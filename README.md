@@ -282,6 +282,26 @@ Detailed documentation for each PLC family and feature:
 | Device Info | Stable | Stable | Stable | Stable | Stable | Experimental |
 | Keep-alive | Stable | Stable | N/A | N/A | Stable | Experimental |
 
+## Acknowledgements
+
+plcio was built from the ground up in pure Go, but the protocol implementations would not have been possible without the research, documentation, and reference code provided by several outstanding open-source projects:
+
+- **[pylogix](https://github.com/dmroeder/pylogix)** &mdash; Invaluable reference for Allen-Bradley EtherNet/IP and CIP implementation details including Forward Open connection parameters, tag discovery, and template decoding. Many protocol constants and sequencing details were validated against pylogix's well-tested codebase.
+
+- **[pycomm3](https://github.com/ottowayi/pycomm3)** &mdash; Reference for CIP structure attribute handling and template size computation. The approach to UDT member decoding was informed by pycomm3's implementation.
+
+- **[libplctag](https://github.com/libplctag/libplctag)** &mdash; Essential resource for Omron EIP/CIP support. GitHub issues and source code provided critical insight into Omron NJ/NX symbol object attributes and CIP vendor-specific behavior. Also a valuable general reference for multi-vendor PLC protocol details.
+
+- **[rust-eip](https://github.com/Joylei/eip-rs)** &mdash; Reference for EtherNet/IP session management and CIP message framing patterns, helpful for validating our EIP transport layer implementation.
+
+- **[gos7](https://github.com/robinson/gos7)** &mdash; Go implementation of the S7comm protocol that served as a reference for S7 connection setup, PDU negotiation, and data block addressing.
+
+- **[Wireshark](https://www.wireshark.org/)** &mdash; Protocol captures with Wireshark's EtherNet/IP, S7comm, and ADS dissectors were used extensively to validate packet structures and debug protocol-level issues across all PLC families.
+
+- **Omron W506 Manual** &mdash; The *NJ/NX-series CPU Unit Built-in EtherNet/IP Port User's Manual* provided essential protocol details for Omron EIP tag discovery and symbol access.
+
+Thank you to the maintainers and contributors of these projects for making industrial protocol communication more accessible.
+
 ## Disclaimer
 
 **plcio is provided "AS IS" without warranty of any kind.** PLCs frequently control industrial equipment that can cause serious injury or death if operated improperly. This library is intended for **monitoring and data collection only**. See [Safety & Intended Use](docs/safety-and-intended-use.md) for critical safety information before using this library in any industrial environment.
