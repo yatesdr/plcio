@@ -9,7 +9,7 @@ import (
 	"net"
 	"sync/atomic"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // ADS TCP Header (6 bytes)

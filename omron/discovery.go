@@ -26,8 +26,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"plcio/cip"
-	"plcio/logging"
+	"github.com/yatesdr/plcio/cip"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // CIP service codes for symbol discovery.

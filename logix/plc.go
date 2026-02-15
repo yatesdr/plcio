@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"plcio/cip"
-	"plcio/eip"
-	"plcio/logging"
+	"github.com/yatesdr/plcio/cip"
+	"github.com/yatesdr/plcio/eip"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // PLC is a thin Logix-specific wrapper over the generic eip client.

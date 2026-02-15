@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // NetworkDeviceInfo contains identity information about a discovered Omron PLC.

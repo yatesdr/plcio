@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"plcio/cip"
+	"github.com/yatesdr/plcio/cip"
 )
 
 // Template represents a UDT/AOI structure definition from the PLC.

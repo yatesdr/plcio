@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // Client provides high-level access to a Beckhoff TwinCAT PLC via ADS protocol.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // Client is a high-level wrapper for S7 PLC communication.

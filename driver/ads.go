@@ -3,7 +3,7 @@ package driver
 import (
 	"fmt"
 
-	"plcio/ads"
+	"github.com/yatesdr/plcio/ads"
 )
 
 // ADSAdapter wraps ads.Client to implement the Driver interface.

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"plcio/s7"
+	"github.com/yatesdr/plcio/s7"
 )
 
 // S7Adapter wraps s7.Client to implement the Driver interface.

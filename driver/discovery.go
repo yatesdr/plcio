@@ -6,11 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"plcio/ads"
-	"plcio/eip"
-	"plcio/logging"
-	"plcio/omron"
-	"plcio/s7"
+	"github.com/yatesdr/plcio/ads"
+	"github.com/yatesdr/plcio/eip"
+	"github.com/yatesdr/plcio/logging"
+	"github.com/yatesdr/plcio/omron"
+	"github.com/yatesdr/plcio/s7"
 )
 
 // DiscoveredDevice represents a PLC discovered on the network.

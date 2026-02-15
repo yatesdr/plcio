@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"plcio/omron"
+	"github.com/yatesdr/plcio/omron"
 )
 
 // OmronAdapter wraps omron.Client to implement the Driver interface.

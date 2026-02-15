@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"plcio/cip"
+	"github.com/yatesdr/plcio/cip"
 )
 
 // TagInfo contains metadata about a tag from the PLC's symbol table.

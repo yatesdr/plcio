@@ -4,9 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"plcio/cip"
-	"plcio/eip"
-	"plcio/logging"
+	"github.com/yatesdr/plcio/cip"
+	"github.com/yatesdr/plcio/eip"
+	"github.com/yatesdr/plcio/logging"
 )
 
 var verboseLogging bool // Controls detailed template/parsing logs

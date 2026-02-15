@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"plcio/cip"
-	"plcio/eip"
-	"plcio/logging"
+	"github.com/yatesdr/plcio/cip"
+	"github.com/yatesdr/plcio/eip"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // CIP service codes for Read/Write Tag operations.

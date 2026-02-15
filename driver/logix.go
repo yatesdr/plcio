@@ -3,7 +3,7 @@ package driver
 import (
 	"fmt"
 
-	"plcio/logix"
+	"github.com/yatesdr/plcio/logix"
 )
 
 // LogixAdapter wraps logix.Client to implement the Driver interface.

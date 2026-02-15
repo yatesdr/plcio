@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 const (

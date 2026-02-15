@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // Client is a high-level wrapper that manages connection lifecycle

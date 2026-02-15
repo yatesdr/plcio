@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // FINS command codes.

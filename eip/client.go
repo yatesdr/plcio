@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"plcio/logging"
+	"github.com/yatesdr/plcio/logging"
 )
 
 const (

@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"plcio/eip"
+	"github.com/yatesdr/plcio/eip"
 )
 
 // DeviceInfo contains identity information about a discovered PLC or EtherNet/IP device.

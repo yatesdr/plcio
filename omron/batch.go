@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"sort"
 
-	"plcio/cip"
-	"plcio/eip"
-	"plcio/logging"
+	"github.com/yatesdr/plcio/cip"
+	"github.com/yatesdr/plcio/eip"
+	"github.com/yatesdr/plcio/logging"
 )
 
 // Batch configuration constants
