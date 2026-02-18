@@ -288,6 +288,12 @@ func (c *Client) writeBit(addr *FileAddress, value interface{}) error {
 	return c.plc.WriteAddress(readAddr, data)
 }
 
+// DecodeValue converts raw PLC bytes to a Go value based on the address type.
+// This is exported for use by the driver layer when slicing bulk read results.
+func DecodeValue(addr *FileAddress, data []byte) interface{} {
+	return decodeValue(addr, data)
+}
+
 // decodeValue converts raw PLC bytes to a Go value based on the address type.
 func decodeValue(addr *FileAddress, data []byte) interface{} {
 	if len(data) == 0 {

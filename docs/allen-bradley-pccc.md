@@ -229,6 +229,23 @@ if m, ok := results[0].Value.(map[string]interface{}); ok {
 }
 ```
 
+### Batch Reads
+
+When the `Driver.Read()` method receives multiple addresses from the same data file with consecutive element numbers, plcio automatically batches them into a single PCCC round-trip. For example, reading `N7:0`, `N7:1`, `N7:2` issues one PCCC command requesting 6 bytes instead of three separate commands.
+
+**What gets batched:**
+- Full-element reads in the same data file with consecutive element numbers
+- All simple types (N, F, L, B, O, I, S, A) and complex types (T, C, R, ST)
+
+**What is always read individually:**
+- Sub-element access (e.g., `T4:0.ACC`, `C5:2.PRE`)
+- Bit access (e.g., `B3:0/5`, `N7:0/3`)
+- Addresses from different data files
+
+Each batch is capped at 236 bytes (the PCCC response payload limit). For 16-bit integer files, this means up to 118 elements per batch. If a batch read fails, the affected elements automatically fall back to individual reads.
+
+Batching is transparent &mdash; you use the same `Read()` API and the driver handles grouping internally. The order of results always matches the order of requests.
+
 ## Writing Tags
 
 ```go
@@ -367,7 +384,7 @@ If you're familiar with the Logix driver, these are the important differences wh
 | Type hints | Not needed | Not needed (type from address prefix) |
 | Tag discovery | Automatic | SLC/MicroLogix: file directory; PLC-5: none |
 | Connection mode | Connected (Forward Open) or Unconnected | Unconnected only |
-| Batch reads | CIP Multi-Service Packet | Individual requests per address |
+| Batch reads | CIP Multi-Service Packet | Contiguous element batching (automatic) |
 | UDT/structures | Automatic decode | Timer/Counter/Control maps |
 | Slot configuration | Required | Not used |
 

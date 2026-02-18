@@ -88,6 +88,57 @@ func (p *PLC) ReadAddress(addr *FileAddress) (*Tag, error) {
 	}, nil
 }
 
+// ReadAddressN reads count contiguous elements starting at addr.Element.
+// The returned Tag.Bytes contains up to count * ElementSize(addr.FileType) bytes.
+// This is used for batch reads: a single PCCC round-trip retrieves multiple
+// consecutive data table elements.
+func (p *PLC) ReadAddressN(addr *FileAddress, count int) (*Tag, error) {
+	if p == nil || p.Connection == nil {
+		return nil, fmt.Errorf("ReadAddressN: nil PLC or connection")
+	}
+	if addr == nil {
+		return nil, fmt.Errorf("ReadAddressN: nil address")
+	}
+	if count <= 0 {
+		return nil, fmt.Errorf("ReadAddressN: count must be > 0")
+	}
+
+	elemSize := ElementSize(addr.FileType)
+	byteCount := count * elemSize
+
+	debugLog("ReadAddressN %s: count=%d elemSize=%d byteCount=%d",
+		addr.RawAddress, count, elemSize, byteCount)
+
+	tns := p.nextTNS()
+	cipReq, err := buildReadRequestN(addr, byteCount, tns, p.vendorID, p.serialNum)
+	if err != nil {
+		return nil, fmt.Errorf("ReadAddressN: %w", err)
+	}
+
+	cipResp, err := p.sendCipRequest(cipReq)
+	if err != nil {
+		return nil, fmt.Errorf("ReadAddressN %s: %w", addr.RawAddress, err)
+	}
+
+	pcccResp, err := parseCipExecutePCCCResponse(cipResp)
+	if err != nil {
+		return nil, fmt.Errorf("ReadAddressN %s: %w", addr.RawAddress, err)
+	}
+
+	data, err := parsePCCCReadResponse(pcccResp)
+	if err != nil {
+		return nil, fmt.Errorf("ReadAddressN %s: %w", addr.RawAddress, err)
+	}
+
+	debugLog("ReadAddressN %s: got %d bytes (expected %d)", addr.RawAddress, len(data), byteCount)
+
+	return &Tag{
+		Address:  addr.RawAddress,
+		FileType: addr.FileType,
+		Bytes:    data,
+	}, nil
+}
+
 // WriteAddress writes raw bytes to a data table address.
 func (p *PLC) WriteAddress(addr *FileAddress, data []byte) error {
 	if p == nil || p.Connection == nil {

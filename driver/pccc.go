@@ -2,6 +2,7 @@ package driver
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/yatesdr/plcio/cip"
 	"github.com/yatesdr/plcio/pccc"
@@ -150,50 +151,210 @@ func (a *PCCCAdapter) Programs() ([]string, error) {
 	return nil, fmt.Errorf("program listing not supported for %s", a.config.GetFamily())
 }
 
-// Read reads data table addresses from the PLC.
+// maxPCCCReadBytes is the maximum data payload for a single PCCC typed read.
+// SLC 5/03 supports ~164 bytes; SLC 5/04 and 5/05 support ~236 bytes.
+// We use 236 as the cap, which works on 5/04+ and MicroLogix.
+const maxPCCCReadBytes = 236
+
+// Read reads data table addresses from the PLC, batching contiguous full-element
+// reads in the same data file into single PCCC round-trips for efficiency.
+//
+// Addresses that use sub-element or bit access (e.g., T4:0.ACC, B3:0/5) are
+// always read individually. If a batch read fails, the affected elements fall
+// back to individual reads automatically.
 func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 	if a.client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
+	if len(requests) == 0 {
+		return nil, nil
+	}
 
-	addresses := make([]string, len(requests))
+	results := make([]*TagValue, len(requests))
+	family := string(a.config.GetFamily())
+
+	// Parse all addresses and classify as bulkable or not.
+	type parsedReq struct {
+		addr     *pccc.FileAddress
+		err      error
+		bulkable bool
+	}
+	parsed := make([]parsedReq, len(requests))
 	for i, req := range requests {
-		addresses[i] = req.Name
+		addr, err := pccc.ParseAddress(req.Name)
+		parsed[i] = parsedReq{addr: addr, err: err}
+		if err == nil && addr.SubElement == 0 && addr.BitNumber < 0 {
+			parsed[i].bulkable = true
+		}
 	}
 
-	values, err := a.client.Read(addresses...)
-	if err != nil {
-		return nil, err
-	}
-
-	results := make([]*TagValue, len(values))
-	for i, v := range values {
-		if v == nil {
-			name := "unknown"
-			if i < len(addresses) {
-				name = addresses[i]
-			}
+	// Fill in parse errors immediately.
+	for i, p := range parsed {
+		if p.err != nil {
 			results[i] = &TagValue{
-				Name:   name,
-				Family: string(a.config.GetFamily()),
-				Error:  fmt.Errorf("nil response"),
+				Name:   requests[i].Name,
+				Family: family,
+				Error:  fmt.Errorf("invalid address: %w", p.err),
 			}
+		}
+	}
+
+	// Group bulkable addresses by (FileNumber, FileType).
+	type groupKey struct {
+		fileNumber uint16
+		fileType   byte
+	}
+	groups := make(map[groupKey][]int)
+	for i, p := range parsed {
+		if p.bulkable {
+			key := groupKey{p.addr.FileNumber, p.addr.FileType}
+			groups[key] = append(groups[key], i)
+		}
+	}
+
+	// Track which indices were handled by bulk reads.
+	handled := make([]bool, len(requests))
+	// Mark parse errors as handled.
+	for i, p := range parsed {
+		if p.err != nil {
+			handled[i] = true
+		}
+	}
+
+	// For each group, find contiguous runs and issue bulk reads.
+	for _, indices := range groups {
+		if len(indices) < 2 {
 			continue
 		}
 
-		results[i] = &TagValue{
-			Name:        v.Name,
-			DataType:    uint16(v.FileType),
-			Family:      string(a.config.GetFamily()),
-			Value:       v.Value,
-			StableValue: v.Value,
-			Bytes:       v.Bytes,
-			Count:       1,
-			Error:       v.Error,
+		// Sort by element number.
+		sort.Slice(indices, func(a, b int) bool {
+			return parsed[indices[a]].addr.Element < parsed[indices[b]].addr.Element
+		})
+
+		// Detect contiguous runs.
+		runs := pcccContiguousRuns(indices, func(i int) uint16 {
+			return parsed[i].addr.Element
+		})
+
+		for _, run := range runs {
+			if len(run) < 2 {
+				continue
+			}
+
+			startAddr := parsed[run[0]].addr
+			elemSize := pccc.ElementSize(startAddr.FileType)
+			maxCount := maxPCCCReadBytes / elemSize
+
+			// Process run in chunks that fit within the PCCC payload limit.
+			for chunkStart := 0; chunkStart < len(run); chunkStart += maxCount {
+				chunkEnd := chunkStart + maxCount
+				if chunkEnd > len(run) {
+					chunkEnd = len(run)
+				}
+				chunk := run[chunkStart:chunkEnd]
+				if len(chunk) < 2 {
+					continue
+				}
+
+				chunkAddr := parsed[chunk[0]].addr
+				count := len(chunk)
+
+				tag, err := a.client.PLC().ReadAddressN(chunkAddr, count)
+				if err != nil {
+					// Fall back to individual reads for this chunk.
+					continue
+				}
+
+				for j, origIdx := range chunk {
+					offset := j * elemSize
+					if offset+elemSize > len(tag.Bytes) {
+						break // truncated response
+					}
+
+					elemBytes := make([]byte, elemSize)
+					copy(elemBytes, tag.Bytes[offset:offset+elemSize])
+
+					value := pccc.DecodeValue(parsed[origIdx].addr, elemBytes)
+
+					results[origIdx] = &TagValue{
+						Name:        requests[origIdx].Name,
+						DataType:    uint16(chunkAddr.FileType),
+						Family:      family,
+						Value:       value,
+						StableValue: value,
+						Bytes:       elemBytes,
+						Count:       1,
+					}
+					handled[origIdx] = true
+				}
+			}
+		}
+	}
+
+	// Handle remaining reads individually (non-bulkable, single elements, fallback).
+	var remaining []string
+	var remainingIdx []int
+	for i, h := range handled {
+		if !h {
+			remaining = append(remaining, requests[i].Name)
+			remainingIdx = append(remainingIdx, i)
+		}
+	}
+
+	if len(remaining) > 0 {
+		values, err := a.client.Read(remaining...)
+		if err != nil {
+			return nil, err
+		}
+		for j, v := range values {
+			origIdx := remainingIdx[j]
+			if v == nil {
+				results[origIdx] = &TagValue{
+					Name:   requests[origIdx].Name,
+					Family: family,
+					Error:  fmt.Errorf("nil response"),
+				}
+				continue
+			}
+			results[origIdx] = &TagValue{
+				Name:        v.Name,
+				DataType:    uint16(v.FileType),
+				Family:      family,
+				Value:       v.Value,
+				StableValue: v.Value,
+				Bytes:       v.Bytes,
+				Count:       1,
+				Error:       v.Error,
+			}
 		}
 	}
 
 	return results, nil
+}
+
+// pcccContiguousRuns detects runs of consecutive elements within a sorted slice
+// of request indices. elemOf returns the element number for a given index.
+func pcccContiguousRuns(sortedIndices []int, elemOf func(int) uint16) [][]int {
+	if len(sortedIndices) == 0 {
+		return nil
+	}
+
+	var runs [][]int
+	current := []int{sortedIndices[0]}
+
+	for i := 1; i < len(sortedIndices); i++ {
+		prev := elemOf(sortedIndices[i-1])
+		curr := elemOf(sortedIndices[i])
+		if curr == prev+1 {
+			current = append(current, sortedIndices[i])
+		} else {
+			runs = append(runs, current)
+			current = []int{sortedIndices[i]}
+		}
+	}
+	runs = append(runs, current)
+	return runs
 }
 
 // Write writes a value to a data table address.

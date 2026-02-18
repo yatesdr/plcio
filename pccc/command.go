@@ -18,11 +18,16 @@ import (
 // Each address field uses compact encoding: values 0-254 as a single byte,
 // values 255+ as 0xFF followed by 2-byte little-endian value.
 func buildReadRequest(addr *FileAddress, tns uint16, vendorID uint16, serialNum uint32) ([]byte, error) {
-	byteSize := addr.ReadSize()
+	return buildReadRequestN(addr, addr.ReadSize(), tns, vendorID, serialNum)
+}
 
+// buildReadRequestN builds a PCCC typed logical read with an explicit byte count.
+// This is used for bulk reads where multiple contiguous elements are requested
+// in a single PCCC command by specifying byteCount = count * ElementSize.
+func buildReadRequestN(addr *FileAddress, byteCount int, tns uint16, vendorID uint16, serialNum uint32) ([]byte, error) {
 	// Build the PCCC command payload
 	pcccCmd := buildPCCCHeader(CmdTypedCommand, tns, FncProtectedTypedLogicalRead)
-	pcccCmd = appendCompactValue(pcccCmd, uint16(byteSize))
+	pcccCmd = appendCompactValue(pcccCmd, uint16(byteCount))
 	pcccCmd = appendCompactValue(pcccCmd, addr.FileNumber)
 	pcccCmd = append(pcccCmd, addr.FileType)
 	pcccCmd = appendCompactValue(pcccCmd, addr.Element)

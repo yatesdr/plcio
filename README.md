@@ -309,7 +309,7 @@ Detailed documentation for each PLC family and feature:
 | Write Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
 | Tag Discovery | Stable | Stable | Untested | N/A | Untested | N/A | Stable | N/A | Experimental |
 | Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable |
-| Batch Reads | Stable | N/A | N/A | N/A | N/A | Stable | Stable | Stable | Experimental |
+| Batch Reads | Stable | N/A | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
 | UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Partial | N/A | No |
 | Device Info | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
 | Keep-alive | Stable | Stable | Untested | Untested | Untested | N/A | N/A | Stable | Experimental |
