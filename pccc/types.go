@@ -1,5 +1,7 @@
 package pccc
 
+import "strings"
+
 // PCCC file type codes — identify the data file type in SLC500/PLC5/MicroLogix data tables.
 // The high bit (0x80) indicates a "typed" file in the PCCC protocol.
 const (
@@ -190,4 +192,90 @@ func FileTypeName(fileType byte) string {
 // IsComplexType returns true for file types with sub-elements (Timer, Counter, Control).
 func IsComplexType(fileType byte) bool {
 	return fileType == FileTypeTimer || fileType == FileTypeCounter || fileType == FileTypeControl
+}
+
+// TypeInteger is the default data type code for PCCC address-based tags (N-file, 16-bit integer).
+const TypeInteger = uint16(FileTypeInteger) // 0x89
+
+// TypeName returns a short name for the given PCCC data type code (uint16 form).
+func TypeName(dataType uint16) string {
+	switch byte(dataType) {
+	case FileTypeOutput:
+		return "OUTPUT"
+	case FileTypeInput:
+		return "INPUT"
+	case FileTypeStatus:
+		return "STATUS"
+	case FileTypeBinary:
+		return "BINARY"
+	case FileTypeTimer:
+		return "TIMER"
+	case FileTypeCounter:
+		return "COUNTER"
+	case FileTypeControl:
+		return "CONTROL"
+	case FileTypeInteger:
+		return "INT"
+	case FileTypeFloat:
+		return "FLOAT"
+	case FileTypeString:
+		return "STRING"
+	case FileTypeASCII:
+		return "ASCII"
+	case FileTypeLong:
+		return "LONG"
+	case FileTypeMessage:
+		return "MESSAGE"
+	case FileTypePID:
+		return "PID"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// TypeCodeFromName returns the PCCC type code for the given short name (case-insensitive).
+// Returns (0, false) if the name is not recognized.
+func TypeCodeFromName(name string) (uint16, bool) {
+	switch strings.ToUpper(name) {
+	case "OUTPUT":
+		return uint16(FileTypeOutput), true
+	case "INPUT":
+		return uint16(FileTypeInput), true
+	case "STATUS":
+		return uint16(FileTypeStatus), true
+	case "BINARY":
+		return uint16(FileTypeBinary), true
+	case "TIMER":
+		return uint16(FileTypeTimer), true
+	case "COUNTER":
+		return uint16(FileTypeCounter), true
+	case "CONTROL":
+		return uint16(FileTypeControl), true
+	case "INT":
+		return uint16(FileTypeInteger), true
+	case "FLOAT":
+		return uint16(FileTypeFloat), true
+	case "STRING":
+		return uint16(FileTypeString), true
+	case "ASCII":
+		return uint16(FileTypeASCII), true
+	case "LONG":
+		return uint16(FileTypeLong), true
+	case "MESSAGE":
+		return uint16(FileTypeMessage), true
+	case "PID":
+		return uint16(FileTypePID), true
+	default:
+		return 0, false
+	}
+}
+
+// SupportedTypeNames returns the list of user-selectable PCCC type names for UI dropdowns.
+func SupportedTypeNames() []string {
+	return []string{"INT", "FLOAT", "BINARY", "TIMER", "COUNTER", "CONTROL", "STRING", "LONG"}
+}
+
+// TypeSize returns the element size in bytes for the given PCCC data type code (uint16 form).
+func TypeSize(dataType uint16) int {
+	return ElementSize(byte(dataType))
 }
