@@ -6,11 +6,14 @@ import "time"
 type PLCFamily string
 
 const (
-	FamilyLogix    PLCFamily = "logix"    // Allen-Bradley ControlLogix/CompactLogix
-	FamilyMicro800 PLCFamily = "micro800" // Allen-Bradley Micro800 series
-	FamilyS7       PLCFamily = "s7"       // Siemens S7
-	FamilyOmron    PLCFamily = "omron"    // Omron PLCs (FINS or EIP based on Protocol field)
-	FamilyBeckhoff PLCFamily = "beckhoff" // Beckhoff TwinCAT (ADS protocol)
+	FamilyLogix     PLCFamily = "logix"     // Allen-Bradley ControlLogix/CompactLogix
+	FamilyMicro800  PLCFamily = "micro800"  // Allen-Bradley Micro800 series
+	FamilySLC500    PLCFamily = "slc500"    // Allen-Bradley SLC 5/03, 5/04, 5/05
+	FamilyPLC5      PLCFamily = "plc5"      // Allen-Bradley PLC-5 series
+	FamilyMicroLogix PLCFamily = "micrologix" // Allen-Bradley MicroLogix 1000/1100/1200/1400/1500
+	FamilyS7        PLCFamily = "s7"        // Siemens S7
+	FamilyOmron     PLCFamily = "omron"     // Omron PLCs (FINS or EIP based on Protocol field)
+	FamilyBeckhoff  PLCFamily = "beckhoff"  // Beckhoff TwinCAT (ADS protocol)
 )
 
 // SupportsDiscovery returns true if the PLC family supports tag discovery.
@@ -31,6 +34,8 @@ func (f PLCFamily) String() string {
 // Driver returns the driver/protocol name used by this PLC family.
 func (f PLCFamily) Driver() string {
 	switch f {
+	case FamilySLC500, FamilyPLC5, FamilyMicroLogix:
+		return "pccc"
 	case FamilyS7:
 		return "s7"
 	case FamilyBeckhoff:
@@ -114,7 +119,8 @@ func (p *PLCConfig) SupportsDiscovery() bool {
 // IsAddressBased returns true if this PLC family uses address-based tag names.
 func (p *PLCConfig) IsAddressBased() bool {
 	family := p.GetFamily()
-	if family == FamilyS7 {
+	switch family {
+	case FamilyS7, FamilySLC500, FamilyPLC5, FamilyMicroLogix:
 		return true
 	}
 	if family == FamilyOmron && p.IsOmronFINS() {

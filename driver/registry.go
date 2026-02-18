@@ -13,6 +13,8 @@ func Create(cfg *PLCConfig) (Driver, error) {
 	}
 
 	switch cfg.GetFamily() {
+	case FamilySLC500, FamilyPLC5, FamilyMicroLogix:
+		return NewPCCCAdapter(cfg)
 	case FamilyS7:
 		return NewS7Adapter(cfg)
 	case FamilyBeckhoff:
