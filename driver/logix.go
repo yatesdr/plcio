@@ -3,6 +3,7 @@ package driver
 import (
 	"fmt"
 
+	"github.com/yatesdr/plcio/cip"
 	"github.com/yatesdr/plcio/logix"
 )
 
@@ -33,7 +34,13 @@ func (a *LogixAdapter) Connect() error {
 		opts = append(opts, logix.WithTimeout(a.config.Timeout))
 	}
 
-	if a.micro800 {
+	if a.config.ConnectionPath != "" {
+		routePath, err := cip.ParseConnectionPath(a.config.ConnectionPath)
+		if err != nil {
+			return fmt.Errorf("invalid connection path %q: %w", a.config.ConnectionPath, err)
+		}
+		opts = append(opts, logix.WithRoutePath(routePath))
+	} else if a.micro800 {
 		opts = append(opts, logix.WithMicro800())
 	} else if a.config.Slot > 0 {
 		opts = append(opts, logix.WithSlot(a.config.Slot))

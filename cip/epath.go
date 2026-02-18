@@ -3,6 +3,8 @@ package cip
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 type LogicalType byte
@@ -260,4 +262,103 @@ func symbolicSegmentAsciiExt(symbol []byte) (EPath_t, error) {
 		out = append(out, 0x00)
 	}
 	return EPath_t(out), nil
+}
+
+// ParseConnectionPath parses a Rockwell/Ignition-style connection path string
+// into CIP port segment bytes. The format is comma-separated port/address pairs:
+//
+//	"1,0"                     → backplane port 1, slot 0
+//	"1,2"                     → backplane port 1, slot 2
+//	"1,1,2,192.168.100.1"    → backplane slot 1, then ethernet to remote IP
+//	"1,0,2,192.168.1.1,1,2"  → multi-hop: backplane slot 0, ethernet, backplane slot 2
+//
+// Each pair encodes as a CIP port segment:
+//   - Simple (numeric address 0-255): [port, address] (2 bytes)
+//   - Extended (IP string): [0x10|port, len, ip_bytes..., pad?] (word-aligned)
+func ParseConnectionPath(path string) ([]byte, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+
+	tokens := strings.Split(path, ",")
+	for i := range tokens {
+		tokens[i] = strings.TrimSpace(tokens[i])
+	}
+	if len(tokens)%2 != 0 {
+		return nil, fmt.Errorf("connection path must have pairs of port,address: got %d tokens", len(tokens))
+	}
+
+	var result []byte
+	for i := 0; i < len(tokens); i += 2 {
+		portStr := tokens[i]
+		addrStr := tokens[i+1]
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port < 0 || port > 15 {
+			return nil, fmt.Errorf("invalid port number %q (must be 0-15)", portStr)
+		}
+
+		if strings.Contains(addrStr, ".") {
+			// Extended port segment: IP address as link address
+			addrBytes := []byte(addrStr)
+			portByte := byte(port) | 0x10 // Set extended link address flag (bit 4)
+			result = append(result, portByte, byte(len(addrBytes)))
+			result = append(result, addrBytes...)
+			// Pad to word alignment (total segment must be even bytes)
+			if len(addrBytes)%2 != 0 {
+				result = append(result, 0x00)
+			}
+		} else {
+			// Simple port segment: numeric link address
+			addr, err := strconv.Atoi(addrStr)
+			if err != nil || addr < 0 || addr > 255 {
+				return nil, fmt.Errorf("invalid link address %q (must be 0-255)", addrStr)
+			}
+			result = append(result, byte(port), byte(addr))
+		}
+	}
+
+	return result, nil
+}
+
+// FormatConnectionPath converts CIP port segment bytes back to the
+// Rockwell/Ignition comma-separated string format (e.g. "1,0" or "1,1,2,192.168.1.1").
+func FormatConnectionPath(data []byte) string {
+	var parts []string
+	for i := 0; i < len(data); {
+		if i >= len(data) {
+			break
+		}
+		portByte := data[i]
+		port := portByte & 0x0F
+		extended := portByte&0x10 != 0
+
+		if extended {
+			// Extended port segment: next byte is length, then ASCII link address
+			if i+1 >= len(data) {
+				break
+			}
+			addrLen := int(data[i+1])
+			if i+2+addrLen > len(data) {
+				break
+			}
+			addr := string(data[i+2 : i+2+addrLen])
+			parts = append(parts, strconv.Itoa(int(port)), addr)
+			// Skip header (2) + data + optional pad to word alignment
+			segLen := 2 + addrLen
+			if segLen%2 != 0 {
+				segLen++
+			}
+			i += segLen
+		} else {
+			// Simple port segment: next byte is link address
+			if i+1 >= len(data) {
+				break
+			}
+			parts = append(parts, strconv.Itoa(int(port)), strconv.Itoa(int(data[i+1])))
+			i += 2
+		}
+	}
+	return strings.Join(parts, ",")
 }

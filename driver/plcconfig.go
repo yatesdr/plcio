@@ -55,6 +55,9 @@ type PLCConfig struct {
 	Timeout            time.Duration  `yaml:"timeout,omitempty"`
 	Tags               []TagSelection `yaml:"tags,omitempty"`
 
+	// Logix/CIP-specific settings
+	ConnectionPath string `yaml:"connection_path,omitempty"` // Rockwell-style route, e.g. "1,0" or "1,1,2,192.168.100.1"
+
 	// Beckhoff/TwinCAT-specific settings
 	AmsNetId string `yaml:"ams_net_id,omitempty"`
 	AmsPort  uint16 `yaml:"ams_port,omitempty"`
