@@ -8,7 +8,7 @@ plcio runs four discovery methods in parallel:
 
 | Method | Protocol | Targets | Technique |
 |---|---|---|---|
-| EIP Broadcast | EtherNet/IP | Allen-Bradley, Omron NJ/NX | UDP broadcast on port 44818 |
+| EIP Broadcast | EtherNet/IP | Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Omron NJ/NX | UDP broadcast on port 44818 |
 | S7 Port Scan | S7comm | Siemens S7-* | TCP connect scan on port 102 |
 | ADS Broadcast + Scan | ADS | Beckhoff TwinCAT | UDP broadcast + TCP scan on port 48898 |
 | FINS Scan | FINS | Omron CS/CJ/CP | Network scan on port 9600 |

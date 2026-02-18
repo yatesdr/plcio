@@ -57,6 +57,9 @@ Factory function that creates the appropriate `Driver` implementation based on t
 |---|---|
 | `FamilyLogix` (default) | `LogixAdapter` |
 | `FamilyMicro800` | `LogixAdapter` (with Micro800 mode) |
+| `FamilySLC500` | `PCCCAdapter` |
+| `FamilyPLC5` | `PCCCAdapter` |
+| `FamilyMicroLogix` | `PCCCAdapter` |
 | `FamilyS7` | `S7Adapter` |
 | `FamilyBeckhoff` | `ADSAdapter` |
 | `FamilyOmron` | `OmronAdapter` |
@@ -71,11 +74,14 @@ The connection is **not** established until `Connect()` is called on the returne
 type PLCFamily string
 
 const (
-    FamilyLogix    PLCFamily = "logix"    // Allen-Bradley ControlLogix/CompactLogix
-    FamilyMicro800 PLCFamily = "micro800" // Allen-Bradley Micro800 series
-    FamilyS7       PLCFamily = "s7"       // Siemens S7
-    FamilyOmron    PLCFamily = "omron"    // Omron (FINS or EIP)
-    FamilyBeckhoff PLCFamily = "beckhoff" // Beckhoff TwinCAT (ADS)
+    FamilyLogix     PLCFamily = "logix"      // Allen-Bradley ControlLogix/CompactLogix
+    FamilyMicro800  PLCFamily = "micro800"   // Allen-Bradley Micro800 series
+    FamilySLC500    PLCFamily = "slc500"     // Allen-Bradley SLC 5/03, 5/04, 5/05
+    FamilyPLC5      PLCFamily = "plc5"       // Allen-Bradley PLC-5 series
+    FamilyMicroLogix PLCFamily = "micrologix" // Allen-Bradley MicroLogix 1000/1100/1200/1400/1500
+    FamilyS7        PLCFamily = "s7"         // Siemens S7
+    FamilyOmron     PLCFamily = "omron"      // Omron (FINS or EIP)
+    FamilyBeckhoff  PLCFamily = "beckhoff"   // Beckhoff TwinCAT (ADS)
 )
 ```
 
@@ -84,7 +90,7 @@ const (
 | Method | Description |
 |---|---|
 | `String() string` | Returns the string representation (defaults to "logix" if empty) |
-| `Driver() string` | Returns the protocol driver name ("logix", "s7", "ads", "omron") |
+| `Driver() string` | Returns the protocol driver name ("logix", "pccc", "s7", "ads", "omron") |
 | `SupportsDiscovery() bool` | Whether the family supports tag browsing |
 
 ---
@@ -126,7 +132,7 @@ type PLCConfig struct {
 | `IsOmronEIP() bool` | True if Omron using EtherNet/IP |
 | `IsOmronFINS() bool` | True if Omron using FINS |
 | `SupportsDiscovery() bool` | Protocol-aware discovery check |
-| `IsAddressBased() bool` | True for S7 and Omron FINS (address-based tags) |
+| `IsAddressBased() bool` | True for S7, SLC 500, PLC-5, MicroLogix, and Omron FINS (address-based tags) |
 | `IsHealthCheckEnabled() bool` | Whether health check is enabled (defaults true) |
 
 ---
@@ -169,7 +175,7 @@ type TagRequest struct {
 }
 ```
 
-Used as input to `Driver.Read()`. The `TypeHint` field is **required** for S7 and Omron FINS, and ignored for Logix and ADS (which carry type information in the protocol).
+Used as input to `Driver.Read()`. The `TypeHint` field is **required** for S7 and Omron FINS, and ignored for Logix, PCCC, and ADS (which carry type information in the protocol). PCCC addresses encode their type via the address prefix (e.g., `N` for integer, `F` for float).
 
 ---
 
@@ -324,6 +330,10 @@ client := adapter.Client() // *ads.Client
 // Get underlying Omron client
 adapter := drv.(*driver.OmronAdapter)
 client := adapter.Client() // *omron.Client
+
+// Get underlying PCCC client (SLC 500, PLC-5, MicroLogix)
+adapter := drv.(*driver.PCCCAdapter)
+client := adapter.Client() // *pccc.Client
 ```
 
 ### LogixAdapter Extra Methods

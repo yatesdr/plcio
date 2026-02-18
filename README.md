@@ -1,8 +1,8 @@
 # plcio
 
-A pure Go library for communicating with industrial PLCs (Programmable Logic Controllers) across multiple vendors and protocols. plcio provides a unified `Driver` interface for reading tags, writing values, discovering devices, and browsing symbol tables across Allen-Bradley, Siemens, Beckhoff, and Omron PLCs.
+A pure Go library for communicating with industrial PLCs (Programmable Logic Controllers) across multiple vendors and protocols. plcio provides a unified `Driver` interface for reading tags, writing values, discovering devices, and browsing symbol tables across Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Siemens, Beckhoff, and Omron PLCs.
 
-> **BETA** &mdash; Allen-Bradley and Siemens support is well-tested. Beckhoff is stable but requires more testing. Omron FINS is functional; Omron EIP is experimental.
+> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. Allen-Bradley PCCC (SLC 500, PLC-5, MicroLogix) is functional but untested on hardware. Beckhoff is stable but requires more testing. Omron FINS is functional; Omron EIP is experimental.
 
 ## Supported PLC Families
 
@@ -10,6 +10,9 @@ A pure Go library for communicating with industrial PLCs (Programmable Logic Con
 |---|---|---|---|---|
 | **Allen-Bradley Logix** | ControlLogix, CompactLogix | EtherNet/IP (CIP) | Automatic | L7, L8 |
 | **Allen-Bradley Micro800** | Micro820, Micro850 | EtherNet/IP (CIP) | Automatic | Micro820 |
+| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Manual (address-based) | Untested |
+| **Allen-Bradley PLC-5** | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Manual (address-based) | Untested |
+| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Manual (address-based) | Untested |
 | **Siemens S7** | S7-300, S7-400, S7-1200, S7-1500 | S7comm (port 102) | Manual (address-based) | S7-1200 |
 | **Beckhoff TwinCAT** | CX series, TwinCAT 2/3 | ADS (port 48898) | Automatic | CX9020 |
 | **Omron (FINS)** | CS1, CJ1/2, CP1, CV | FINS TCP/UDP (port 9600) | Manual (address-based) | CP1 |
@@ -124,6 +127,34 @@ cfg := &driver.PLCConfig{
     Enabled: true,
 }
 ```
+
+### Allen-Bradley SLC 500 / PLC-5 / MicroLogix (PCCC)
+
+```go
+cfg := &driver.PLCConfig{
+    Name:    "slc500",
+    Address: "192.168.1.15",
+    Family:  driver.FamilySLC500, // or FamilyPLC5, FamilyMicroLogix
+    Enabled: true,
+}
+
+drv, _ := driver.Create(cfg)
+drv.Connect()
+defer drv.Close()
+
+// Read data table addresses (no type hints needed)
+results, _ := drv.Read([]driver.TagRequest{
+    {Name: "N7:0"},       // Integer
+    {Name: "F8:5"},       // Float
+    {Name: "B3:0/5"},     // Single bit
+    {Name: "T4:0.ACC"},   // Timer accumulated value
+})
+
+// Write a value
+drv.Write("N7:0", 42)
+```
+
+PCCC PLCs use file-based data table addresses instead of symbolic tag names. Tag discovery is not supported. See [Allen-Bradley PCCC](docs/allen-bradley-pccc.md) for the full address reference and usage details.
 
 ### Siemens S7
 
@@ -260,6 +291,7 @@ for _, dev := range devices {
 Detailed documentation for each PLC family and feature:
 
 - [Allen-Bradley (Logix & Micro800)](docs/allen-bradley.md)
+- [Allen-Bradley (SLC 500, PLC-5 & MicroLogix)](docs/allen-bradley-pccc.md)
 - [Siemens S7](docs/siemens-s7.md)
 - [Beckhoff TwinCAT (ADS)](docs/beckhoff.md)
 - [Omron (FINS & EIP)](docs/omron.md)
@@ -270,17 +302,17 @@ Detailed documentation for each PLC family and feature:
 
 ## Support Status
 
-| Feature | Logix | Micro800 | S7 | Beckhoff | Omron FINS | Omron EIP |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Connect/Disconnect | Stable | Stable | Stable | Stable | Stable | Experimental |
-| Read Tags | Stable | Stable | Stable | Stable | Stable | Experimental |
-| Write Tags | Stable | Stable | Stable | Stable | Stable | Experimental |
-| Tag Discovery | Stable | Stable | N/A | Stable | N/A | Experimental |
-| Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable |
-| Batch Reads | Stable | N/A | Stable | Stable | Stable | Experimental |
-| UDT/Struct Decode | Stable | Stable | N/A | Partial | N/A | No |
-| Device Info | Stable | Stable | Stable | Stable | Stable | Experimental |
-| Keep-alive | Stable | Stable | N/A | N/A | Stable | Experimental |
+| Feature | Logix | Micro800 | SLC 500 | PLC-5 | MicroLogix | S7 | Beckhoff | Omron FINS | Omron EIP |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Connect/Disconnect | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
+| Read Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
+| Write Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
+| Tag Discovery | Stable | Stable | N/A | N/A | N/A | N/A | Stable | N/A | Experimental |
+| Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable |
+| Batch Reads | Stable | N/A | N/A | N/A | N/A | Stable | Stable | Stable | Experimental |
+| UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Partial | N/A | No |
+| Device Info | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
+| Keep-alive | Stable | Stable | Untested | Untested | Untested | N/A | N/A | Stable | Experimental |
 
 ## Acknowledgements
 
@@ -288,7 +320,7 @@ plcio was built from the ground up in pure Go, but the protocol implementations 
 
 - **[pylogix](https://github.com/dmroeder/pylogix)** &mdash; Invaluable reference for Allen-Bradley EtherNet/IP and CIP implementation details including Forward Open connection parameters, tag discovery, and template decoding. Many protocol constants and sequencing details were validated against pylogix's well-tested codebase.
 
-- **[pycomm3](https://github.com/ottowayi/pycomm3)** &mdash; Reference for CIP structure attribute handling and template size computation. The approach to UDT member decoding was informed by pycomm3's implementation.
+- **[pycomm3](https://github.com/ottowayi/pycomm3)** &mdash; Reference for CIP structure attribute handling, template size computation, and PCCC protocol constants. The approach to UDT member decoding was informed by pycomm3's implementation, and the PCCC file type codes and command framing were validated against its SLC/PLC-5 driver.
 
 - **[libplctag](https://github.com/libplctag/libplctag)** &mdash; Essential resource for Omron EIP/CIP support. GitHub issues and source code provided critical insight into Omron NJ/NX symbol object attributes and CIP vendor-specific behavior. Also a valuable general reference for multi-vendor PLC protocol details.
 

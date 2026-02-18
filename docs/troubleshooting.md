@@ -15,6 +15,7 @@ Common issues, error patterns, and solutions when using plcio.
 | All | Wrong IP address or PLC powered off | Verify IP with ping, check PLC power |
 | All | Firewall blocking the port | Open required port (44818, 102, 48898, 9600) |
 | Logix | Too many concurrent connections | Close unused connections, check PLC connection limit |
+| SLC/PLC-5/MicroLogix | PLC has no Ethernet port | Only Ethernet-equipped models supported (SLC 5/03+, MicroLogix 1100+). Use a gateway for non-Ethernet models. |
 | S7 | PUT/GET access not enabled | Enable in TIA Portal: Protection & Security > Connection mechanisms |
 | Beckhoff | No ADS route configured | Add static route on TwinCAT device |
 | Omron FINS | FINS ethernet unit not configured | Configure FINS settings in CX-Programmer |
@@ -78,6 +79,7 @@ if err != nil && drv.IsConnectionError(err) {
 |---|---|
 | Logix | Check exact tag name spelling (case-sensitive). Verify tag exists in PLC program. Use `AllTags()` to list available tags. |
 | Micro800 | Same as Logix. Ensure PLC is in Run mode. |
+| SLC/PLC-5/MicroLogix | Verify file number and element exist in RSLogix. Check address format (e.g., `N7:0`, `F8:5`). Confirm file type prefix matches the data table type. |
 | S7 | Verify DB number exists and byte offset is within the DB size. |
 | Beckhoff | Check exact symbol name. Ensure PLC is in RUN mode with valid program. |
 | Omron FINS | Verify memory area and address are valid for your PLC model. |
@@ -116,6 +118,7 @@ if err != nil && drv.IsConnectionError(err) {
 | Micro800 | Put PLC in Run mode. May need a power cycle. |
 | Beckhoff | PLC must be in RUN mode with a valid downloaded program. |
 | Omron EIP | Tags exist but UDT members won't be listed (known limitation). |
+| SLC/PLC-5/MicroLogix | These families do not support discovery. Configure addresses manually from RSLogix. |
 | S7 / Omron FINS | These families do not support discovery. Configure tags manually. |
 
 ### Structure/UDT Values
@@ -258,7 +261,7 @@ plcio includes a debug logging system that writes protocol-level details to `deb
 import "github.com/yatesdr/plcio/logging"
 
 // Logging is protocol-filtered
-// Available filters: "omron", "fins", "eip", "ads", "logix", "s7"
+// Available filters: "omron", "fins", "eip", "ads", "logix", "pccc", "s7"
 ```
 
 When reporting issues, include the relevant debug.log output for the protocol in question.
@@ -269,7 +272,7 @@ When reporting issues, include the relevant debug.log output for the protocol in
 
 If you've worked through this guide and still have issues:
 
-1. Check the PLC-specific documentation: [Allen-Bradley](allen-bradley.md), [Siemens S7](siemens-s7.md), [Beckhoff](beckhoff.md), [Omron](omron.md)
+1. Check the PLC-specific documentation: [Allen-Bradley Logix](allen-bradley.md), [Allen-Bradley PCCC](allen-bradley-pccc.md), [Siemens S7](siemens-s7.md), [Beckhoff](beckhoff.md), [Omron](omron.md)
 2. Enable debug logging and review the protocol-level output
 3. Test connectivity with the PLC vendor's own software first (RSLogix, TIA Portal, TwinCAT XAE, CX-Programmer) to rule out PLC-side configuration issues
 4. File an issue on GitHub with:

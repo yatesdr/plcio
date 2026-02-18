@@ -2,6 +2,8 @@
 
 plcio supports Allen-Bradley ControlLogix, CompactLogix, and Micro800 series PLCs over EtherNet/IP using the Common Industrial Protocol (CIP).
 
+> For SLC 500, PLC-5, and MicroLogix support using the PCCC protocol, see [Allen-Bradley PCCC](allen-bradley-pccc.md).
+
 ## Supported Hardware
 
 | Series | Models Tested | Protocol | Connection Mode |
