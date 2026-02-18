@@ -6,9 +6,9 @@ plcio supports Allen-Bradley SLC 500, PLC-5, and MicroLogix processors using the
 
 | Series | Models | Protocol | Connection Mode | Tested |
 |---|---|---|---|---|
-| SLC 500 | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Unconnected | No |
+| SLC 500 | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Unconnected | SLC 5/05 |
 | PLC-5 | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Unconnected | No |
-| MicroLogix | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Unconnected | No |
+| MicroLogix | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Unconnected | MicroLogix 1400 |
 
 **Default port:** TCP 44818
 

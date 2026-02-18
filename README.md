@@ -2,7 +2,7 @@
 
 A pure Go library for communicating with industrial PLCs (Programmable Logic Controllers) across multiple vendors and protocols. plcio provides a unified `Driver` interface for reading tags, writing values, discovering devices, and browsing symbol tables across Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Siemens, Beckhoff, and Omron PLCs.
 
-> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. Allen-Bradley PCCC (SLC 500, PLC-5, MicroLogix) is functional but untested on hardware. Beckhoff is stable but requires more testing. Omron FINS is functional; Omron EIP is experimental.
+> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. Beckhoff is stable but requires more testing. SLC 500, MicroLogix, and Omron FINS are moderately tested. PLC-5 and Omron EIP are untested/experimental.
 
 ## Supported PLC Families
 
@@ -10,9 +10,9 @@ A pure Go library for communicating with industrial PLCs (Programmable Logic Con
 |---|---|---|---|---|
 | **Allen-Bradley Logix** | ControlLogix, CompactLogix | EtherNet/IP (CIP) | Automatic | L7, L8 |
 | **Allen-Bradley Micro800** | Micro820, Micro850 | EtherNet/IP (CIP) | Automatic | Micro820 |
-| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Automatic (file directory) | Untested |
+| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Automatic (file directory) | SLC 5/05 |
 | **Allen-Bradley PLC-5** | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Manual (address-based) | Untested |
-| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Automatic (file directory) | Untested |
+| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Automatic (file directory) | MicroLogix 1400 |
 | **Siemens S7** | S7-300, S7-400, S7-1200, S7-1500 | S7comm (port 102) | Manual (address-based) | S7-1200 |
 | **Beckhoff TwinCAT** | CX series, TwinCAT 2/3 | ADS (port 48898) | Automatic | CX9020 |
 | **Omron (FINS)** | CS1, CJ1/2, CP1, CV | FINS TCP/UDP (port 9600) | Manual (address-based) | CP1 |
@@ -304,15 +304,15 @@ Detailed documentation for each PLC family and feature:
 
 | Feature | Logix | Micro800 | SLC 500 | PLC-5 | MicroLogix | S7 | Beckhoff | Omron FINS | Omron EIP |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Connect/Disconnect | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
-| Read Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
-| Write Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
-| Tag Discovery | Stable | Stable | Untested | N/A | Untested | N/A | Stable | N/A | Experimental |
+| Connect/Disconnect | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
+| Read Tags | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
+| Write Tags | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
+| Tag Discovery | Stable | Stable | Tested | N/A | Tested | N/A | Stable | N/A | Experimental |
 | Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable |
-| Batch Reads | Stable | N/A | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
+| Batch Reads | Stable | N/A | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
 | UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Partial | N/A | No |
-| Device Info | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
-| Keep-alive | Stable | Stable | Untested | Untested | Untested | N/A | N/A | Stable | Experimental |
+| Device Info | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
+| Keep-alive | Stable | Stable | Tested | Untested | Tested | N/A | N/A | Stable | Experimental |
 
 ## Acknowledgements
 
