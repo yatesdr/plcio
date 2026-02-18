@@ -10,9 +10,9 @@ A pure Go library for communicating with industrial PLCs (Programmable Logic Con
 |---|---|---|---|---|
 | **Allen-Bradley Logix** | ControlLogix, CompactLogix | EtherNet/IP (CIP) | Automatic | L7, L8 |
 | **Allen-Bradley Micro800** | Micro820, Micro850 | EtherNet/IP (CIP) | Automatic | Micro820 |
-| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Manual (address-based) | Untested |
+| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Automatic (file directory) | Untested |
 | **Allen-Bradley PLC-5** | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Manual (address-based) | Untested |
-| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Manual (address-based) | Untested |
+| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Automatic (file directory) | Untested |
 | **Siemens S7** | S7-300, S7-400, S7-1200, S7-1500 | S7comm (port 102) | Manual (address-based) | S7-1200 |
 | **Beckhoff TwinCAT** | CX series, TwinCAT 2/3 | ADS (port 48898) | Automatic | CX9020 |
 | **Omron (FINS)** | CS1, CJ1/2, CP1, CV | FINS TCP/UDP (port 9600) | Manual (address-based) | CP1 |
@@ -154,7 +154,7 @@ results, _ := drv.Read([]driver.TagRequest{
 drv.Write("N7:0", 42)
 ```
 
-PCCC PLCs use file-based data table addresses instead of symbolic tag names. Tag discovery is not supported. See [Allen-Bradley PCCC](docs/allen-bradley-pccc.md) for the full address reference and usage details.
+PCCC PLCs use file-based data table addresses instead of symbolic tag names. SLC 500 and MicroLogix support automatic data table discovery via the file directory; PLC-5 requires manual address configuration. See [Allen-Bradley PCCC](docs/allen-bradley-pccc.md) for the full address reference and usage details.
 
 ### Siemens S7
 
@@ -307,7 +307,7 @@ Detailed documentation for each PLC family and feature:
 | Connect/Disconnect | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
 | Read Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
 | Write Tags | Stable | Stable | Untested | Untested | Untested | Stable | Stable | Stable | Experimental |
-| Tag Discovery | Stable | Stable | N/A | N/A | N/A | N/A | Stable | N/A | Experimental |
+| Tag Discovery | Stable | Stable | Untested | N/A | Untested | N/A | Stable | N/A | Experimental |
 | Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable |
 | Batch Reads | Stable | N/A | N/A | N/A | N/A | Stable | Stable | Stable | Experimental |
 | UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Partial | N/A | No |

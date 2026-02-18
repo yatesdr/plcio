@@ -22,6 +22,13 @@ const (
 
 	// CmdTypedReply is the reply bit ORed with the command code.
 	CmdTypedReply byte = 0x4F // 0x0F | 0x40
+
+	// CmdDiagnosticStatus is the Diagnostic Status command (no FNC byte).
+	// Returns processor catalog string and status information.
+	CmdDiagnosticStatus byte = 0x06
+
+	// CmdDiagnosticReply is the reply to Diagnostic Status.
+	CmdDiagnosticReply byte = 0x46 // 0x06 | 0x40
 )
 
 // PCCC function codes for typed commands (CMD=0x0F).
@@ -39,6 +46,9 @@ const (
 
 	// FncTypedWrite is the PLC-5 typed write function.
 	FncTypedWrite byte = 0x67
+
+	// FncReadSection reads a section of a data file (used for file directory discovery).
+	FncReadSection byte = 0xA1
 )
 
 // PCCC status codes (STS byte in response).

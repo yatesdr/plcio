@@ -261,16 +261,56 @@ Writing to a single bit (e.g., `B3:0/5`) performs a **read-modify-write** operat
 
 ## Tag Discovery
 
-PCCC PLCs **do not support** tag discovery or data table browsing over EtherNet/IP. You must configure addresses manually based on your PLC program.
+SLC 500 and MicroLogix processors support **automatic data table discovery** by reading the file directory (system file 0). This enumerates all configured data files with their type and element count.
 
 ```go
-drv.SupportsDiscovery() // Always returns false for PCCC families
+if drv.SupportsDiscovery() {
+    tags, err := drv.AllTags()
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, t := range tags {
+        fmt.Printf("  %s: %s (%d elements)\n", t.Name, t.TypeName, t.Dimensions[0])
+    }
+}
+// Example output:
+//   O0: OUTPUT (1 elements)
+//   I1: INPUT (1 elements)
+//   S2: STATUS (33 elements)
+//   B3: BINARY (1 elements)
+//   T4: TIMER (3 elements)
+//   C5: COUNTER (3 elements)
+//   R6: CONTROL (1 elements)
+//   N7: INT (50 elements)
+//   F8: FLOAT (10 elements)
 ```
 
-To determine the data table layout of your PLC, refer to:
-- **RSLogix 500** for SLC 500 and MicroLogix
-- **RSLogix 5** for PLC-5
-- The PLC program's data file configuration
+### Supported Processors
+
+| Family | Discovery | Method |
+|---|---|---|
+| SLC 500 (5/03, 5/04, 5/05) | Supported | File directory read |
+| MicroLogix (1000, 1100, 1200, 1400, 1500) | Supported | File directory read |
+| PLC-5 | Not supported | PLC-5 does not expose a file directory |
+
+### How It Works
+
+Discovery sends two PCCC commands:
+
+1. **Diagnostic Status** (CMD 0x06) &mdash; retrieves the processor catalog string (e.g., "1747-L552") to identify the processor family and determine the file directory binary layout.
+2. **Read Section** (CMD 0x0F, FNC 0xA1) &mdash; reads system file 0 (the file directory) in 80-byte chunks, then parses each row to extract the file type code and element count.
+
+The discovered tag names use the format `PrefixFileNumber` (e.g., `N7`, `F8`, `T4`). These names correspond directly to the data table addresses used for reading and writing.
+
+### PLC-5
+
+PLC-5 does **not** support file directory discovery. You must configure addresses manually based on your PLC program.
+
+```go
+drv.SupportsDiscovery() // Returns false for PLC-5
+```
+
+To determine the data table layout, refer to **RSLogix 5** or your PLC program documentation.
 
 ## Routing Through a Gateway
 
@@ -325,7 +365,7 @@ If you're familiar with the Logix driver, these are the important differences wh
 |---|---|---|
 | Tag names | Symbolic (e.g., `MyTag`) | Address-based (e.g., `N7:0`) |
 | Type hints | Not needed | Not needed (type from address prefix) |
-| Tag discovery | Automatic | Not supported |
+| Tag discovery | Automatic | SLC/MicroLogix: file directory; PLC-5: none |
 | Connection mode | Connected (Forward Open) or Unconnected | Unconnected only |
 | Batch reads | CIP Multi-Service Packet | Individual requests per address |
 | UDT/structures | Automatic decode | Timer/Counter/Control maps |

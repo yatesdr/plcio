@@ -103,14 +103,46 @@ func (a *PCCCAdapter) GetDeviceInfo() (*DeviceInfo, error) {
 	}, nil
 }
 
-// SupportsDiscovery returns false since SLC500/PLC-5 don't support tag browsing over EIP.
+// SupportsDiscovery returns true for SLC500 and MicroLogix (file directory discovery).
+// PLC-5 does not support file directory reads.
 func (a *PCCCAdapter) SupportsDiscovery() bool {
-	return false
+	return a.config.GetFamily() != FamilyPLC5
 }
 
-// AllTags is not supported for PCCC-based PLCs.
+// AllTags discovers data files from the file directory and returns them as TagInfo entries.
+// Supported for SLC500 and MicroLogix only.
 func (a *PCCCAdapter) AllTags() ([]TagInfo, error) {
-	return nil, fmt.Errorf("tag discovery not supported for %s", a.config.GetFamily())
+	if a.client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	if a.config.GetFamily() == FamilyPLC5 {
+		return nil, fmt.Errorf("tag discovery not supported for PLC-5")
+	}
+
+	entries, err := a.client.DiscoverDataFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	tags := make([]TagInfo, 0, len(entries))
+	for _, e := range entries {
+		var name string
+		if e.TypePrefix != "" {
+			name = fmt.Sprintf("%s%d", e.TypePrefix, e.FileNumber)
+		} else {
+			name = fmt.Sprintf("FILE%d", e.FileNumber)
+		}
+
+		tags = append(tags, TagInfo{
+			Name:       name,
+			TypeCode:   uint16(e.FileType),
+			Dimensions: []uint32{uint32(e.ElementCount)},
+			TypeName:   pccc.TypeName(uint16(e.FileType)),
+			Writable:   true,
+		})
+	}
+
+	return tags, nil
 }
 
 // Programs is not supported for PCCC-based PLCs.

@@ -189,6 +189,44 @@ func FileTypeName(fileType byte) string {
 	}
 }
 
+// FileTypePrefix returns the single-letter address prefix for a PCCC file type code.
+// For example, 0x89 → "N", 0x8A → "F", 0x86 → "T".
+// Returns "" for unknown types.
+func FileTypePrefix(fileType byte) string {
+	switch fileType {
+	case FileTypeOutput:
+		return "O"
+	case FileTypeInput:
+		return "I"
+	case FileTypeStatus:
+		return "S"
+	case FileTypeBinary:
+		return "B"
+	case FileTypeTimer:
+		return "T"
+	case FileTypeCounter:
+		return "C"
+	case FileTypeControl:
+		return "R"
+	case FileTypeInteger:
+		return "N"
+	case FileTypeFloat:
+		return "F"
+	case FileTypeString:
+		return "ST"
+	case FileTypeASCII:
+		return "A"
+	case FileTypeLong:
+		return "L"
+	case FileTypeMessage:
+		return "MG"
+	case FileTypePID:
+		return "PD"
+	default:
+		return ""
+	}
+}
+
 // IsComplexType returns true for file types with sub-elements (Timer, Counter, Control).
 func IsComplexType(fileType byte) bool {
 	return fileType == FileTypeTimer || fileType == FileTypeCounter || fileType == FileTypeControl

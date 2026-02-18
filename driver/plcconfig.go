@@ -20,7 +20,8 @@ const (
 // Note: For Omron PLCs, discovery depends on the protocol (EIP supports it, FINS doesn't).
 // Use PLCConfig.SupportsDiscovery() for protocol-aware check.
 func (f PLCFamily) SupportsDiscovery() bool {
-	return f == FamilyLogix || f == "" || f == FamilyMicro800 || f == FamilyBeckhoff
+	return f == FamilyLogix || f == "" || f == FamilyMicro800 || f == FamilyBeckhoff ||
+		f == FamilySLC500 || f == FamilyMicroLogix
 }
 
 // String returns the string representation of the PLC family.
