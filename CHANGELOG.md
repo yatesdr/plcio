@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2026-03-16
+
+### Fixed
+- **PCCC Discovery Fallback**: SLC and MicroLogix discovery now falls back to
+  parsing the EtherNet/IP `ListIdentity` product name when the PCCC Diagnostic
+  Status probe (`CMD 0x06`) is rejected by the PLC. This restores file
+  discovery on some SLC-500 controllers that return `STS=0x10`.
+
 ## [0.1.5] - 2026-02-18
 
 ### Added

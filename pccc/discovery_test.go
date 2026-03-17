@@ -63,6 +63,29 @@ func TestExtractCatalogPrefix(t *testing.T) {
 	}
 }
 
+func TestExtractCatalogFromIdentityProductName(t *testing.T) {
+	tests := []struct {
+		productName string
+		want        string
+	}{
+		{"1747-L553/C C/10 - DC 3.46 ", "1747-L553"},
+		{"1747-L553/C C/9 - DC 3.33 ", "1747-L553"},
+		{"1763-L16BWA B/16.00", "1763-L16BWA"},
+		{"1766-L32BWAA B/21.00", "1766-L32BWAA"},
+		{"  1747-L552  ", "1747-L552"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.productName, func(t *testing.T) {
+			got := extractCatalogFromIdentityProductName(tt.productName)
+			if got != tt.want {
+				t.Errorf("extractCatalogFromIdentityProductName(%q) = %q, want %q", tt.productName, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseFileDirectory(t *testing.T) {
 	// Build a test directory using SLC layout (RowSize=10, FileType offset=0x01, SizeElement offset=0x23 is too large for 10-byte row)
 	// For SLC (1747): FileType=0x01, SizeElement=0x23, FilePosition=79, RowSize=10

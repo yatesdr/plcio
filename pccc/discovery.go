@@ -32,8 +32,23 @@ const FileTypePlaceholder byte = 0x81
 // GetProcessorType sends a Diagnostic Status command (CMD 0x06) and returns
 // the processor catalog string (e.g., "1747-L552").
 func (p *PLC) GetProcessorType() (string, error) {
+	catalog, err := p.getProcessorTypeFromDiagnosticStatus()
+	if err == nil {
+		return catalog, nil
+	}
+
+	fallbackCatalog, fallbackErr := p.getProcessorTypeFromIdentity()
+	if fallbackErr == nil {
+		debugLog("GetProcessorType: diagnostic probe failed (%v), using ListIdentity catalog %q", err, fallbackCatalog)
+		return fallbackCatalog, nil
+	}
+
+	return "", err
+}
+
+func (p *PLC) getProcessorTypeFromDiagnosticStatus() (string, error) {
 	if p == nil || p.Connection == nil {
-		return "", fmt.Errorf("GetProcessorType: nil PLC or connection")
+		return "", fmt.Errorf("nil PLC or connection")
 	}
 
 	tns := p.nextTNS()
@@ -46,29 +61,29 @@ func (p *PLC) GetProcessorType() (string, error) {
 
 	cipReq, err := wrapInCipExecutePCCC(pcccCmd, p.vendorID, p.serialNum)
 	if err != nil {
-		return "", fmt.Errorf("GetProcessorType: %w", err)
+		return "", err
 	}
 
 	cipResp, err := p.sendCipRequest(cipReq)
 	if err != nil {
-		return "", fmt.Errorf("GetProcessorType: %w", err)
+		return "", err
 	}
 
 	pcccResp, err := parseCipExecutePCCCResponse(cipResp)
 	if err != nil {
-		return "", fmt.Errorf("GetProcessorType: %w", err)
+		return "", err
 	}
 
 	// Response: [CMD 0x46] [STS] [TNS lo] [TNS hi] [data...]
 	if len(pcccResp) < 4 {
-		return "", fmt.Errorf("GetProcessorType: response too short: %d bytes", len(pcccResp))
+		return "", fmt.Errorf("response too short: %d bytes", len(pcccResp))
 	}
 
 	cmd := pcccResp[0]
 	sts := pcccResp[1]
 
 	if cmd != CmdDiagnosticReply {
-		return "", fmt.Errorf("GetProcessorType: unexpected reply command 0x%02X", cmd)
+		return "", fmt.Errorf("unexpected reply command 0x%02X", cmd)
 	}
 	if sts != StsSuccess {
 		return "", PCCCStatusError(sts, 0)
@@ -79,12 +94,33 @@ func (p *PLC) GetProcessorType() (string, error) {
 	// For SLC/MicroLogix, the catalog string is at bytes 12-21 (0-indexed from data start).
 	data := pcccResp[4:]
 	if len(data) < 22 {
-		return "", fmt.Errorf("GetProcessorType: diagnostic data too short: %d bytes", len(data))
+		return "", fmt.Errorf("diagnostic data too short: %d bytes", len(data))
 	}
 
 	// Extract catalog: starts at byte 12, up to 10 chars, null/space terminated
 	catalog := extractCatalog(data[12:22])
 	debugLog("GetProcessorType: catalog=%q", catalog)
+	return catalog, nil
+}
+
+func (p *PLC) getProcessorTypeFromIdentity() (string, error) {
+	if p == nil || p.Connection == nil {
+		return "", fmt.Errorf("nil PLC or connection")
+	}
+
+	identities, err := p.Connection.ListIdentityTCP()
+	if err != nil {
+		return "", err
+	}
+	if len(identities) == 0 {
+		return "", fmt.Errorf("no identity response")
+	}
+
+	catalog := extractCatalogFromIdentityProductName(identities[0].ProductName)
+	if catalog == "" {
+		return "", fmt.Errorf("unable to extract catalog from product name %q", identities[0].ProductName)
+	}
+
 	return catalog, nil
 }
 
@@ -100,6 +136,23 @@ func extractCatalog(raw []byte) string {
 		}
 	}
 	return strings.TrimRight(string(raw[:end]), " ")
+}
+
+func extractCatalogFromIdentityProductName(productName string) string {
+	productName = strings.TrimSpace(productName)
+	if productName == "" {
+		return ""
+	}
+
+	firstField := productName
+	if idx := strings.IndexAny(productName, " \t"); idx >= 0 {
+		firstField = productName[:idx]
+	}
+	if idx := strings.IndexByte(firstField, '/'); idx >= 0 {
+		firstField = firstField[:idx]
+	}
+
+	return strings.TrimSpace(firstField)
 }
 
 // extractCatalogPrefix returns the first 4 characters of a catalog string,
