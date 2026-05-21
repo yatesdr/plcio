@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-05-21
+
+### Added
+- **EtherNet/IP Adapter Mode**: new `eipadapter/` package implementing the
+  adapter (server) side of EtherNet/IP. Lets a Go program be scanned by a PLC,
+  exposing Identity / Message Router / Assembly / Connection Manager / TCP-IP
+  Interface / Ethernet Link objects, responding to ListIdentity discovery, and
+  producing Class 1 cyclic I/O at the negotiated RPI. Use for smart sensors,
+  vision systems, and bench fixtures.
+- **`eip` package**: exported `Frame` type with `ReadFrame`, `ParseFrame`,
+  `BuildRRData`, `ParseRRData` helpers — symmetric server-side counterparts to
+  the existing client primitives. Existing client-side `EipEncap` type and
+  paths are unchanged.
+- **`cip` package**: `ParseForwardOpenRequest`, `BuildForwardOpenSuccess`,
+  `BuildForwardOpenError`, `ParseForwardCloseRequest`,
+  `BuildForwardCloseSuccess`, and `ParsePath` for adapter-side use. Existing
+  scanner-side Forward_Open builder and response parser are unchanged.
+
+### Notes
+- All additions are strictly additive. No existing scanner-side code paths
+  are modified; v0.1.6 applications continue to work without changes.
+- The adapter is not safety-rated. Do not use it as a permissive output in a
+  safety function. See `docs/safety-and-intended-use.md`.
+
 ## [0.1.6] - 2026-03-16
 
 ### Fixed

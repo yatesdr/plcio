@@ -286,6 +286,24 @@ for _, dev := range devices {
 - **Connection detection** &mdash; Built-in heuristics to detect connection loss
 - **Keep-alive** &mdash; Automatic connection maintenance for protocols that need it
 
+## Adapter Mode
+
+In addition to the scanner-side drivers above, plcio includes an **adapter-side** package (`plcio/eipadapter`) that lets your Go program be scanned by a PLC over EtherNet/IP. Typical use: smart sensors, vision systems, or bench fixtures that feed data into a PLC's I/O scan.
+
+```go
+import "github.com/yatesdr/plcio/eipadapter"
+
+input := eipadapter.NewAssembly(101, eipadapter.AssemblyInput, 16)
+adp, _ := eipadapter.New(eipadapter.Config{
+    Identity:   eipadapter.Identity{VendorID: 0x1337, DeviceType: 0x000C, ProductName: "MyDevice", SerialNumber: 1, RevMajor: 1, State: 0x03},
+    Assemblies: []*eipadapter.Assembly{input},
+})
+go adp.Serve(ctx)
+input.SetBytes(0, myDataBytes) // produced cyclically at the negotiated RPI
+```
+
+See [EtherNet/IP Adapter](docs/eip-adapter.md) for the full guide. This package is not safety-rated — see [Safety & Intended Use](docs/safety-and-intended-use.md).
+
 ## Documentation
 
 Detailed documentation for each PLC family and feature:
@@ -295,6 +313,7 @@ Detailed documentation for each PLC family and feature:
 - [Siemens S7](docs/siemens-s7.md)
 - [Beckhoff TwinCAT (ADS)](docs/beckhoff.md)
 - [Omron (FINS & EIP)](docs/omron.md)
+- [EtherNet/IP Adapter (be-a-device)](docs/eip-adapter.md)
 - [Network Discovery](docs/network-discovery.md)
 - [API Reference](docs/api-reference.md)
 - [Safety & Intended Use](docs/safety-and-intended-use.md)
