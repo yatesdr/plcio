@@ -2,12 +2,30 @@ package pccc
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"time"
 
 	"github.com/yatesdr/plcio/eip"
 )
+
+// ErrConnectionLost indicates the link to the PLC dropped during a read. Read
+// folds per-address failures into each TagValue.Error and otherwise returns a
+// nil top-level error, so callers cannot tell a lost link from a single bad
+// address. When the transport has dropped, Read surfaces this error at the top
+// level — alongside any partial results — so callers can reconnect. Detect it
+// with errors.Is(err, ErrConnectionLost).
+var ErrConnectionLost = errors.New("pccc: connection lost during read")
+
+// connErrorIfDown returns a wrapped ErrConnectionLost when the underlying
+// transport has dropped, otherwise nil.
+func (c *Client) connErrorIfDown() error {
+	if !c.IsConnected() {
+		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
+	}
+	return nil
+}
 
 // Client is a high-level wrapper for PCCC communication with SLC500, PLC-5,
 // and MicroLogix processors. It provides type-safe read/write operations
@@ -196,7 +214,7 @@ func (c *Client) Read(addresses ...string) ([]*TagValue, error) {
 		})
 	}
 
-	return results, nil
+	return results, c.connErrorIfDown()
 }
 
 // Write writes a Go value to a data table address.

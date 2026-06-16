@@ -4,6 +4,7 @@ package omron
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,6 +14,32 @@ import (
 	"github.com/yatesdr/plcio/eip"
 	"github.com/yatesdr/plcio/logging"
 )
+
+// ErrConnectionLost indicates the link to the PLC dropped during a read. The
+// FINS read paths fold per-address failures into each TagValue.Error and
+// otherwise return a nil top-level error, so callers cannot tell a lost link
+// from a single bad address. When the transport has dropped, the read methods
+// surface this error at the top level — alongside any partial results — so
+// callers can reconnect. Detect it with errors.Is(err, ErrConnectionLost).
+// (The EIP path already escalates connection errors on its own.)
+var ErrConnectionLost = errors.New("omron: connection lost during read")
+
+// connErrorIfDownLocked returns a wrapped ErrConnectionLost when the underlying
+// transport has dropped, otherwise nil. It must be called with c.mu held (the
+// read paths hold it) and queries each transport's own state without re-locking
+// c.mu, so it cannot be replaced by IsConnected() (which locks c.mu).
+func (c *Client) connErrorIfDownLocked() error {
+	connected := false
+	if c.fins != nil {
+		connected = c.fins.isConnected()
+	} else if c.eipClient != nil {
+		connected = c.connected && c.eipClient.IsConnected()
+	}
+	if !connected {
+		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
+	}
+	return nil
+}
 
 // CIP service codes for Read/Write Tag operations.
 const (
@@ -838,13 +865,19 @@ func (c *Client) Read(addresses ...string) ([]*TagValue, error) {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	// EIP uses symbolic addressing with MSP batching
+	var results []*TagValue
+	var err error
 	if c.eipClient != nil {
-		return c.readEIPBatched(addresses)
+		// EIP uses symbolic addressing with MSP batching
+		results, err = c.readEIPBatched(addresses)
+	} else {
+		// FINS uses memory addressing with contiguous grouping
+		results, err = c.readFINSBatched(addresses)
 	}
-
-	// FINS uses memory addressing with contiguous grouping
-	return c.readFINSBatched(addresses)
+	if err == nil {
+		err = c.connErrorIfDownLocked()
+	}
+	return results, err
 }
 
 // sendCIPRequest sends a CIP request via EIP.
@@ -1151,17 +1184,23 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	// EIP doesn't need type hints (types are embedded) - use batched read
+	var results []*TagValue
+	var err error
 	if c.eipClient != nil {
+		// EIP doesn't need type hints (types are embedded) - use batched read
 		addrs := make([]string, len(requests))
 		for i, req := range requests {
 			addrs[i] = req.Address
 		}
-		return c.readEIPBatched(addrs)
+		results, err = c.readEIPBatched(addrs)
+	} else {
+		// FINS with type hints - use batched read with type application
+		results, err = c.readFINSWithTypesBatched(requests)
 	}
-
-	// FINS with type hints - use batched read with type application
-	return c.readFINSWithTypesBatched(requests)
+	if err == nil {
+		err = c.connErrorIfDownLocked()
+	}
+	return results, err
 }
 
 // readFINSWithTypesBatched reads FINS addresses with type hints using batching.

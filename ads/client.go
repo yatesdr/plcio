@@ -2,6 +2,7 @@ package ads
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -11,6 +12,23 @@ import (
 
 	"github.com/yatesdr/plcio/logging"
 )
+
+// ErrConnectionLost indicates the link to the PLC dropped during a read. Read
+// folds per-symbol failures into each TagValue.Error and otherwise returns a
+// nil top-level error, so callers cannot tell a lost link from a single bad
+// symbol. When the transport has dropped, Read surfaces this error at the top
+// level — alongside any partial results — so callers can reconnect. Detect it
+// with errors.Is(err, ErrConnectionLost).
+var ErrConnectionLost = errors.New("ads: connection lost during read")
+
+// connErrorIfDown returns a wrapped ErrConnectionLost when the underlying
+// transport has dropped, otherwise nil.
+func (c *Client) connErrorIfDown() error {
+	if !c.IsConnected() {
+		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
+	}
+	return nil
+}
 
 // Client provides high-level access to a Beckhoff TwinCAT PLC via ADS protocol.
 // It handles symbol discovery, handle management, and type-safe read/write operations.
@@ -448,7 +466,7 @@ func (c *Client) Read(symbolNames ...string) ([]*TagValue, error) {
 		logging.DebugLog("ADS", "Read 1 symbol (single)")
 		value, err := c.readSymbol(symbolNames[0])
 		if err != nil {
-			return []*TagValue{{Name: symbolNames[0], Error: err}}, nil
+			return []*TagValue{{Name: symbolNames[0], Error: err}}, c.connErrorIfDown()
 		}
 		return []*TagValue{value}, nil
 	}
@@ -471,7 +489,7 @@ func (c *Client) Read(symbolNames ...string) ([]*TagValue, error) {
 		return c.readIndividual(symbolNames)
 	}
 
-	return results, nil
+	return results, c.connErrorIfDown()
 }
 
 // getSymbolEntries retrieves symbol entries for multiple symbols.
@@ -654,7 +672,7 @@ func (c *Client) readIndividual(symbolNames []string) ([]*TagValue, error) {
 		logging.DebugLog("ADS", "Individual read completed: %d success, %d errors", len(symbolNames)-errorCount, errorCount)
 	}
 
-	return results, nil
+	return results, c.connErrorIfDown()
 }
 
 // readSymbol reads a single symbol value.

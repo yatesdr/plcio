@@ -49,6 +49,7 @@ func IsLikelyConnectionError(err error) bool {
 		"forcibly closed",
 		"socket closed",
 		"not connected",
+		"connection lost",
 	}
 
 	for _, keyword := range connectionKeywords {

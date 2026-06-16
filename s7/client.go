@@ -2,6 +2,7 @@ package s7
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -9,6 +10,25 @@ import (
 
 	"github.com/yatesdr/plcio/logging"
 )
+
+// ErrConnectionLost indicates the link to the PLC dropped during a read. The
+// read paths fold per-address failures into each TagValue.Error and otherwise
+// return a nil top-level error, so callers cannot tell a lost link from a
+// single bad address. When the transport has dropped, the read methods surface
+// this error at the top level — alongside any partial results — so callers can
+// reconnect. Detect it with errors.Is(err, ErrConnectionLost).
+var ErrConnectionLost = errors.New("s7: connection lost during read")
+
+// connErrorIfDownLocked returns a wrapped ErrConnectionLost when the underlying
+// transport has dropped, otherwise nil. It must be called with c.mu held (the
+// read paths hold it); it queries the transport's own state without re-locking
+// c.mu, so it cannot be replaced by IsConnected() (which locks c.mu).
+func (c *Client) connErrorIfDownLocked() error {
+	if c.transport == nil || !c.transport.isConnected() {
+		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
+	}
+	return nil
+}
 
 // Client is a high-level wrapper for S7 PLC communication.
 type Client struct {
@@ -423,7 +443,7 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 	// Flush remaining batch
 	flushBatch()
 
-	return results, nil
+	return results, c.connErrorIfDownLocked()
 }
 
 // readBatch reads multiple addresses in a single S7 request.
