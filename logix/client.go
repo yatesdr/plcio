@@ -2,6 +2,7 @@ package logix
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -9,6 +10,25 @@ import (
 
 	"github.com/yatesdr/plcio/logging"
 )
+
+// ErrConnectionLost indicates the EIP session was torn down during a read, i.e.
+// the link to the PLC dropped. Batch read methods fold per-request failures into
+// each TagValue.Error and otherwise return a nil top-level error, so callers
+// cannot tell a lost link from a single bad tag. When the transport has dropped
+// (transactEncap closes the socket on any send/recv failure), the read methods
+// surface this error at the top level — alongside any partial results — so
+// callers can reconnect. Detect it with errors.Is(err, ErrConnectionLost).
+var ErrConnectionLost = errors.New("logix: connection lost during read")
+
+// connErrorIfDown returns a wrapped ErrConnectionLost when the underlying
+// transport has dropped, otherwise nil. Used to convert silently-swallowed
+// transport failures in the batch read paths into an explicit top-level signal.
+func (c *Client) connErrorIfDown() error {
+	if c.plc != nil && !c.plc.IsConnected() {
+		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
+	}
+	return nil
+}
 
 // Client is a high-level wrapper that manages connection lifecycle
 // and provides simplified methods for common PLC operations.
@@ -573,7 +593,7 @@ func (c *Client) Read(tagNames ...string) ([]*TagValue, error) {
 		}
 	}
 
-	return results, nil
+	return results, c.connErrorIfDown()
 }
 
 // ReadWithCount reads a single tag with a specified element count.
@@ -641,7 +661,7 @@ func (c *Client) readIndividual(tagNames []string) ([]*TagValue, error) {
 		}
 	}
 
-	return results, nil
+	return results, c.connErrorIfDown()
 }
 
 // readStructMembers reads a UDT/structure by reading each member individually.
