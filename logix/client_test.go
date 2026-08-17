@@ -3,6 +3,9 @@ package logix
 import (
 	"errors"
 	"testing"
+
+	"github.com/yatesdr/plcio/cip"
+	"github.com/yatesdr/plcio/eip"
 )
 
 // When the underlying transport is down, the batch read paths must surface
@@ -27,5 +30,23 @@ func TestConnErrorIfDownNilPLC(t *testing.T) {
 	c := &Client{}
 	if err := c.connErrorIfDown(); err != nil {
 		t.Fatalf("expected nil error when plc is nil, got %v", err)
+	}
+}
+
+// A Forward Open object can remain populated after the EIP client tears down
+// its socket. The transport state is authoritative in that situation.
+func TestIsConnectedRejectsStaleCIPConnection(t *testing.T) {
+	plc := &PLC{
+		Connection: eip.NewEipClient("127.0.0.1"),
+		cipConn:    &cip.Connection{},
+	}
+
+	if plc.IsConnected() {
+		t.Fatal("expected disconnected when CIP state exists but the EIP transport is down")
+	}
+
+	err := (&Client{plc: plc}).connErrorIfDown()
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("expected ErrConnectionLost for stale CIP state, got %v", err)
 	}
 }

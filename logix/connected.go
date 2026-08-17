@@ -190,19 +190,11 @@ func (p *PLC) CloseConnection() error {
 	return nil
 }
 
-// IsConnected returns true if the PLC connection is active.
-// For connected messaging, this checks the CIP connection.
-// For unconnected messaging, this checks the underlying EIP/TCP connection.
+// IsConnected returns true when the underlying EIP/TCP transport is active.
+// A CIP connection object can outlive a dropped transport, so its presence alone
+// must not be used as evidence that the PLC is still reachable.
 func (p *PLC) IsConnected() bool {
-	if p == nil {
-		return false
-	}
-	// For connected messaging, check CIP connection
-	if p.cipConn != nil {
-		return true
-	}
-	// For unconnected messaging, check TCP connection
-	return p.Connection != nil && p.Connection.IsConnected()
+	return p != nil && p.Connection != nil && p.Connection.IsConnected()
 }
 
 // ReadTagConnected reads a tag using connected messaging.
