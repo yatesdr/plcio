@@ -39,20 +39,20 @@ const (
 	AreaTimerCounterPV byte = 0x89 // Timer/Counter PV
 
 	// Extended Memory (EM) bank areas
-	AreaEM0Word  byte = 0xA0 // EM bank 0; word
-	AreaEM1Word  byte = 0xA1 // EM bank 1; word
-	AreaEM2Word  byte = 0xA2 // EM bank 2; word
-	AreaEM3Word  byte = 0xA3 // EM bank 3; word
-	AreaEM4Word  byte = 0xA4 // EM bank 4; word
-	AreaEM5Word  byte = 0xA5 // EM bank 5; word
-	AreaEM6Word  byte = 0xA6 // EM bank 6; word
-	AreaEM7Word  byte = 0xA7 // EM bank 7; word
-	AreaEM8Word  byte = 0xA8 // EM bank 8; word
-	AreaEM9Word  byte = 0xA9 // EM bank 9; word
-	AreaEMAWord  byte = 0xAA // EM bank A; word
-	AreaEMBWord  byte = 0xAB // EM bank B; word
-	AreaEMCWord  byte = 0xAC // EM bank C; word
-	AreaEMCurr   byte = 0x98 // EM current bank; word
+	AreaEM0Word byte = 0xA0 // EM bank 0; word
+	AreaEM1Word byte = 0xA1 // EM bank 1; word
+	AreaEM2Word byte = 0xA2 // EM bank 2; word
+	AreaEM3Word byte = 0xA3 // EM bank 3; word
+	AreaEM4Word byte = 0xA4 // EM bank 4; word
+	AreaEM5Word byte = 0xA5 // EM bank 5; word
+	AreaEM6Word byte = 0xA6 // EM bank 6; word
+	AreaEM7Word byte = 0xA7 // EM bank 7; word
+	AreaEM8Word byte = 0xA8 // EM bank 8; word
+	AreaEM9Word byte = 0xA9 // EM bank 9; word
+	AreaEMAWord byte = 0xAA // EM bank A; word
+	AreaEMBWord byte = 0xAB // EM bank B; word
+	AreaEMCWord byte = 0xAC // EM bank C; word
+	AreaEMCurr  byte = 0x98 // EM current bank; word
 )
 
 // Data type codes for Omron.
@@ -88,14 +88,14 @@ const (
 
 	// Omron-specific type codes
 	// Based on libplctag research and Wireshark captures
-	TypeOmronByte   uint16 = 0xD1 // Omron BYTE (sometimes used instead of USINT)
-	TypeOmronWord   uint16 = 0xD2 // Omron WORD (sometimes used instead of UINT)
-	TypeOmronDWord  uint16 = 0xD3 // Omron DWORD (sometimes used instead of UDINT)
-	TypeOmronLWord  uint16 = 0xD4 // Omron LWORD (sometimes used instead of ULINT)
-	TypeOmronTime   uint16 = 0xDB // Omron TIME (4 bytes, milliseconds)
-	TypeOmronDate   uint16 = 0xDC // Omron DATE
-	TypeOmronTOD    uint16 = 0xDD // Omron TIME_OF_DAY
-	TypeOmronDT     uint16 = 0xDE // Omron DATE_AND_TIME
+	TypeOmronByte  uint16 = 0xD1 // Omron BYTE (sometimes used instead of USINT)
+	TypeOmronWord  uint16 = 0xD2 // Omron WORD (sometimes used instead of UINT)
+	TypeOmronDWord uint16 = 0xD3 // Omron DWORD (sometimes used instead of UDINT)
+	TypeOmronLWord uint16 = 0xD4 // Omron LWORD (sometimes used instead of ULINT)
+	TypeOmronTime  uint16 = 0xDB // Omron TIME (4 bytes, milliseconds)
+	TypeOmronDate  uint16 = 0xDC // Omron DATE
+	TypeOmronTOD   uint16 = 0xDD // Omron TIME_OF_DAY
+	TypeOmronDT    uint16 = 0xDE // Omron DATE_AND_TIME
 
 	// Structure/UDT type indicator (high byte = 0x02 indicates struct)
 	TypeStructFlag uint16 = 0x0200
@@ -521,6 +521,16 @@ func EncodeValue(value interface{}, typeCode uint16, bigEndian bool) ([]byte, er
 			result = append(result, encoded...)
 		}
 		return result, nil
+	case []bool:
+		var result []byte
+		for _, elem := range v {
+			encoded, err := encodeScalar(elem, typeCode, order)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, encoded...)
+		}
+		return result, nil
 	}
 
 	// Handle scalar values
@@ -555,6 +565,9 @@ func encodeScalar(value interface{}, typeCode uint16, order binary.ByteOrder) ([
 			}
 		default:
 			return nil, fmt.Errorf("cannot convert %T to BOOL", value)
+		}
+		if order == binary.LittleEndian {
+			return []byte{byte(v)}, nil
 		}
 		buf := make([]byte, 2)
 		order.PutUint16(buf, v)

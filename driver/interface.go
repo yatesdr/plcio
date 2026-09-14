@@ -1,5 +1,6 @@
 package driver
 
+import "github.com/yatesdr/plcio/metadata"
 
 // Driver is the unified interface for all PLC communications.
 // Each PLC family has an adapter that implements this interface.
@@ -26,4 +27,9 @@ type Driver interface {
 	// Maintenance
 	Keepalive() error
 	IsConnectionError(err error) bool
+}
+
+// Describer is optional symbol inspection; ordinary Read/Write do not require it.
+type Describer interface {
+	Describe(request TagRequest) (*metadata.Symbol, error)
 }

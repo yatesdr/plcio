@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,55 +11,50 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yatesdr/plcio/logging"
+	"github.com/yatesdr/plcio/metadata"
 )
 
-// ErrConnectionLost indicates the link to the PLC dropped during a read. Read
-// folds per-symbol failures into each TagValue.Error and otherwise returns a
-// nil top-level error, so callers cannot tell a lost link from a single bad
-// symbol. When the transport has dropped, Read surfaces this error at the top
-// level — alongside any partial results — so callers can reconnect. Detect it
-// with errors.Is(err, ErrConnectionLost).
+// ErrConnectionLost indicates an unusable ADS stream. Partial read slots are
+// retained. Wrapped I/O causes and *AdsError remain inspectable with errors.As.
 var ErrConnectionLost = errors.New("ads: connection lost during read")
 
-// connErrorIfDown returns a wrapped ErrConnectionLost when the underlying
-// transport has dropped, otherwise nil.
-func (c *Client) connErrorIfDown() error {
-	if !c.IsConnected() {
-		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
-	}
-	return nil
-}
-
-// Client provides high-level access to a Beckhoff TwinCAT PLC via ADS protocol.
-// It handles symbol discovery, handle management, and type-safe read/write operations.
+// Client provides bounded symbolic ADS access. Lock ownership: mu protects only
+// session publication/state and operation-gate initialization; never hold mu
+// during I/O or while waiting on gate. gate serializes complete operations and
+// owns all caches, handles and deadline. Close may close the stream under mu to
+// abort active work, but never mutates operation-owned caches without gate.
 type Client struct {
-	conn        *adsConnection
-	targetNetId AmsNetId
-	targetPort  uint16
-	localNetId  AmsNetId
-	localPort   uint16
-
-	// Symbol cache for efficient access
-	symbols     map[string]*SymbolEntry
-	symbolsMu   sync.RWMutex
-	symbolsLoaded bool
-
-	// Connection state
-	connected bool
-	mu        sync.Mutex
-
-	// Device info (cached after first read)
-	deviceInfo *DeviceInfo
+	mu                                   sync.Mutex
+	gate                                 chan struct{}
+	conn                                 *adsConnection
+	connected, closed                    bool
+	epoch, generation                    uint64
+	endpoint                             string
+	cfg                                  options
+	targetNetId, localNetId              AmsNetId
+	targetPort, localPort                uint16
+	deviceInfo                           *DeviceInfo
+	deadline                             time.Time
+	symbols                              map[string]*SymbolEntry // direct lookup cache; not catalog membership
+	catalog                              []TagInfo
+	symbolsLoaded                        bool
+	snapshot                             *schemaSnapshot
+	versionCapability                    uint8 // 0 unknown, 1 supported, 2 documented unsupported
+	symbolVersion                        uint32
+	versionSet                           bool
+	catalogUnavailable, typesUnavailable bool
+	lookupSymbols                        map[string]*symbolRecord
+	fallbackResolver                     *typeResolver
+	lookupBytes                          uint64
 }
 
-// SymbolEntry holds cached information about a symbol.
+// SymbolEntry retains the published raw symbol and handle layout.
 type SymbolEntry struct {
 	Info   TagInfo
-	Handle uint32 // Cached handle (0 if not acquired)
+	Handle uint32
 }
 
-// DeviceInfo contains information about the connected TwinCAT device.
+// DeviceInfo describes the verified device identity.
 type DeviceInfo struct {
 	MajorVersion uint8
 	MinorVersion uint8
@@ -66,7 +62,6 @@ type DeviceInfo struct {
 	DeviceName   string
 }
 
-// String returns a human-readable device description.
 func (d *DeviceInfo) String() string {
 	if d == nil {
 		return "Unknown"
@@ -74,181 +69,205 @@ func (d *DeviceInfo) String() string {
 	return fmt.Sprintf("%s v%d.%d.%d", d.DeviceName, d.MajorVersion, d.MinorVersion, d.BuildVersion)
 }
 
-// options holds configuration options for Connect.
-type options struct {
-	targetNetId AmsNetId
-	targetPort  uint16
-	timeout     time.Duration
-}
-
-// Option is a functional option for Connect.
-type Option func(*options)
-
-// WithAmsNetId configures the target AMS Net ID.
-// If not specified, it will be derived from the IP address (IP.1.1).
-func WithAmsNetId(netId string) Option {
-	return func(o *options) {
-		parsed, err := ParseAmsNetId(netId)
-		if err == nil {
-			o.targetNetId = parsed
-		}
-	}
-}
-
-// WithAmsPort configures the target AMS port.
-// Default is 851 (TwinCAT 3 PLC runtime 1).
-func WithAmsPort(port uint16) Option {
-	return func(o *options) {
-		o.targetPort = port
-	}
-}
-
-// WithTimeout configures the connection and operation timeout.
-// Default is 5 seconds.
-func WithTimeout(d time.Duration) Option {
-	return func(o *options) {
-		o.timeout = d
-	}
-}
-
-// Connect establishes a connection to a Beckhoff TwinCAT PLC at the given address.
-// The address should be an IP address or hostname (port 48898 is used for ADS).
+// Connect verifies identity before publishing a session. A supplied TCP port is
+// retained; target/local AMS identities do not determine the TCP endpoint.
 func Connect(address string, opts ...Option) (*Client, error) {
-	// Apply options
-	cfg := &options{
-		targetPort: PortTC3PLC1, // Default TwinCAT 3 PLC runtime 1
-		timeout:    5 * time.Second,
-	}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-
-	// Parse address and extract IP
-	host, _, err := net.SplitHostPort(address)
+	endpoint, cfg, err := configure(address, opts)
 	if err != nil {
-		// No port specified, use address as-is
-		host = address
-	}
-
-	// Derive target Net ID from IP if not specified
-	if cfg.targetNetId.IsZero() {
-		cfg.targetNetId, err = AmsNetIdFromIP(host)
-		if err != nil {
-			return nil, fmt.Errorf("Connect: cannot derive AMS Net ID from %q: %w", host, err)
-		}
-	}
-
-	// Connect to ADS TCP port
-	tcpAddr := fmt.Sprintf("%s:%d", host, DefaultTCPPort)
-	logging.DebugConnect("ADS", tcpAddr)
-	logging.DebugLog("ADS", "Connection params: targetNetId=%s, targetPort=%d", cfg.targetNetId.String(), cfg.targetPort)
-
-	conn, err := net.DialTimeout("tcp", tcpAddr, cfg.timeout)
-	if err != nil {
-		logging.DebugConnectError("ADS", tcpAddr, err)
 		return nil, fmt.Errorf("Connect: %w", err)
 	}
-
-	logging.DebugLog("ADS", "TCP connection established to %s", tcpAddr)
-
-	// Set connection timeouts
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	c := &Client{endpoint: endpoint, cfg: cfg, targetNetId: cfg.targetNetId,
+		targetPort: cfg.targetPort, localNetId: cfg.localNetId, localPort: cfg.localPort}
+	if err := c.Reconnect(); err != nil {
+		return nil, fmt.Errorf("Connect: %w", err)
 	}
-
-	// Derive local AMS Net ID from the connection's local IP address.
-	// This must match what the Beckhoff route expects (typically IP.1.1).
-	var localNetId AmsNetId
-	if localAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-		// Get IPv4 address (handles IPv6-mapped IPv4 addresses)
-		ip := localAddr.IP
-		if ip4 := ip.To4(); ip4 != nil {
-			ip = ip4
-		}
-		localNetId, err = AmsNetIdFromIP(ip.String())
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("Connect: cannot derive local AMS Net ID from %s: %w", ip.String(), err)
-		}
-	} else {
-		// Fallback to generic ID (may not work with strict routes)
-		localNetId = AmsNetId{0, 0, 0, 0, 1, 1}
-	}
-	localPort := uint16(32768 + (time.Now().UnixNano() % 1000)) // Random-ish port
-
-	adsConn := newAdsConnection(conn, localNetId, localPort)
-
-	client := &Client{
-		conn:        adsConn,
-		targetNetId: cfg.targetNetId,
-		targetPort:  cfg.targetPort,
-		localNetId:  localNetId,
-		localPort:   localPort,
-		symbols:     make(map[string]*SymbolEntry),
-		connected:   true,
-	}
-
-	// Verify connection by reading device info
-	info, err := client.readDeviceInfo()
-	if err != nil {
-		logging.DebugError("ADS", "readDeviceInfo", err)
-		conn.Close()
-		return nil, fmt.Errorf("Connect: failed to read device info: %w", err)
-	}
-	client.deviceInfo = info
-
-	logging.DebugConnectSuccess("ADS", tcpAddr, fmt.Sprintf("device=%s, local=%s:%d, target=%s:%d",
-		info.String(), localNetId.String(), localPort, cfg.targetNetId.String(), cfg.targetPort))
-
-	return client, nil
+	return c, nil
 }
 
-// Close releases all resources associated with the client.
+func (c *Client) budgetLocked() time.Duration {
+	if c.cfg.timeout == 0 {
+		return 5 * time.Second
+	} // zero Client is usable in offline tests
+	return c.cfg.timeout
+}
+
+func (c *Client) gateLocked() chan struct{} {
+	if c.gate == nil {
+		c.gate = make(chan struct{}, 1)
+		c.gate <- struct{}{}
+	}
+	return c.gate
+}
+
+func (c *Client) begin(allowDisconnected bool) (uint64, func(), error) {
+	if c == nil {
+		return 0, nil, fmt.Errorf("nil ADS client")
+	}
+	c.mu.Lock()
+	gate, epoch, budget := c.gateLocked(), c.epoch, c.budgetLocked()
+	c.mu.Unlock()
+	deadline := time.Now().Add(budget)
+	select {
+	case <-gate:
+	default:
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case <-gate:
+		case <-timer.C:
+			return 0, nil, fmt.Errorf("ADS operation lock: %w", context.DeadlineExceeded)
+		}
+	}
+	done := func() { gate <- struct{}{} }
+	c.mu.Lock()
+	valid := epoch == c.epoch && (allowDisconnected || (!c.closed && c.connected && c.conn != nil && !c.conn.dead.Load()))
+	c.mu.Unlock()
+	if !valid {
+		done()
+		return 0, nil, fmt.Errorf("%w: %w", ErrConnectionLost, net.ErrClosed)
+	}
+	c.deadline = deadline
+	if c.symbols == nil {
+		c.symbols = make(map[string]*SymbolEntry)
+	}
+	return epoch, done, nil
+}
+
+// Reconnect deduplicates attempts and retains the original TCP endpoint/options.
+// An attempt predating Close cannot publish a late replacement session.
+func (c *Client) Reconnect() error {
+	epoch, done, err := c.begin(true)
+	if err != nil {
+		return err
+	}
+	defer done()
+	if c.IsConnected() {
+		return nil
+	}
+	if c.endpoint == "" {
+		return fmt.Errorf("reconnect: original TCP endpoint unavailable")
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), c.deadline)
+	defer cancel()
+	tcp, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.endpoint)
+	if err != nil {
+		return fmt.Errorf("reconnect dial %s: %w", c.endpoint, err)
+	}
+	local := c.localNetId
+	if local.IsZero() {
+		addr, ok := tcp.LocalAddr().(*net.TCPAddr)
+		if !ok {
+			tcp.Close()
+			return fmt.Errorf("cannot derive local AMS identity")
+		}
+		local, err = AmsNetIdFromIP(addr.IP.String())
+		if err != nil {
+			tcp.Close()
+			return err
+		}
+	}
+	port := c.localPort
+	if port == 0 {
+		port = uint16(32768 + time.Now().UnixNano()%1000)
+	}
+	conn := newAdsConnection(tcp, local, port)
+	conn.maxPayload, conn.timeout = c.cfg.maxPayload, c.cfg.timeout
+	if conn.maxPayload == 0 {
+		conn.maxPayload = 1 << 20
+	}
+	if conn.timeout == 0 {
+		conn.timeout = 5 * time.Second
+	}
+	resp, err := conn.sendRequestUntil(c.targetNetId, c.targetPort, CmdReadDeviceInfo, nil, c.deadline)
+	if err != nil {
+		conn.close()
+		return fmt.Errorf("reconnect identity: %w", err)
+	}
+	info, err := decodeDeviceInfo(resp)
+	if err != nil {
+		conn.close()
+		return fmt.Errorf("reconnect identity: %w", err)
+	}
+	c.mu.Lock()
+	if epoch != c.epoch {
+		c.mu.Unlock()
+		conn.close()
+		return fmt.Errorf("reconnect superseded by Close: %w", net.ErrClosed)
+	}
+	previous := c.conn
+	c.conn, c.localNetId, c.localPort, c.deviceInfo = conn, local, port, info
+	c.connected, c.closed = true, false
+	c.generation++
+	c.mu.Unlock()
+	if previous != nil {
+		previous.close()
+	}
+	c.invalidateCaches()
+	c.versionCapability, c.versionSet, c.catalogUnavailable, c.typesUnavailable = 0, false, false, false
+	return nil
+}
+
+func (c *Client) invalidateCaches() {
+	c.symbols = make(map[string]*SymbolEntry)
+	c.catalog = nil
+	c.symbolsLoaded = false
+	c.snapshot = nil
+	c.lookupSymbols = make(map[string]*symbolRecord)
+	c.fallbackResolver = nil
+	c.lookupBytes = 0
+}
+
+// Close is idempotent and spends at most one budget on total handle cleanup.
+// Active I/O is aborted immediately; a busy/desynchronized stream is not reused.
 func (c *Client) Close() {
 	if c == nil {
 		return
 	}
-
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	logging.DebugDisconnect("ADS", c.targetNetId.String(), "close requested")
-
-	c.connected = false
-
-	// Release any acquired handles
-	c.symbolsMu.Lock()
-	handleCount := 0
-	for _, entry := range c.symbols {
-		if entry.Handle != 0 {
-			_ = c.releaseHandleUnsafe(entry.Handle)
-			entry.Handle = 0
-			handleCount++
+	c.closed, c.connected = true, false
+	c.epoch++
+	gate, conn, budget := c.gateLocked(), c.conn, c.budgetLocked()
+	select {
+	case <-gate:
+		c.mu.Unlock()
+		defer func() { gate <- struct{}{} }()
+		c.deadline = time.Now().Add(budget)
+		if conn != nil && !conn.dead.Load() {
+			for _, entry := range c.symbols {
+				if entry.Handle != 0 {
+					err := c.releaseHandleUnsafe(entry.Handle)
+					if err != nil && errors.Is(err, ErrConnectionLost) {
+						break
+					}
+					if !time.Now().Before(c.deadline) {
+						break
+					}
+				}
+			}
 		}
-	}
-	c.symbolsMu.Unlock()
-
-	logging.DebugLog("ADS", "Released %d symbol handles", handleCount)
-
-	if c.conn != nil {
-		c.conn.close()
-		c.conn = nil
+		if conn != nil {
+			conn.close()
+		}
+		c.invalidateCaches()
+	default:
+		// An operation owns caches; it will observe the closed stream. The next
+		// successful reconnect resets all caches before permitting new operations.
+		if conn != nil {
+			conn.close()
+		}
+		c.mu.Unlock()
 	}
 }
 
-// IsConnected returns true if the client is connected.
 func (c *Client) IsConnected() bool {
 	if c == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.connected
+	return c.connected && !c.closed && c.conn != nil && !c.conn.dead.Load()
 }
 
-// SetDisconnected marks the client as disconnected.
-// This is called when a read/write error indicates the connection is lost.
 func (c *Client) SetDisconnected() {
 	if c == nil {
 		return
@@ -256,1134 +275,652 @@ func (c *Client) SetDisconnected() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.connected = false
-}
-
-// Reconnect attempts to re-establish the connection.
-// Returns nil if already connected, otherwise attempts reconnection.
-func (c *Client) Reconnect() error {
-	if c == nil {
-		return fmt.Errorf("nil client")
-	}
-
-	c.mu.Lock()
-	if c.connected {
-		c.mu.Unlock()
-		return nil
-	}
-
-	// Close existing connection if any
 	if c.conn != nil {
 		c.conn.close()
-		c.conn = nil
 	}
+}
 
-	// Clear symbol handles (they're invalid after reconnection)
-	c.symbolsMu.Lock()
-	for _, entry := range c.symbols {
-		entry.Handle = 0
+func (c *Client) connErrorIfDown() error {
+	if !c.IsConnected() {
+		return fmt.Errorf("read incomplete: %w", ErrConnectionLost)
 	}
-	c.symbolsMu.Unlock()
-
-	targetNetId := c.targetNetId
-	localPort := c.localPort
-	c.mu.Unlock()
-
-	// Derive host from target Net ID (first 4 bytes are typically the IP)
-	host := fmt.Sprintf("%d.%d.%d.%d", targetNetId[0], targetNetId[1], targetNetId[2], targetNetId[3])
-
-	// Connect to ADS TCP port
-	tcpAddr := fmt.Sprintf("%s:%d", host, DefaultTCPPort)
-	logging.DebugLog("ADS", "Reconnecting to %s", tcpAddr)
-
-	conn, err := net.DialTimeout("tcp", tcpAddr, 10*time.Second)
-	if err != nil {
-		logging.DebugConnectError("ADS", tcpAddr, err)
-		return fmt.Errorf("reconnect failed: %w", err)
-	}
-
-	logging.DebugLog("ADS", "Reconnect TCP connection established to %s", tcpAddr)
-
-	// Set connection timeouts
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	// Derive local AMS Net ID from the connection's local IP address.
-	var localNetId AmsNetId
-	if localAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-		localNetId, err = AmsNetIdFromIP(localAddr.IP.String())
-		if err != nil {
-			conn.Close()
-			return fmt.Errorf("reconnect: cannot derive local AMS Net ID: %w", err)
-		}
-	} else {
-		localNetId = AmsNetId{0, 0, 0, 0, 1, 1}
-	}
-
-	adsConn := newAdsConnection(conn, localNetId, localPort)
-
-	c.mu.Lock()
-	c.conn = adsConn
-	c.localNetId = localNetId
-	c.connected = true
-	c.mu.Unlock()
-
-	// Verify connection by reading device info
-	info, err := c.readDeviceInfo()
-	if err != nil {
-		logging.DebugError("ADS", "reconnect readDeviceInfo", err)
-		c.mu.Lock()
-		c.connected = false
-		c.conn.close()
-		c.conn = nil
-		c.mu.Unlock()
-		return fmt.Errorf("reconnect verification failed: %w", err)
-	}
-	c.deviceInfo = info
-
-	logging.DebugConnectSuccess("ADS", tcpAddr, fmt.Sprintf("reconnected, device=%s", info.String()))
-
 	return nil
 }
 
-// isConnectionError checks if an error indicates the TCP connection is broken.
-func isConnectionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := strings.ToLower(err.Error())
-	// Common connection-related error patterns
-	return strings.Contains(errStr, "connection") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "reset by peer") ||
-		strings.Contains(errStr, "eof") ||
-		strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "refused") ||
-		strings.Contains(errStr, "closed") ||
-		strings.Contains(errStr, "nil")
-}
+func isConnectionError(err error) bool { return errors.Is(err, ErrConnectionLost) }
 
-// ConnectionDetails returns a string describing the AMS addressing for debugging.
 func (c *Client) ConnectionDetails() string {
 	if c == nil {
 		return ""
 	}
-	return fmt.Sprintf("Target: %s:%d, Local: %s:%d",
-		c.targetNetId.String(), c.targetPort,
-		c.localNetId.String(), c.localPort)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return fmt.Sprintf("Target: %s:%d, Local: %s:%d", c.targetNetId, c.targetPort, c.localNetId, c.localPort)
 }
 
-// ConnectionMode returns a human-readable string describing the connection mode.
 func (c *Client) ConnectionMode() string {
 	if c == nil {
 		return "Not connected"
 	}
 	c.mu.Lock()
-	connected := c.connected
-	c.mu.Unlock()
-
-	if connected {
-		if c.deviceInfo != nil {
-			return fmt.Sprintf("ADS Connected (%s)", c.deviceInfo.String())
-		}
-		return "ADS Connected"
+	defer c.mu.Unlock()
+	if c.connected && !c.closed && c.conn != nil && !c.conn.dead.Load() {
+		return fmt.Sprintf("ADS Connected (%s)", c.deviceInfo)
 	}
 	return "Disconnected"
 }
 
-// GetDeviceInfo returns information about the connected device.
 func (c *Client) GetDeviceInfo() (*DeviceInfo, error) {
-	if c == nil {
-		return nil, fmt.Errorf("GetDeviceInfo: nil client")
+	_, done, err := c.begin(false)
+	if err != nil {
+		return nil, err
 	}
-	if c.deviceInfo != nil {
-		return c.deviceInfo, nil
+	defer done()
+	c.mu.Lock()
+	info := c.deviceInfo
+	c.mu.Unlock()
+	if info != nil {
+		copy := *info
+		return &copy, nil
 	}
 	return c.readDeviceInfo()
 }
 
-// readDeviceInfo reads device information from the PLC.
-func (c *Client) readDeviceInfo() (*DeviceInfo, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Client) Identity() (*DeviceInfo, error) { return c.GetDeviceInfo() }
 
+// Internal command helpers require operation gate ownership.
+func (c *Client) exchange(command uint16, data []byte) ([]byte, error) {
 	if c.conn == nil {
-		return nil, fmt.Errorf("not connected")
+		return nil, fmt.Errorf("%w: %w", ErrConnectionLost, net.ErrClosed)
 	}
+	return c.conn.sendRequestUntil(c.targetNetId, c.targetPort, command, data, c.deadline)
+}
 
-	// Send ReadDeviceInfo command (no data)
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdReadDeviceInfo, nil)
+func (c *Client) checkedReadResponse(resp []byte, err error) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Response: [Result 4] [MajorVersion 1] [MinorVersion 1] [BuildVersion 2] [DeviceName 16]
-	if len(resp) < 24 {
-		return nil, fmt.Errorf("response too short: %d bytes", len(resp))
-	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return nil, &AdsError{Code: result}
-	}
-
-	info := &DeviceInfo{
-		MajorVersion: resp[4],
-		MinorVersion: resp[5],
-		BuildVersion: binary.LittleEndian.Uint16(resp[6:8]),
-	}
-
-	// Device name is null-terminated within 16 bytes
-	nameBytes := resp[8:24]
-	for i, b := range nameBytes {
-		if b == 0 {
-			info.DeviceName = string(nameBytes[:i])
-			break
+	payload, err := readCommandData(resp)
+	if err != nil {
+		var device *AdsError
+		if !errors.As(err, &device) {
+			return nil, c.conn.fail(err)
 		}
 	}
-	if info.DeviceName == "" {
-		info.DeviceName = string(nameBytes)
-	}
-
-	return info, nil
+	return payload, err
 }
 
-// Read reads one or more symbols by name and returns their values.
-// Symbol names are typically in the format "MAIN.VariableName" or "GVL.GlobalVar".
-// This uses ADS SumUp Read to batch all reads into a single request for efficiency.
-func (c *Client) Read(symbolNames ...string) ([]*TagValue, error) {
-	if c == nil || c.conn == nil {
-		logging.DebugLog("ADS", "Read called but not connected")
-		return nil, fmt.Errorf("Read: nil client")
+func (c *Client) readData(group, offset, size uint32) ([]byte, error) {
+	if uint64(size)+8 > uint64(c.conn.maxPayload) {
+		return nil, fmt.Errorf("ADS read size %d exceeds payload limit %d", size, c.conn.maxPayload)
 	}
-	if len(symbolNames) == 0 {
-		return nil, nil
-	}
-
-	// For a single symbol, use the simple path
-	if len(symbolNames) == 1 {
-		logging.DebugLog("ADS", "Read 1 symbol (single)")
-		value, err := c.readSymbol(symbolNames[0])
-		if err != nil {
-			return []*TagValue{{Name: symbolNames[0], Error: err}}, c.connErrorIfDown()
-		}
-		return []*TagValue{value}, nil
-	}
-
-	logging.DebugLog("ADS", "Read %d symbols (batched)", len(symbolNames))
-
-	// Get symbol entries (from cache or PLC)
-	entries, err := c.getSymbolEntries(symbolNames)
-	if err != nil {
-		// If we can't get symbol info, fall back to individual reads
-		logging.DebugLog("ADS", "Symbol lookup failed, falling back to individual reads: %v", err)
-		return c.readIndividual(symbolNames)
-	}
-
-	// Perform batched read using SumUp Read with direct addressing
-	results, err := c.readBatch(symbolNames, entries)
-	if err != nil {
-		// If batch read fails, fall back to individual reads
-		logging.DebugLog("ADS", "Batch read failed, falling back to individual reads: %v", err)
-		return c.readIndividual(symbolNames)
-	}
-
-	return results, c.connErrorIfDown()
+	req := make([]byte, 12)
+	binary.LittleEndian.PutUint32(req[:4], group)
+	binary.LittleEndian.PutUint32(req[4:8], offset)
+	binary.LittleEndian.PutUint32(req[8:12], size)
+	return c.checkedReadResponse(c.exchange(CmdRead, req))
 }
 
-// getSymbolEntries retrieves symbol entries for multiple symbols.
-// Returns entries in the same order as symbolNames.
-func (c *Client) getSymbolEntries(symbolNames []string) ([]*SymbolEntry, error) {
-	entries := make([]*SymbolEntry, len(symbolNames))
-
-	for i, name := range symbolNames {
-		entry, err := c.getSymbolEntry(name)
-		if err != nil {
-			return nil, fmt.Errorf("get symbol entry for %s: %w", name, err)
-		}
-		entries[i] = entry
+func (c *Client) readWriteData(group, offset, size uint32, write []byte) ([]byte, error) {
+	if uint64(size)+8 > uint64(c.conn.maxPayload) || uint64(len(write))+16 > uint64(c.conn.maxPayload) {
+		return nil, fmt.Errorf("ADS ReadWrite exceeds payload limit %d", c.conn.maxPayload)
 	}
-
-	return entries, nil
+	req := make([]byte, 16+len(write))
+	binary.LittleEndian.PutUint32(req[:4], group)
+	binary.LittleEndian.PutUint32(req[4:8], offset)
+	binary.LittleEndian.PutUint32(req[8:12], size)
+	binary.LittleEndian.PutUint32(req[12:16], uint32(len(write)))
+	copy(req[16:], write)
+	return c.checkedReadResponse(c.exchange(CmdReadWrite, req))
 }
 
-// readBatch reads multiple symbols in a single ADS SumUp Read request.
-// Uses direct addressing via IndexGroup/IndexOffset (no handles required).
-func (c *Client) readBatch(symbolNames []string, entries []*SymbolEntry) ([]*TagValue, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		c.connected = false
-		return nil, fmt.Errorf("not connected")
+func (c *Client) writeData(group, offset uint32, data []byte) error {
+	if uint64(len(data))+12 > uint64(c.conn.maxPayload) {
+		return fmt.Errorf("ADS write exceeds payload limit %d", c.conn.maxPayload)
 	}
-
-	count := len(entries)
-
-	// Calculate total data size (sum of all symbol sizes)
-	totalDataSize := uint32(0)
-	for _, entry := range entries {
-		totalDataSize += entry.Info.Size
-	}
-
-	// SumUp Read response format:
-	// [Result1 4][Result2 4]...[ResultN 4][Data1][Data2]...[DataN]
-	// So readLen = N * 4 (results) + sum of data sizes
-	totalReadLen := uint32(count)*4 + totalDataSize
-
-	// Build SumUp Read request using direct addressing
-	// WriteData: For each symbol: [IndexGroup 4][IndexOffset 4][Size 4]
-	writeLen := uint32(count * 12)
-	writeData := make([]byte, writeLen)
-
-	for i, entry := range entries {
-		offset := i * 12
-		// Use direct IndexGroup/IndexOffset from symbol info (typically 0x4040/offset)
-		binary.LittleEndian.PutUint32(writeData[offset:offset+4], entry.Info.IndexGroup)
-		binary.LittleEndian.PutUint32(writeData[offset+4:offset+8], entry.Info.IndexOffset)
-		binary.LittleEndian.PutUint32(writeData[offset+8:offset+12], entry.Info.Size)
-	}
-
-	// Build ReadWrite request: [IndexGroup 4][IndexOffset 4][ReadLength 4][WriteLength 4][WriteData]
-	reqData := make([]byte, 16+len(writeData))
-	binary.LittleEndian.PutUint32(reqData[0:4], IndexGroupSumUpRead)
-	binary.LittleEndian.PutUint32(reqData[4:8], uint32(count))
-	binary.LittleEndian.PutUint32(reqData[8:12], totalReadLen)
-	binary.LittleEndian.PutUint32(reqData[12:16], writeLen)
-	copy(reqData[16:], writeData)
-
-	logging.DebugLog("ADS", "SumUp Read: %d symbols, readLen=%d, writeLen=%d", count, totalReadLen, writeLen)
-
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdReadWrite, reqData)
-	if err != nil {
-		if isConnectionError(err) {
-			logging.DebugDisconnect("ADS", c.targetNetId.String(), fmt.Sprintf("batch read failed: %v", err))
-			c.connected = false
-		}
-		return nil, err
-	}
-
-	// Parse response: [Result 4][ReadLength 4][SubResults...][Data...]
-	if len(resp) < 8 {
-		return nil, fmt.Errorf("batch read response too short: %d bytes", len(resp))
-	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return nil, &AdsError{Code: result}
-	}
-
-	readLen := binary.LittleEndian.Uint32(resp[4:8])
-	if uint32(len(resp)) < 8+readLen {
-		return nil, fmt.Errorf("batch read response truncated: expected %d, got %d", 8+readLen, len(resp))
-	}
-
-	// SumUp Read response structure:
-	// [Result1 4][Result2 4]...[ResultN 4][Data1][Data2]...[DataN]
-	// First, read all N result codes
-	subResults := make([]uint32, count)
-	offset := uint32(8)
-	for i := 0; i < count; i++ {
-		if offset+4 > uint32(len(resp)) {
-			return nil, fmt.Errorf("sub-result %d truncated", i)
-		}
-		subResults[i] = binary.LittleEndian.Uint32(resp[offset : offset+4])
-		offset += 4
-	}
-
-	// Then read all data sections
-	results := make([]*TagValue, count)
-	for i := 0; i < count; i++ {
-		entry := entries[i]
-		name := symbolNames[i]
-		size := entry.Info.Size
-
-		if subResults[i] != 0 {
-			results[i] = &TagValue{Name: name, Error: &AdsError{Code: subResults[i]}}
-			// Still advance offset by the expected size
-			offset += size
-			continue
-		}
-
-		if offset+size > uint32(len(resp)) {
-			results[i] = &TagValue{Name: name, Error: fmt.Errorf("data truncated")}
-			continue
-		}
-
-		// Determine element count for arrays
-		elemSize := TypeSize(entry.Info.TypeCode)
-		elemCount := 1
-		if elemSize > 0 && int(size) > elemSize {
-			elemCount = int(size) / elemSize
-		}
-
-		// Special handling for string/wstring arrays
-		if elemCount == 1 && (entry.Info.TypeCode == TypeString || entry.Info.TypeCode == TypeWString) {
-			typeName := strings.ToUpper(entry.Info.TypeName)
-			if strings.Contains(typeName, "ARRAY") {
-				arrayCount := parseArrayCountFromTypeName(typeName)
-				if arrayCount > 1 {
-					elemCount = arrayCount
-				}
-			}
-		}
-
-		// Copy data bytes
-		dataBytes := make([]byte, size)
-		copy(dataBytes, resp[offset:offset+size])
-
-		results[i] = &TagValue{
-			Name:     name,
-			DataType: entry.Info.TypeCode,
-			Bytes:    dataBytes,
-			Count:    elemCount,
-			Error:    nil,
-		}
-
-		offset += size
-	}
-
-	logging.DebugLog("ADS", "SumUp Read completed: %d symbols", count)
-
-	return results, nil
-}
-
-// readIndividual reads symbols one at a time (fallback for batch failures).
-func (c *Client) readIndividual(symbolNames []string) ([]*TagValue, error) {
-	results := make([]*TagValue, 0, len(symbolNames))
-	errorCount := 0
-
-	for _, name := range symbolNames {
-		value, err := c.readSymbol(name)
-		if err != nil {
-			errorCount++
-			logging.DebugError("ADS", fmt.Sprintf("readSymbol %s", name), err)
-			results = append(results, &TagValue{
-				Name:  name,
-				Error: err,
-			})
-		} else {
-			results = append(results, value)
-		}
-	}
-
-	if errorCount > 0 {
-		logging.DebugLog("ADS", "Individual read completed: %d success, %d errors", len(symbolNames)-errorCount, errorCount)
-	}
-
-	return results, c.connErrorIfDown()
-}
-
-// readSymbol reads a single symbol value.
-func (c *Client) readSymbol(name string) (*TagValue, error) {
-	// Get symbol info (from cache or PLC)
-	entry, err := c.getSymbolEntry(name)
-	if err != nil {
-		// Check for connection error
-		if isConnectionError(err) {
-			c.mu.Lock()
-			c.connected = false
-			c.mu.Unlock()
-		}
-		return nil, err
-	}
-
-	// Ensure we have a handle
-	if entry.Handle == 0 {
-		logging.DebugLog("ADS", "Acquiring handle for %s", name)
-		handle, err := c.acquireHandle(name)
-		if err != nil {
-			// Check for connection error
-			if isConnectionError(err) {
-				logging.DebugDisconnect("ADS", c.targetNetId.String(), fmt.Sprintf("handle acquisition failed: %v", err))
-				c.mu.Lock()
-				c.connected = false
-				c.mu.Unlock()
-			}
-			return nil, err
-		}
-		logging.DebugLog("ADS", "Acquired handle 0x%08X for %s", handle, name)
-		c.symbolsMu.Lock()
-		entry.Handle = handle
-		c.symbolsMu.Unlock()
-	}
-
-	// Read using handle
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		c.connected = false
-		return nil, fmt.Errorf("not connected")
-	}
-
-	// Build read request: [IndexGroup 4] [IndexOffset 4] [Length 4]
-	data := make([]byte, 12)
-	binary.LittleEndian.PutUint32(data[0:4], IndexGroupSymbolValueByHandle)
-	binary.LittleEndian.PutUint32(data[4:8], entry.Handle)
-	binary.LittleEndian.PutUint32(data[8:12], entry.Info.Size)
-
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdRead, data)
-	if err != nil {
-		// Check for connection error
-		if isConnectionError(err) {
-			logging.DebugDisconnect("ADS", c.targetNetId.String(), fmt.Sprintf("read failed: %v", err))
-			c.connected = false
-		}
-		return nil, err
-	}
-
-	// Response: [Result 4] [Length 4] [Data n]
-	if len(resp) < 8 {
-		return nil, fmt.Errorf("response too short: %d bytes", len(resp))
-	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return nil, &AdsError{Code: result}
-	}
-
-	length := binary.LittleEndian.Uint32(resp[4:8])
-	if len(resp) < int(8+length) {
-		return nil, fmt.Errorf("response data truncated: expected %d, got %d", length, len(resp)-8)
-	}
-
-	// Determine element count for arrays
-	elemSize := TypeSize(entry.Info.TypeCode)
-	count := 1
-	if elemSize > 0 && int(length) > elemSize {
-		count = int(length) / elemSize
-	}
-
-	// Special handling for string/wstring arrays - parse from TypeName
-	if count == 1 && (entry.Info.TypeCode == TypeString || entry.Info.TypeCode == TypeWString) {
-		// Check if TypeName indicates an array (e.g., "ARRAY [0..4] OF STRING")
-		typeName := strings.ToUpper(entry.Info.TypeName)
-		if strings.Contains(typeName, "ARRAY") {
-			// Try to extract array bounds from TypeName
-			arrayCount := parseArrayCountFromTypeName(typeName)
-			if arrayCount > 1 {
-				count = arrayCount
-			}
-		}
-	}
-
-	return &TagValue{
-		Name:     name,
-		DataType: entry.Info.TypeCode,
-		Bytes:    resp[8 : 8+length],
-		Count:    count,
-		Error:    nil,
-	}, nil
-}
-
-// Write writes a value to a symbol.
-func (c *Client) Write(symbolName string, value interface{}) error {
-	if c == nil || c.conn == nil {
-		return fmt.Errorf("Write: nil client")
-	}
-
-	// Get symbol info
-	entry, err := c.getSymbolEntry(symbolName)
-	if err != nil {
-		return err
-	}
-
-	// Check if writable
-	if !entry.Info.IsWritable() {
-		return fmt.Errorf("symbol %q is read-only", symbolName)
-	}
-
-	// Encode value - special handling for string arrays
-	var data []byte
-	if strSlice, ok := value.([]string); ok && (entry.Info.TypeCode == TypeString || entry.Info.TypeCode == TypeWString) {
-		// String array: need to pad each element to fixed size
-		// Get actual array element count from TypeName (e.g., "ARRAY [0..4] OF STRING")
-		arrayCount := parseArrayCountFromTypeName(entry.Info.TypeName)
-		if arrayCount < 1 {
-			arrayCount = len(strSlice) // Fallback to input length
-		}
-		elemSize := int(entry.Info.Size) / arrayCount
-		if elemSize < 1 {
-			elemSize = 81 // Default STRING size
-		}
-		data, err = encodeStringArray(strSlice, elemSize, entry.Info.TypeCode == TypeWString)
-	} else {
-		data, err = EncodeValueWithType(value, entry.Info.TypeCode)
-	}
-	if err != nil {
-		return fmt.Errorf("encode value: %w", err)
-	}
-
-	// Ensure we have a handle
-	if entry.Handle == 0 {
-		handle, err := c.acquireHandle(symbolName)
-		if err != nil {
-			return err
-		}
-		c.symbolsMu.Lock()
-		entry.Handle = handle
-		c.symbolsMu.Unlock()
-	}
-
-	// Write using handle
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return fmt.Errorf("not connected")
-	}
-
-	// Build write request: [IndexGroup 4] [IndexOffset 4] [Length 4] [Data n]
 	req := make([]byte, 12+len(data))
-	binary.LittleEndian.PutUint32(req[0:4], IndexGroupSymbolValueByHandle)
-	binary.LittleEndian.PutUint32(req[4:8], entry.Handle)
+	binary.LittleEndian.PutUint32(req[:4], group)
+	binary.LittleEndian.PutUint32(req[4:8], offset)
 	binary.LittleEndian.PutUint32(req[8:12], uint32(len(data)))
 	copy(req[12:], data)
-
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdWrite, req)
+	resp, err := c.exchange(CmdWrite, req)
 	if err != nil {
 		return err
 	}
-
-	// Response: [Result 4]
-	if len(resp) < 4 {
-		return fmt.Errorf("response too short: %d bytes", len(resp))
+	rest, err := commandResult(resp)
+	var device *AdsError
+	if err != nil && !errors.As(err, &device) {
+		return c.conn.fail(err)
 	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return &AdsError{Code: result}
+	if err == nil && len(rest) != 0 {
+		return c.conn.fail(fmt.Errorf("ADS write response trailing data"))
 	}
-
-	return nil
+	return err
 }
 
-// encodeStringArray encodes a string slice with fixed-size padding for each element.
-// This is needed for TwinCAT STRING arrays where each element has a fixed size.
-func encodeStringArray(strings []string, elemSize int, isWString bool) ([]byte, error) {
-	if elemSize <= 0 {
-		return nil, fmt.Errorf("invalid element size: %d", elemSize)
+func (c *Client) readDeviceInfo() (*DeviceInfo, error) {
+	resp, err := c.exchange(CmdReadDeviceInfo, nil)
+	if err != nil {
+		return nil, err
 	}
+	info, err := decodeDeviceInfo(resp)
+	var device *AdsError
+	if err != nil && !errors.As(err, &device) {
+		return nil, c.conn.fail(err)
+	}
+	return info, err
+}
 
-	result := make([]byte, len(strings)*elemSize)
+func symbolNameBytes(name string) ([]byte, error) {
+	if name == "" || len(name) > 0xffff || strings.ContainsRune(name, 0) {
+		return nil, fmt.Errorf("invalid empty/NUL symbol name")
+	}
+	return append([]byte(name), 0), nil
+}
 
-	for i, s := range strings {
-		offset := i * elemSize
-		if isWString {
-			// WSTRING: UTF-16LE encoding with null terminator
-			// For now, just do simple ASCII to UTF-16LE conversion
-			maxChars := (elemSize - 2) / 2 // Reserve 2 bytes for null terminator
-			for j, r := range s {
-				if j >= maxChars {
-					break
-				}
-				result[offset+j*2] = byte(r)
-				result[offset+j*2+1] = 0
-			}
-		} else {
-			// STRING: null-terminated, pad rest with zeros
-			maxLen := elemSize - 1 // Reserve 1 byte for null terminator
-			copyLen := len(s)
-			if copyLen > maxLen {
-				copyLen = maxLen
-			}
-			copy(result[offset:offset+copyLen], s)
-			// Rest is already zero from make()
+func (c *Client) getSymbolInfo(name string) (*TagInfo, error) {
+	cfg := c.effectiveOptions()
+	if uint64(len(c.lookupSymbols)) >= uint64(cfg.maxSymbols) {
+		return nil, fmt.Errorf("symbol lookup count limit exceeded")
+	}
+	bytes, err := symbolNameBytes(name)
+	if err != nil {
+		return nil, err
+	}
+	size := uint32(0xffff)
+	if c.conn.maxPayload-8 < size {
+		size = c.conn.maxPayload - 8
+	}
+	payload, err := c.readWriteData(IndexGroupSymbolInfoByNameEx, 0, size, bytes)
+	if err != nil {
+		return nil, err
+	}
+	retained := c.lookupBytes
+	if c.snapshot != nil {
+		retained += c.snapshot.bytes
+	}
+	if uint64(len(payload)) > uint64(cfg.maxMetadata) || retained > uint64(cfg.maxMetadata)-uint64(len(payload)) {
+		return nil, fmt.Errorf("symbol lookup aggregate metadata limit exceeded")
+	}
+	budget := parseBudget{remaining: uint64(c.effectiveOptions().maxElements), maxDepth: c.effectiveOptions().maxDepth, deadline: c.deadline}
+	record, err := parseSymbolRecord(payload, &budget)
+	strictErr := err
+	if err != nil {
+		record, err = parseSymbolRecordFields(payload, &budget, true)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if record.info.Name != name || strictErr != nil {
+		if err := c.validateBitLookup(name, record, &budget); err != nil {
+			return nil, err
 		}
+		record.info.Name = name // Handles always address the requested member.
 	}
-
-	return result, nil
+	if c.lookupSymbols == nil {
+		c.lookupSymbols = make(map[string]*symbolRecord)
+	}
+	c.lookupSymbols[name] = record
+	c.lookupBytes += uint64(len(payload))
+	return &record.info, nil
 }
 
-// getSymbolEntry retrieves a symbol entry from cache or discovers it from the PLC.
 func (c *Client) getSymbolEntry(name string) (*SymbolEntry, error) {
-	// Check cache first
-	c.symbolsMu.RLock()
-	entry, ok := c.symbols[name]
-	c.symbolsMu.RUnlock()
-
-	if ok {
+	if entry := c.symbols[name]; entry != nil {
 		return entry, nil
 	}
-
-	// Get symbol info from PLC
+	if uint64(len(c.symbols)) >= uint64(c.effectiveOptions().maxSymbols) {
+		return nil, fmt.Errorf("symbol/handle cache count limit exceeded")
+	}
 	info, err := c.getSymbolInfo(name)
 	if err != nil {
 		return nil, err
 	}
-
-	// Cache it
-	entry = &SymbolEntry{
-		Info:   *info,
-		Handle: 0,
+	entry := &SymbolEntry{Info: *info}
+	if c.symbols == nil {
+		c.symbols = make(map[string]*SymbolEntry)
 	}
-	c.symbolsMu.Lock()
 	c.symbols[name] = entry
-	c.symbolsMu.Unlock()
-
 	return entry, nil
 }
 
-// getSymbolInfo retrieves symbol information from the PLC.
-func (c *Client) getSymbolInfo(name string) (*TagInfo, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-
-	// Use ReadWrite to get symbol info by name
-	// Request: [IndexGroup 4] [IndexOffset 4] [ReadLength 4] [WriteLength 4] [SymbolName n]
-	nameBytes := append([]byte(name), 0) // Null-terminated
-
-	req := make([]byte, 16+len(nameBytes))
-	binary.LittleEndian.PutUint32(req[0:4], IndexGroupSymbolInfoByNameEx)
-	binary.LittleEndian.PutUint32(req[4:8], 0)                   // Offset = 0
-	binary.LittleEndian.PutUint32(req[8:12], 0xFFFF)             // Read up to 64KB
-	binary.LittleEndian.PutUint32(req[12:16], uint32(len(nameBytes)))
-	copy(req[16:], nameBytes)
-
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdReadWrite, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Response: [Result 4] [ReadLength 4] [SymbolInfo]
-	if len(resp) < 8 {
-		return nil, fmt.Errorf("response too short: %d bytes", len(resp))
-	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return nil, &AdsError{Code: result}
-	}
-
-	readLen := binary.LittleEndian.Uint32(resp[4:8])
-	if len(resp) < int(8+readLen) {
-		return nil, fmt.Errorf("response data truncated")
-	}
-
-	infoData := resp[8:]
-	return parseSymbolInfo(infoData)
-}
-
-// parseSymbolInfo parses the symbol info response from TwinCAT.
-// Format (AdsSymbolEntry):
-// [EntryLength 4] [IndexGroup 4] [IndexOffset 4] [Size 4] [DataType 4]
-// [Flags 4] [NameLength 2] [TypeLength 2] [CommentLength 2]
-// [Name] [Type] [Comment]
-func parseSymbolInfo(data []byte) (*TagInfo, error) {
-	if len(data) < 30 {
-		return nil, fmt.Errorf("symbol info too short: %d bytes", len(data))
-	}
-
-	info := &TagInfo{
-		IndexGroup:  binary.LittleEndian.Uint32(data[4:8]),
-		IndexOffset: binary.LittleEndian.Uint32(data[8:12]),
-		Size:        binary.LittleEndian.Uint32(data[12:16]),
-		Flags:       binary.LittleEndian.Uint32(data[20:24]),
-	}
-
-	// TwinCAT data type is stored as ADST_* enum, need to map to our type codes
-	adsType := binary.LittleEndian.Uint32(data[16:20])
-	info.TypeCode = mapAdsType(adsType)
-
-	nameLen := binary.LittleEndian.Uint16(data[24:26])
-	typeLen := binary.LittleEndian.Uint16(data[26:28])
-	commentLen := binary.LittleEndian.Uint16(data[28:30])
-
-	offset := uint16(30)
-
-	// Parse name (null-terminated)
-	if len(data) > int(offset+nameLen) {
-		info.Name = string(data[offset : offset+nameLen])
-		if len(info.Name) > 0 && info.Name[len(info.Name)-1] == 0 {
-			info.Name = info.Name[:len(info.Name)-1]
-		}
-		offset += nameLen + 1 // +1 for null terminator
-	}
-
-	// Parse type name
-	if len(data) > int(offset+typeLen) {
-		info.TypeName = string(data[offset : offset+typeLen])
-		if len(info.TypeName) > 0 && info.TypeName[len(info.TypeName)-1] == 0 {
-			info.TypeName = info.TypeName[:len(info.TypeName)-1]
-		}
-		offset += typeLen + 1
-	}
-
-	// Parse comment
-	if len(data) > int(offset+commentLen) {
-		info.Comment = string(data[offset : offset+commentLen])
-		if len(info.Comment) > 0 && info.Comment[len(info.Comment)-1] == 0 {
-			info.Comment = info.Comment[:len(info.Comment)-1]
-		}
-	}
-
-	// If type code is unknown, try to determine from TypeName
-	if info.TypeCode == TypeUnknown && info.TypeName != "" {
-		info.TypeCode = mapTypeFromName(info.TypeName, info.Size)
-	}
-
-	return info, nil
-}
-
-// mapTypeFromName attempts to determine the type code from the type name string.
-// This is used as a fallback when the ADS type code is unknown (e.g., LTIME, TOD).
-func mapTypeFromName(typeName string, size uint32) uint16 {
-	// Normalize to uppercase for matching
-	upper := strings.ToUpper(typeName)
-
-	// Handle array types by extracting the base type
-	if strings.HasPrefix(upper, "ARRAY") {
-		// Extract base type from "ARRAY [x..y] OF TYPE"
-		if idx := strings.Index(upper, " OF "); idx != -1 {
-			upper = strings.TrimSpace(upper[idx+4:])
-		}
-	}
-
-	// Match known type names
-	switch upper {
-	case "LTIME":
-		return TypeLTime
-	case "TIME":
-		return TypeTime
-	case "DATE":
-		return TypeDate
-	case "TIME_OF_DAY", "TOD":
-		return TypeTimeOfDay
-	case "DATE_AND_TIME", "DT":
-		return TypeDateTime
-	case "BOOL":
-		return TypeBool
-	case "BYTE", "USINT":
-		return TypeByte
-	case "SINT":
-		return TypeSByte
-	case "WORD", "UINT":
-		return TypeWord
-	case "INT":
-		return TypeInt16
-	case "DWORD", "UDINT":
-		return TypeDWord
-	case "DINT":
-		return TypeInt32
-	case "LWORD", "ULINT":
-		return TypeLWord
-	case "LINT":
-		return TypeInt64
-	case "REAL":
-		return TypeReal
-	case "LREAL":
-		return TypeLReal
-	case "STRING":
-		return TypeString
-	case "WSTRING":
-		return TypeWString
-	}
-
-	// Check if type name starts with STRING (e.g., "STRING(80)")
-	if strings.HasPrefix(upper, "STRING") {
-		return TypeString
-	}
-	if strings.HasPrefix(upper, "WSTRING") {
-		return TypeWString
-	}
-
-	return TypeUnknown
-}
-
-// mapAdsType maps TwinCAT ADST_* type enum to our type codes.
-func mapAdsType(adsType uint32) uint16 {
-	switch adsType {
-	case 0: // ADST_VOID
-		return TypeVoid
-	case 16: // ADST_INT8
-		return TypeSByte
-	case 17: // ADST_UINT8
-		return TypeByte
-	case 2: // ADST_INT16
-		return TypeInt16
-	case 18: // ADST_UINT16
-		return TypeWord
-	case 3: // ADST_INT32
-		return TypeInt32
-	case 19: // ADST_UINT32
-		return TypeDWord
-	case 20: // ADST_INT64
-		return TypeInt64
-	case 21: // ADST_UINT64
-		return TypeLWord
-	case 4: // ADST_REAL32
-		return TypeReal
-	case 5: // ADST_REAL64
-		return TypeLReal
-	case 30: // ADST_STRING
-		return TypeString
-	case 31: // ADST_WSTRING
-		return TypeWString
-	case 33: // ADST_BOOL / ADST_BIT
-		return TypeBool
-	default:
-		// For complex types, return TypeUnknown
-		return TypeUnknown
-	}
-}
-
-// parseArrayCountFromTypeName extracts array element count from TwinCAT type names.
-// Examples: "ARRAY [0..4] OF STRING" -> 5, "ARRAY [1..10] OF INT" -> 10
-func parseArrayCountFromTypeName(typeName string) int {
-	// Look for pattern like "[0..4]" or "[1..10]"
-	startIdx := strings.Index(typeName, "[")
-	endIdx := strings.Index(typeName, "]")
-	if startIdx == -1 || endIdx == -1 || endIdx <= startIdx {
-		return 1
-	}
-
-	bounds := typeName[startIdx+1 : endIdx]
-	// Split by ".." to get lower and upper bounds
-	parts := strings.Split(bounds, "..")
-	if len(parts) != 2 {
-		return 1
-	}
-
-	// Parse bounds - handle both "0..4" and "1..5" styles
-	lower := 0
-	upper := 0
-	fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &lower)
-	fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &upper)
-
-	if upper >= lower {
-		return upper - lower + 1
-	}
-	return 1
-}
-
-// acquireHandle gets a handle for a symbol name.
 func (c *Client) acquireHandle(name string) (uint32, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return 0, fmt.Errorf("not connected")
-	}
-
-	// ReadWrite to get handle by name
-	// Write: symbol name (null-terminated)
-	// Read: handle (4 bytes)
-	nameBytes := append([]byte(name), 0)
-
-	req := make([]byte, 16+len(nameBytes))
-	binary.LittleEndian.PutUint32(req[0:4], IndexGroupSymbolHandleByName)
-	binary.LittleEndian.PutUint32(req[4:8], 0)
-	binary.LittleEndian.PutUint32(req[8:12], 4) // Read 4 bytes (handle)
-	binary.LittleEndian.PutUint32(req[12:16], uint32(len(nameBytes)))
-	copy(req[16:], nameBytes)
-
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdReadWrite, req)
+	bytes, err := symbolNameBytes(name)
 	if err != nil {
 		return 0, err
 	}
-
-	// Response: [Result 4] [ReadLength 4] [Handle 4]
-	if len(resp) < 12 {
-		return 0, fmt.Errorf("response too short: %d bytes", len(resp))
+	data, err := c.readWriteData(IndexGroupSymbolHandleByName, 0, 4, bytes)
+	if err != nil {
+		return 0, err
 	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return 0, &AdsError{Code: result}
+	if len(data) != 4 {
+		return 0, c.conn.fail(fmt.Errorf("ADS handle size %d, want 4", len(data)))
 	}
-
-	handle := binary.LittleEndian.Uint32(resp[8:12])
+	handle := binary.LittleEndian.Uint32(data)
+	if handle == 0 {
+		return 0, fmt.Errorf("ADS returned zero symbol handle")
+	}
 	return handle, nil
 }
 
-// releaseHandleUnsafe releases a symbol handle (caller must hold c.mu).
-func (c *Client) releaseHandleUnsafe(handle uint32) error {
-	if c.conn == nil {
+func (c *Client) ensureHandle(name string, entry *SymbolEntry) error {
+	if entry.Handle != 0 {
 		return nil
 	}
+	handle, err := c.acquireHandle(name)
+	if err != nil {
+		return err
+	}
+	entry.Handle = handle
+	return nil
+}
 
-	// Write to release handle index group
-	req := make([]byte, 16)
-	binary.LittleEndian.PutUint32(req[0:4], IndexGroupSymbolReleaseHandle)
-	binary.LittleEndian.PutUint32(req[4:8], 0)
-	binary.LittleEndian.PutUint32(req[8:12], 4) // Size of handle
-	handleBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(handleBytes, handle)
+func (c *Client) releaseHandleUnsafe(handle uint32) error {
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, handle)
+	return c.writeData(IndexGroupSymbolReleaseHandle, 0, data)
+}
 
-	fullReq := append(req, handleBytes...)
+func rawValue(name string, entry *SymbolEntry, data []byte) *TagValue {
+	count := 1
+	size := TypeSize(entry.Info.TypeCode)
+	if size > 0 && len(data) > size {
+		count = len(data) / size
+	}
+	if size == 0 && strings.Contains(strings.ToUpper(entry.Info.TypeName), "ARRAY") {
+		count = parseArrayCountFromTypeName(entry.Info.TypeName)
+	}
+	return &TagValue{Name: name, DataType: entry.Info.TypeCode, Bytes: data, Count: count}
+}
 
-	_, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdWrite, fullReq)
+func (c *Client) readSymbol(name string) (*TagValue, error) {
+	entry, err := c.getSymbolEntry(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.ensureHandle(name, entry); err != nil {
+		return nil, err
+	}
+	data, err := c.readData(IndexGroupSymbolValueByHandle, entry.Handle, entry.Info.Size)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(data)) != uint64(entry.Info.Size) {
+		return nil, fmt.Errorf("symbol %s size %d, want %d", name, len(data), entry.Info.Size)
+	}
+	return rawValue(name, entry, data), nil
+}
+
+// readValues owns the current immutable snapshot until each group is validated.
+// Caller holds gate and owns the operation's single retry and deadline.
+func (c *Client) readValues(names []string) ([]*TagValue, []*SymbolEntry, error) {
+	if len(names) == 0 {
+		return nil, nil, nil
+	}
+	results := make([]*TagValue, len(names))
+
+	entries := make([]*SymbolEntry, len(names))
+	var connectionErr error
+	for i, name := range names {
+		if connectionErr != nil {
+			results[i] = &TagValue{Name: name, Error: connectionErr}
+			continue
+		}
+		entry, err := c.getSymbolEntry(name)
+		if err == nil {
+			err = c.ensureHandle(name, entry)
+		}
+		if err != nil {
+			results[i] = &TagValue{Name: name, Error: err}
+			if isConnectionError(err) {
+				connectionErr = err
+			}
+			continue
+		}
+		entries[i] = entry
+	}
+	if connectionErr != nil { // Completed lookups are not completed value reads.
+		for i, v := range results {
+			if v == nil {
+				results[i] = &TagValue{Name: names[i], Error: connectionErr}
+			}
+		}
+		return results, entries, connectionErr
+	}
+	limit := c.cfg.maxBatch
+	if limit == 0 {
+		limit = 500
+	}
+	for start := 0; start < len(names); {
+		if entries[start] == nil {
+			start++
+			continue
+		}
+		end := start
+		responseBytes := uint64(8)
+		for end < len(names) && entries[end] != nil && uint64(end-start) < uint64(limit) {
+			next := responseBytes + 4 + uint64(entries[end].Info.Size)
+			if next > uint64(c.conn.maxPayload) || 16+12*uint64(end-start+1) > uint64(c.conn.maxPayload) {
+				break
+			}
+			responseBytes = next
+			end++
+		}
+		if end == start {
+			if uint64(entries[start].Info.Size)+8 <= uint64(c.conn.maxPayload) {
+				end = start + 1 // A plain Read needs less space than SumUp.
+			} else {
+				results[start] = &TagValue{Name: names[start], Error: fmt.Errorf("symbol exceeds ADS batch payload budget")}
+				start++
+				continue
+			}
+		}
+		before := c.symbolVersion
+		individualVersionChecks := false
+		err := c.readBatch(names[start:end], entries[start:end], results[start:end])
+		if err != nil {
+			var device *AdsError
+			if errors.As(err, &device) && (device.Code == ErrDeviceSrvNotSupp || device.Code == ErrDeviceInvalidGrp) {
+				individualVersionChecks = true
+				for i := start; i < end; i++ {
+					individualBefore := c.symbolVersion
+					v, individualErr := c.readSymbol(names[i])
+					if individualErr == nil {
+						_, individualErr = c.checkVersion()
+						if individualErr != nil {
+							v.Error = individualErr
+							results[i] = v
+							return results, entries, individualErr
+						}
+						if individualErr == nil && c.versionCapability == 1 && individualBefore != c.symbolVersion {
+							return results, entries, &AdsError{Code: ErrDeviceSymbolVersionInvalid}
+						}
+					}
+					if individualErr != nil {
+						if v != nil {
+							v.Error = individualErr
+							results[i] = v
+						} else {
+							results[i] = &TagValue{Name: names[i], Error: individualErr}
+						}
+					} else {
+						results[i] = v
+					}
+					if isConnectionError(individualErr) {
+						err = individualErr
+						break
+					}
+				}
+				if !isConnectionError(err) {
+					err = nil
+				}
+			} else {
+				for i := start; i < end; i++ {
+					results[i] = &TagValue{Name: names[i], Error: err}
+				}
+			}
+		}
+		if err != nil && isConnectionError(err) {
+			for i := start; i < len(results); i++ {
+				if results[i] == nil {
+					results[i] = &TagValue{Name: names[i], Error: err}
+				}
+			}
+			return results, entries, err
+		}
+		if !individualVersionChecks && !isConnectionError(err) {
+			_, versionErr := c.checkVersion()
+			if versionErr != nil {
+				for i := start; i < end; i++ {
+					if results[i] != nil && results[i].Error == nil {
+						results[i].Error = versionErr
+					}
+				}
+				for i := end; i < len(results); i++ {
+					if results[i] == nil {
+						results[i] = &TagValue{Name: names[i], Error: versionErr}
+					}
+				}
+				return results, entries, versionErr
+			}
+			if c.versionCapability == 1 && before != c.symbolVersion {
+				return results, entries, &AdsError{Code: ErrDeviceSymbolVersionInvalid}
+			}
+		}
+		start = end
+	}
+	return results, entries, nil
+}
+
+func (c *Client) readBatch(names []string, entries []*SymbolEntry, results []*TagValue) error {
+	count := uint64(len(entries))
+	if len(names) != len(entries) || len(results) != len(entries) {
+		return fmt.Errorf("batch names/entries count mismatch")
+	}
+	if count == 0 {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry == nil {
+			return fmt.Errorf("nil ADS batch entry")
+		}
+	}
+	if len(entries) == 1 {
+		v, err := c.readSymbol(names[0])
+		if err != nil {
+			return err
+		}
+		results[0] = v
+		return nil
+	}
+	if count > uint64(^uint32(0)) || 16+12*count > uint64(c.conn.maxPayload) || 4*count+8 > uint64(c.conn.maxPayload) {
+		return fmt.Errorf("ADS batch request count/byte limit exceeded")
+	}
+	readSize := 4 * uint64(len(entries))
+	write := make([]byte, 12*len(entries))
+	for i, entry := range entries {
+		readSize += uint64(entry.Info.Size)
+		if readSize+8 > uint64(c.conn.maxPayload) {
+			return fmt.Errorf("ADS batch response exceeds budget")
+		}
+		binary.LittleEndian.PutUint32(write[i*12:i*12+4], IndexGroupSymbolValueByHandle)
+		binary.LittleEndian.PutUint32(write[i*12+4:i*12+8], entry.Handle)
+		binary.LittleEndian.PutUint32(write[i*12+8:i*12+12], entry.Info.Size)
+	}
+	data, err := c.readWriteData(IndexGroupSumUpRead, uint32(len(entries)), uint32(readSize), write)
+	if err != nil {
+		return err
+	}
+	if uint64(len(data)) != readSize {
+		return c.conn.fail(fmt.Errorf("ADS SumUp size %d, want %d", len(data), readSize))
+	}
+	offset := 4 * len(entries)
+	// F080 returns each requested-size data slot, including failed slots. F084
+	// uses returned lengths instead; never apply its cursor rule to F080.
+	for i, entry := range entries {
+		size := int(entry.Info.Size)
+		code := binary.LittleEndian.Uint32(data[i*4 : i*4+4])
+		if code != 0 {
+			results[i] = &TagValue{Name: names[i], Error: &AdsError{Code: code}}
+		} else {
+			bytes := append([]byte(nil), data[offset:offset+size]...)
+			results[i] = rawValue(names[i], entry, bytes)
+		}
+		offset += size
+	}
+	return nil
+}
+
+// Write validates a complete schema-driven value before sending a value write.
+// It never performs implicit record read/modify/write or replays a value write.
+func (c *Client) Write(name string, value interface{}) error {
+	_, done, err := c.begin(false)
+	if err != nil {
+		return err
+	}
+	defer done()
+	for attempt := 0; attempt < 2; attempt++ {
+		err = c.loadSchemaForIO()
+		if staleSymbolError(err) && attempt == 0 {
+			c.invalidateCaches()
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		break
+	}
+	before := c.symbolVersion
+	entry, err := c.getSymbolEntry(name)
+	if err != nil {
+		return err
+	}
+	if !entry.Info.IsWritable() {
+		return fmt.Errorf("symbol %q is read-only", name)
+	}
+	paths, err := c.readOnlyPaths(name)
+	if err != nil {
+		return err
+	}
+	if len(paths) != 0 {
+		return fmt.Errorf("symbol %q contains read-only storage %q", name, paths[0])
+	}
+	resolver := c.currentResolver()
+	schema := c.schemaFor(entry.Info, resolver, c.snapshot)
+	cfg := c.effectiveOptions()
+	cfg.deadline = c.deadline
+	data, err := encodeValue(schema, value, cfg)
+	if err != nil {
+		return fmt.Errorf("encode %s: %w", name, err)
+	}
+	if err := c.ensureHandle(name, entry); err != nil {
+		if staleSymbolError(err) {
+			c.invalidateCaches()
+		}
+		return err
+	}
+	if _, err := c.checkVersion(); err != nil {
+		return err
+	}
+	if c.versionCapability == 1 && before != c.symbolVersion {
+		return &AdsError{Code: ErrDeviceSymbolVersionInvalid}
+	}
+	err = c.writeData(IndexGroupSymbolValueByHandle, entry.Handle, data)
+	if staleSymbolError(err) {
+		c.invalidateCaches()
+	}
+	if isConnectionError(err) {
+		return fmt.Errorf("write outcome uncertain; value may have been sent: %w", err)
+	}
 	return err
 }
 
-// AllTags discovers and returns all symbols from the PLC.
-// This performs a full symbol table upload which may take time on large projects.
+// AllTags returns the complete validated advertised catalog, sorted by name.
+// Direct symbol lookups do not alter membership.
 func (c *Client) AllTags() ([]TagInfo, error) {
-	if c == nil || c.conn == nil {
-		logging.DebugLog("ADS", "AllTags called but not connected")
-		return nil, fmt.Errorf("AllTags: nil client")
-	}
-
-	// Check if already loaded
-	c.symbolsMu.RLock()
-	if c.symbolsLoaded {
-		tags := make([]TagInfo, 0, len(c.symbols))
-		for _, entry := range c.symbols {
-			tags = append(tags, entry.Info)
-		}
-		c.symbolsMu.RUnlock()
-		logging.DebugLog("ADS", "AllTags returning %d cached symbols", len(tags))
-		return tags, nil
-	}
-	c.symbolsMu.RUnlock()
-
-	// Get upload info first
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-
-	// Read upload info: symbol count and size
-	req := make([]byte, 12)
-	binary.LittleEndian.PutUint32(req[0:4], IndexGroupSymbolUploadInfo2)
-	binary.LittleEndian.PutUint32(req[4:8], 0)
-	binary.LittleEndian.PutUint32(req[8:12], 24) // Read 24 bytes of info
-
-	resp, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdRead, req)
+	_, done, err := c.begin(false)
 	if err != nil {
-		return nil, fmt.Errorf("read upload info: %w", err)
+		return nil, err
 	}
-
-	if len(resp) < 16 {
-		return nil, fmt.Errorf("upload info response too short: %d bytes", len(resp))
-	}
-
-	result := binary.LittleEndian.Uint32(resp[0:4])
-	if result != 0 {
-		return nil, &AdsError{Code: result}
-	}
-
-	// Info structure: [SymbolCount 4] [SymbolSize 4] [DataTypeCount 4] [DataTypeSize 4] ...
-	symbolCount := binary.LittleEndian.Uint32(resp[8:12])
-	symbolSize := binary.LittleEndian.Uint32(resp[12:16])
-
-	logging.DebugLog("ADS", "Symbol upload info: %d symbols, %d bytes", symbolCount, symbolSize)
-
-	if symbolCount == 0 {
-		return nil, nil
-	}
-
-	// Upload symbol table
-	req2 := make([]byte, 12)
-	binary.LittleEndian.PutUint32(req2[0:4], IndexGroupSymbolUpload)
-	binary.LittleEndian.PutUint32(req2[4:8], 0)
-	binary.LittleEndian.PutUint32(req2[8:12], symbolSize)
-
-	resp2, err := c.conn.sendRequest(c.targetNetId, c.targetPort, CmdRead, req2)
-	if err != nil {
-		return nil, fmt.Errorf("upload symbols: %w", err)
-	}
-
-	if len(resp2) < 8 {
-		return nil, fmt.Errorf("symbol upload response too short")
-	}
-
-	result = binary.LittleEndian.Uint32(resp2[0:4])
-	if result != 0 {
-		return nil, &AdsError{Code: result}
-	}
-
-	dataLen := binary.LittleEndian.Uint32(resp2[4:8])
-	symbolData := resp2[8:]
-	if uint32(len(symbolData)) < dataLen {
-		return nil, fmt.Errorf("symbol data truncated: expected %d, got %d", dataLen, len(symbolData))
-	}
-
-	// Parse symbol entries
-	tags := make([]TagInfo, 0, symbolCount)
-	offset := uint32(0)
-
-	for i := uint32(0); i < symbolCount && offset < dataLen; i++ {
-		if offset+4 > dataLen {
-			break
-		}
-
-		entryLen := binary.LittleEndian.Uint32(symbolData[offset : offset+4])
-		if offset+entryLen > dataLen {
-			break
-		}
-
-		info, err := parseSymbolInfo(symbolData[offset : offset+entryLen])
-		if err == nil && info.IsPrimitive() {
-			tags = append(tags, *info)
-
-			// Cache symbol
-			c.symbolsMu.Lock()
-			c.symbols[info.Name] = &SymbolEntry{Info: *info, Handle: 0}
-			c.symbolsMu.Unlock()
-		}
-
-		offset += entryLen
-	}
-
-	c.symbolsMu.Lock()
-	c.symbolsLoaded = true
-	c.symbolsMu.Unlock()
-
-	logging.DebugLog("ADS", "AllTags discovered %d primitive symbols from %d total", len(tags), symbolCount)
-
-	return tags, nil
+	defer done()
+	return c.allTags()
 }
 
-// Programs returns the unique top-level prefixes from discovered symbols.
-// TwinCAT symbols are accessed by their full path (e.g., "MAIN.Variable", "GVL.GlobalVar").
-// This extracts prefixes like MAIN, GVL, FB_Motor, etc. from the symbol table.
-func (c *Client) Programs() ([]string, error) {
-	c.symbolsMu.RLock()
-	defer c.symbolsMu.RUnlock()
+func (c *Client) allTags() ([]TagInfo, error) {
+	tags, _, err := c.catalogResult(false)
+	return tags, err
+}
 
-	if !c.symbolsLoaded || len(c.symbols) == 0 {
-		// Symbols not yet loaded, return common defaults
-		return []string{"MAIN", "GVL"}, nil
+// Describe returns a deep, caller-owned description of the exact symbol path.
+// Ordinary reads and writes resolve schemas automatically; inspection is optional.
+func (c *Client) Describe(name string) (*metadata.Symbol, error) {
+	_, done, err := c.begin(false)
+	if err != nil {
+		return nil, err
 	}
-
-	// Extract unique top-level prefixes from symbol names
-	prefixes := make(map[string]bool)
-	for name := range c.symbols {
-		if idx := strings.Index(name, "."); idx > 0 {
-			prefix := name[:idx]
-			// Skip internal/system symbols (start with underscore or are all caps constants)
-			if !strings.HasPrefix(prefix, "_") {
-				prefixes[prefix] = true
+	defer done()
+	for attempt := 0; attempt < 2; attempt++ {
+		err := c.loadSchemaForIO()
+		if err != nil {
+			if staleSymbolError(err) && attempt == 0 {
+				continue
 			}
+			return nil, err
+		}
+		entry, err := c.getSymbolEntry(name)
+		if err != nil {
+			return nil, err
+		}
+		resolver := c.currentResolver()
+		schema := c.schemaFor(entry.Info, resolver, c.snapshot)
+		budget := parseBudget{remaining: uint64(c.effectiveOptions().maxElements), maxDepth: c.effectiveOptions().maxDepth, deadline: c.deadline}
+		typeOf, err := describeType(schema, &budget, 1)
+		if err != nil {
+			return nil, err
+		}
+		paths, err := c.readOnlyPaths(name)
+		if err != nil {
+			return nil, err
+		}
+		rootReadOnly, err := describeAccess(&typeOf, name, paths, &budget)
+		if err != nil {
+			return nil, err
+		}
+		before := c.symbolVersion
+		_, err = c.checkVersion()
+		if err != nil {
+			return nil, err
+		}
+		if c.versionCapability == 1 && before != c.symbolVersion {
+			if attempt == 0 {
+				continue
+			}
+			return nil, &AdsError{Code: ErrDeviceSymbolVersionInvalid}
+		}
+		return &metadata.Symbol{Name: entry.Info.Name, Type: typeOf, Readable: entry.Info.IsReadable(), Writable: entry.Info.IsWritable() && !rootReadOnly}, nil
+	}
+	panic("unreachable")
+}
+
+// Programs projects published top-level namespaces, loading the catalog as needed.
+func (c *Client) Programs() ([]string, error) {
+	tags, err := c.AllTags()
+	if err != nil {
+		return nil, err
+	}
+	prefixes := make(map[string]bool)
+	for _, tag := range tags {
+		if i := strings.IndexByte(tag.Name, '.'); i > 0 {
+			prefixes[tag.Name[:i]] = true
 		}
 	}
-
-	// Convert to sorted slice
 	result := make([]string, 0, len(prefixes))
 	for prefix := range prefixes {
 		result = append(result, prefix)
 	}
 	sort.Strings(result)
-
-	if len(result) == 0 {
-		// Fallback to defaults if no prefixes found
-		return []string{"MAIN", "GVL"}, nil
-	}
-
 	return result, nil
 }
 
-// Identity returns device information in a format compatible with the plcman interface.
-// This is an alias for GetDeviceInfo for API consistency.
-func (c *Client) Identity() (*DeviceInfo, error) {
-	return c.GetDeviceInfo()
+// encodeStringArray is retained for protocol helper compatibility inside ads.
+func encodeStringArray(values []string, size int, wide bool) ([]byte, error) {
+	if size <= 0 || len(values) > int(^uint(0)>>1)/size {
+		return nil, fmt.Errorf("invalid string array size")
+	}
+	result := make([]byte, len(values)*size)
+	code := TypeString
+	if wide {
+		code = TypeWString
+	}
+	for i, value := range values {
+		bytes, err := EncodeValueWithType(value, code)
+		if err != nil {
+			return nil, err
+		}
+		if len(bytes) > size {
+			return nil, fmt.Errorf("string exceeds element capacity")
+		}
+		copy(result[i*size:(i+1)*size], bytes)
+	}
+	return result, nil
 }

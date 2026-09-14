@@ -2,7 +2,7 @@
 
 A pure Go library for communicating with industrial PLCs (Programmable Logic Controllers) across multiple vendors and protocols. plcio provides a unified `Driver` interface for reading tags, writing values, discovering devices, and browsing symbol tables across Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Siemens, Beckhoff, and Omron PLCs.
 
-> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. Beckhoff is stable but requires more testing. SLC 500, MicroLogix, and Omron FINS are moderately tested. PLC-5 and Omron EIP are untested/experimental.
+> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. v0.3.0 adds published Beckhoff record/array support; remaining hardware validation is tracked in the implementation report. SLC 500, MicroLogix, and Omron FINS are moderately tested. PLC-5 and Omron EIP are untested/experimental.
 
 ## Supported PLC Families
 
@@ -67,16 +67,17 @@ func main() {
         {Name: "MyTag"},
         {Name: "AnotherTag"},
     })
-    if err != nil {
-        log.Fatal(err)
-    }
-
     for _, tv := range results {
         if tv.Error != nil {
             fmt.Printf("%s: ERROR %v\n", tv.Name, tv.Error)
         } else {
             fmt.Printf("%s = %v\n", tv.Name, tv.Value)
         }
+    }
+
+    if err != nil {
+        log.Printf("read incomplete: %v", err)
+        return
     }
 
     // Write a value
@@ -184,9 +185,9 @@ results, _ := drv.Read([]driver.TagRequest{
 ```go
 cfg := &driver.PLCConfig{
     Name:     "beckhoff",
-    Address:  "192.168.1.40",
+    Address:  "192.168.5.212:48898",
     Family:   driver.FamilyBeckhoff,
-    AmsNetId: "192.168.1.40.1.1", // Target AMS Net ID
+    AmsNetId: "5.45.219.226.1.1", // Target AMS identity, independent of TCP host
     AmsPort:  851,                 // TwinCAT 3 runtime (801 for TC2)
     Enabled:  true,
 }
@@ -197,11 +198,13 @@ defer drv.Close()
 
 // Read by symbol name
 results, _ := drv.Read([]driver.TagRequest{
-    {Name: "MAIN.counter"},
-    {Name: "MAIN.temperature"},
-    {Name: "GVL.status_word"},
+    {Name: "MAIN.test_struct"}, // map[string]any with typed member values
+    {Name: "MAIN.test_2d_dint_array_style1"}, // flat []int64
+    {Name: "MAIN.test_struct.my_dint"},
 })
 ```
+
+Successful unified reads use `int64`, `uint64`, `float64`, `bool`, `string`, typed primitive slices and record maps. Integers retain their precision. Check per-tag errors and process successful results even when Read returns a top-level connection error. ADS resolves schemas automatically; `driver.Describer` is optional inspection. See [Beckhoff details](docs/beckhoff.md) and [compatibility changes](docs/plcio-compatibility.md).
 
 ### Omron (FINS)
 
@@ -316,6 +319,8 @@ Detailed documentation for each PLC family and feature:
 - [EtherNet/IP Adapter (be-a-device)](docs/eip-adapter.md)
 - [Network Discovery](docs/network-discovery.md)
 - [API Reference](docs/api-reference.md)
+- [Candidate Compatibility](docs/plcio-compatibility.md)
+- [Implementation Audit and Promotion Gates](docs/plcio-implementation-report.md)
 - [Safety & Intended Use](docs/safety-and-intended-use.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
@@ -329,7 +334,7 @@ Detailed documentation for each PLC family and feature:
 | Tag Discovery | Stable | Stable | Tested | N/A | Tested | N/A | Stable | N/A | Experimental |
 | Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable |
 | Batch Reads | Stable | N/A | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
-| UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Partial | N/A | No |
+| UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Published layouts | N/A | No |
 | Device Info | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
 | Keep-alive | Stable | Stable | Tested | Untested | Tested | N/A | N/A | Stable | Experimental |
 

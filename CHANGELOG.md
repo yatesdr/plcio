@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-09-14
+
+### Added
+- Automatic published ADS record, packed BIT, alias/enum/subrange and flat array
+  decoding in ordinary Driver.Read; optional caller-owned metadata descriptions.
+- ReadDecoded bridge and ADS identity/resource/string-encoding options through
+  NewADSAdapterWithOptions, preserving the original constructors and result layouts.
+- Independent captured wire/schema fixtures, bounded parser fuzz targets, adapter
+  TCP fixtures, opt-in read-only PLC smoke and soak tests.
+
+### Fixed
+- Logix template BOOL members use their published INFO bit positions, including positions
+  beyond the first byte, while retaining existing template APIs.
+- ADS framing/deadlines, short writes/errors, original-endpoint reconnect,
+  deduplicated handles, bounded Close, cache generation invalidation and one
+  deadline-bounded read recovery; value writes are never automatically replayed.
+- Complete advertised catalog membership and namespaces; checked SumUp splitting,
+  failed-slot offsets and explicit unsupported-service fallback.
+- ADS catalog dimensions use the same generation and operation budget as names;
+  whole-value writes enforce known child access without changing shared schemas.
+- STRING encoding attributes apply through aliases and arrays, with explicit
+  override precedence; schema validation bounds shared-graph work and CPU time.
+- Direct TwinCAT packed-member lookups accept validated zero-padded parent
+  names while preserving exact requested handles and strict catalog parsing.
+- Correct ADS READONLY/service/error constants, unsigned TIME/TOD and 4-byte DT,
+  Latin-1/UTF-8 STRING and UCS-2 WSTRING storage, exact write sizes/ranges/counts.
+- Shared adapters retain partial successful results alongside connection errors.
+  Omron/PCCC numbers and decoded primitive record arrays follow the shared Go
+  categories; canonical numeric write inputs preserve integer precision.
+- Omron CIP BOOL writes use one byte and typed CIP arrays carry their actual
+  element count; FINS accepts complete BOOL slices.
+- ADS discovery validates identity separately from route verification; ADS/S7/FINS
+  IPv4 expansion and worker counts are bounded, with correct /31 and /32 handling.
+- Omron TCP/discovery addresses use proper host/port construction.
+
+### Compatibility and validation
+- Minor feature release within the project's beta status. See the
+  [migration contract](docs/plcio-compatibility.md) and
+  [audit evidence and remaining hardware validation](docs/plcio-implementation-report.md).
+- Read-only Beckhoff validation covers all 34 supplied variables and nine member
+  paths. Logix scalar/UDT reads pass; Siemens testing establishes connectivity.
+  Live writes, real online changes, Siemens value reads and Omron hardware tests
+  remain unverified.
+- Unified decoded representations, complete ADS browsing and stricter invalid
+  writes are intentional behavior changes. Existing Driver methods, function
+  signatures, shared configuration/result field layouts and native Bytes/type
+  meanings remain source compatible.
+
 ## [0.2.0] - 2026-05-21
 
 ### Added

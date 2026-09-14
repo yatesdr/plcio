@@ -17,16 +17,24 @@ import (
 // helper to build a fresh adapter on auto-assigned localhost ports
 func startAdapter(t *testing.T, asm ...*Assembly) (*Adapter, context.CancelFunc) {
 	t.Helper()
+	// Zero selects the production default, rather than an ephemeral TCP port.
+	// Pick a temporary port so independent package fixtures can run together.
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpPort := uint16(listener.Addr().(*net.TCPAddr).Port)
+	listener.Close()
 	cfg := Config{
 		BindAddr: "127.0.0.1",
-		TCPPort:  0,
+		TCPPort:  tcpPort,
 		UDPPort:  0,
 		IOPort:   0,
 		Identity: Identity{
-			VendorID:     0x1337,
-			DeviceType:   0x000C,
-			ProductCode:  1,
-			RevMajor:     1, RevMinor: 0,
+			VendorID:    0x1337,
+			DeviceType:  0x000C,
+			ProductCode: 1,
+			RevMajor:    1, RevMinor: 0,
 			SerialNumber: 0xC0FFEE01,
 			ProductName:  "Test Adapter",
 			State:        0x03,
@@ -125,11 +133,11 @@ func TestGetAttributeIdentityProductName(t *testing.T) {
 
 	// Build a Get_Attribute_Single request: path = class 0x01, inst 1, attr 7
 	cipReq := make([]byte, 0, 8)
-	cipReq = append(cipReq, 0x0E)             // service
-	cipReq = append(cipReq, 0x03)             // path size = 3 words = 6 bytes
-	cipReq = append(cipReq, 0x20, 0x01)       // class = 1
-	cipReq = append(cipReq, 0x24, 0x01)       // instance = 1
-	cipReq = append(cipReq, 0x30, 0x07)       // attribute = 7
+	cipReq = append(cipReq, 0x0E)       // service
+	cipReq = append(cipReq, 0x03)       // path size = 3 words = 6 bytes
+	cipReq = append(cipReq, 0x20, 0x01) // class = 1
+	cipReq = append(cipReq, 0x24, 0x01) // instance = 1
+	cipReq = append(cipReq, 0x30, 0x07) // attribute = 7
 
 	cpf := eip.EipCommonPacket{
 		Items: []eip.EipCommonPacketItem{

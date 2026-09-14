@@ -275,7 +275,7 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 					elemBytes := make([]byte, elemSize)
 					copy(elemBytes, tag.Bytes[offset:offset+elemSize])
 
-					value := pccc.DecodeValue(parsed[origIdx].addr, elemBytes)
+					value := normalizeDecoded(pccc.DecodeValue(parsed[origIdx].addr, elemBytes))
 
 					results[origIdx] = &TagValue{
 						Name:        requests[origIdx].Name,
@@ -302,12 +302,14 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 	}
 
+	var readErr error
 	if len(remaining) > 0 {
 		values, err := a.client.Read(remaining...)
-		if err != nil {
-			return nil, err
-		}
+		readErr = err
 		for j, v := range values {
+			if j >= len(remainingIdx) {
+				break
+			}
 			origIdx := remainingIdx[j]
 			if v == nil {
 				results[origIdx] = &TagValue{
@@ -317,12 +319,13 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 				}
 				continue
 			}
+			goValue := normalizeDecoded(v.Value)
 			results[origIdx] = &TagValue{
 				Name:        v.Name,
 				DataType:    uint16(v.FileType),
 				Family:      family,
-				Value:       v.Value,
-				StableValue: v.Value,
+				Value:       goValue,
+				StableValue: goValue,
 				Bytes:       v.Bytes,
 				Count:       1,
 				Error:       v.Error,
@@ -330,7 +333,16 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 	}
 
-	return results, nil
+	for i, value := range results {
+		if value == nil {
+			slotErr := readErr
+			if slotErr == nil {
+				slotErr = fmt.Errorf("missing response")
+			}
+			results[i] = &TagValue{Name: requests[i].Name, Family: family, Error: slotErr}
+		}
+	}
+	return results, readErr
 }
 
 // pcccContiguousRuns detects runs of consecutive elements within a sorted slice
@@ -361,6 +373,14 @@ func pcccContiguousRuns(sortedIndices []int, elemOf func(int) uint16) [][]int {
 func (a *PCCCAdapter) Write(tag string, value interface{}) error {
 	if a.client == nil {
 		return fmt.Errorf("not connected")
+	}
+	addr, err := pccc.ParseAddress(tag)
+	if err != nil {
+		return err
+	}
+	value, err = pcccCanonical(addr, value)
+	if err != nil {
+		return err
 	}
 	return a.client.Write(tag, value)
 }

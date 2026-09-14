@@ -5,6 +5,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/yatesdr/plcio/internal/netutil"
 )
 
 // DiscoveredDevice contains identity information about a discovered S7 PLC.
@@ -26,15 +28,13 @@ type DiscoveredDevice struct {
 //
 // Returns discovered devices that responded to S7 protocol.
 func Discover(ips []net.IP, timeout time.Duration, concurrency int) []DiscoveredDevice {
-	if len(ips) == 0 {
+	if !netutil.ValidScan(ips) {
 		return nil
 	}
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
-	if concurrency <= 0 {
-		concurrency = 20
-	}
+	concurrency = netutil.ScanWorkers(concurrency, len(ips))
 
 	var (
 		results []DiscoveredDevice
@@ -170,35 +170,4 @@ func tryS7Connect(ip net.IP, addr string, rack, slot int, timeout time.Duration)
 }
 
 // expandCIDR expands a CIDR notation to a list of IP addresses.
-func expandCIDR(cidr string) ([]net.IP, error) {
-	ip, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid CIDR: %w", err)
-	}
-
-	var ips []net.IP
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
-		// Skip network and broadcast addresses for /24 and larger
-		ones, bits := ipnet.Mask.Size()
-		if bits-ones >= 8 {
-			if ip[len(ip)-1] == 0 || ip[len(ip)-1] == 255 {
-				continue
-			}
-		}
-		ipCopy := make(net.IP, len(ip))
-		copy(ipCopy, ip)
-		ips = append(ips, ipCopy)
-	}
-
-	return ips, nil
-}
-
-// inc increments an IP address.
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
-}
+func expandCIDR(cidr string) ([]net.IP, error) { return netutil.ExpandIPv4(cidr) }

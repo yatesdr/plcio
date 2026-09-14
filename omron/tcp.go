@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,7 +61,7 @@ func (t *tcpTransport) connect(address string, port int, network, node, unit, sr
 	t.localNode = srcNode
 
 	// Connect TCP
-	addr := fmt.Sprintf("%s:%d", address, port)
+	addr := net.JoinHostPort(address, strconv.Itoa(port))
 	logging.DebugConnect("FINS/TCP", addr)
 	logging.DebugLog("FINS/TCP", "Connection params: network=%d, node=%d, unit=%d, srcNode=%d", network, node, unit, srcNode)
 

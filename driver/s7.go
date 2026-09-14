@@ -119,7 +119,7 @@ func (a *S7Adapter) Read(requests []TagRequest) ([]*TagValue, error) {
 	}
 
 	values, err := a.client.ReadWithTypes(s7Requests)
-	if err != nil {
+	if err != nil && len(values) == 0 {
 		return nil, err
 	}
 
@@ -135,7 +135,7 @@ func (a *S7Adapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 
 		// Get Go value from S7 tag
-		goValue := v.GoValue()
+		goValue := normalizeDecoded(v.GoValue())
 
 		// Handle array type code
 		dataType := v.DataType
@@ -155,7 +155,7 @@ func (a *S7Adapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 	}
 
-	return result, nil
+	return result, err
 }
 
 // Write writes a value to a tag.
@@ -175,6 +175,18 @@ func (a *S7Adapter) Write(tag string, value interface{}) error {
 		}
 	}
 
+	addr, err := s7.ParseAddress(tag)
+	if err != nil {
+		return err
+	}
+	code := addr.DataType
+	if code == 0 && typeHint != "" {
+		code, _ = s7.TypeCodeFromName(typeHint)
+	}
+	value, err = s7Canonical(code, value)
+	if err != nil {
+		return err
+	}
 	return a.client.WriteWithType(tag, value, typeHint)
 }
 

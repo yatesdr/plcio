@@ -108,17 +108,24 @@ results, _ := drv.Read([]driver.TagRequest{
 
 ### Supported Data Types (FINS)
 
+The table describes unified driver values. Native protocol APIs retain their
+existing representations and wire widths. Primitive arrays use typed slices;
+record members follow the same widened categories. Canonical numeric Write inputs
+are checked against the target width without routing integers through floating
+point; existing time and text semantics are preserved. See
+[compatibility changes](plcio-compatibility.md).
+
 | Type Hint | Go Type | Words | Byte Order |
 |---|---|---|---|
 | `BOOL` | `bool` | 1 bit | N/A |
-| `BYTE` | `uint8` | 1 (partial) | N/A |
-| `WORD` | `uint16` | 1 | Big-endian |
-| `INT` / `INT16` | `int16` | 1 | Big-endian |
-| `DWORD` | `uint32` | 2 | Big-endian |
-| `DINT` / `INT32` | `int32` | 2 | Big-endian |
+| `BYTE` | `uint64` | 1 (partial) | N/A |
+| `WORD` | `uint64` | 1 | Big-endian |
+| `INT` / `INT16` | `int64` | 1 | Big-endian |
+| `DWORD` | `uint64` | 2 | Big-endian |
+| `DINT` / `INT32` | `int64` | 2 | Big-endian |
 | `LWORD` | `uint64` | 4 | Big-endian |
 | `INT64` | `int64` | 4 | Big-endian |
-| `REAL` | `float32` | 2 | Big-endian |
+| `REAL` | `float64` | 2 | Big-endian |
 | `LREAL` | `float64` | 4 | Big-endian |
 | `STRING` | `string` | Variable | N/A |
 

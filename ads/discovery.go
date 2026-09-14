@@ -1,11 +1,14 @@
 package ads
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/yatesdr/plcio/internal/netutil"
 )
 
 // UDP port for TwinCAT discovery broadcasts
@@ -19,8 +22,8 @@ type DiscoveredDevice struct {
 	ProductName    string // Product name or description
 	Hostname       string // Device hostname
 	TwinCATVersion string // TwinCAT version (e.g., "3.1.4024")
-	HasRoute       bool   // True if route is configured (device responds to ADS requests)
-	Connected      bool   // True if successfully identified
+	HasRoute       bool   // True only after a successful ADS runtime identity exchange
+	Connected      bool   // True for a validated protocol identity; UDP does not verify a route
 }
 
 // DiscoverBroadcast performs UDP broadcast discovery for TwinCAT devices.
@@ -36,14 +39,18 @@ func DiscoverBroadcast(broadcastAddrs []string, timeout time.Duration) []Discove
 		seen    = make(map[string]bool)
 	)
 
-	// TwinCAT discovery packet (32 bytes)
+	// SDK SERVERINFO: 12-byte header, empty AMS address and zero tag count.
 	// Magic: 03 66 14 71, followed by request parameters
-	packet := make([]byte, 32)
+	packet := make([]byte, 24)
 	binary.LittleEndian.PutUint32(packet[0:4], 0x71146603)  // Magic (little-endian)
 	binary.LittleEndian.PutUint32(packet[4:8], 0x00000000)  // Request ID
 	binary.LittleEndian.PutUint32(packet[8:12], 0x00000001) // Service: discovery
 
+	deadline := time.Now().Add(timeout)
 	for _, broadcastAddr := range broadcastAddrs {
+		if !time.Now().Before(deadline) {
+			break
+		}
 		addr := fmt.Sprintf("%s:%d", broadcastAddr, DiscoveryUDPPort)
 
 		conn, err := net.ListenPacket("udp4", ":0")
@@ -57,8 +64,14 @@ func DiscoverBroadcast(broadcastAddrs []string, timeout time.Duration) []Discove
 			continue
 		}
 
-		conn.WriteTo(packet, destAddr)
-		conn.SetReadDeadline(time.Now().Add(timeout))
+		if err := conn.SetDeadline(deadline); err != nil {
+			conn.Close()
+			continue
+		}
+		if _, err := conn.WriteTo(packet, destAddr); err != nil {
+			conn.Close()
+			continue
+		}
 
 		buf := make([]byte, 512)
 		for {
@@ -91,67 +104,56 @@ func DiscoverBroadcast(broadcastAddrs []string, timeout time.Duration) []Discove
 	return results
 }
 
-// parseDiscoveryResponse parses a TwinCAT UDP discovery response.
-// Response format:
-//   - Bytes 0-3: Magic (03 66 14 71)
-//   - Bytes 4-7: Request ID echo
-//   - Bytes 8-11: Service response (01 00 00 80 - 0x80 indicates response)
-//   - Bytes 12-17: AMS Net ID (6 bytes)
-//   - Bytes 18-19: Port (little-endian, typically 10000)
-//   - Bytes 20-23: Flags
-//   - Bytes 24-25: Unknown
-//   - Byte 26: Hostname length
-//   - Byte 27: Unknown
-//   - Bytes 28+: Hostname (null-terminated)
+// SERVERINFO identity and TLV fields follow the official Beckhoff AdsLib UDP
+// implementation. Visibility verifies identity, not an ADS runtime route.
 func parseDiscoveryResponse(data []byte, sourceIP net.IP) *DiscoveredDevice {
-	if len(data) < 18 {
+	if sourceIP.To4() == nil || len(data) < 18 || binary.LittleEndian.Uint32(data[:4]) != 0x71146603 || binary.LittleEndian.Uint32(data[4:8]) != 0 || binary.LittleEndian.Uint32(data[8:12]) != 0x80000001 {
 		return nil
 	}
-
-	// Verify magic bytes
-	if data[0] != 0x03 || data[1] != 0x66 || data[2] != 0x14 || data[3] != 0x71 {
+	id := AmsNetId(data[12:18])
+	if id.IsZero() {
 		return nil
 	}
-
-	device := &DiscoveredDevice{
-		IP:        sourceIP,
-		Port:      DefaultTCPPort,
-		Connected: true,
-		HasRoute:  true,
+	device := &DiscoveredDevice{IP: append(net.IP(nil), sourceIP...), Port: DefaultTCPPort, AmsNetId: id.String(), Connected: true, HasRoute: false, ProductName: "Beckhoff TwinCAT"}
+	// The SDK accepts the minimal six-byte identity. Optional TLVs require
+	// complete AMS address/count fields and complete bounded tag payloads.
+	if len(data) == 18 || len(data) == 20 {
+		return device
 	}
-
-	// AMS Net ID at offset 12 (6 bytes)
-	amsBytes := data[12:18]
-	device.AmsNetId = fmt.Sprintf("%d.%d.%d.%d.%d.%d",
-		amsBytes[0], amsBytes[1], amsBytes[2], amsBytes[3], amsBytes[4], amsBytes[5])
-
-	// Validate AMS Net ID (not all zeros)
-	allZero := true
-	for _, b := range amsBytes {
-		if b != 0 {
-			allZero = false
-			break
+	if len(data) < 24 {
+		return nil
+	}
+	count := uint64(binary.LittleEndian.Uint32(data[20:24]))
+	if count > uint64(len(data)-24)/4 {
+		return nil
+	}
+	offset := 24
+	seen := make(map[uint16]bool)
+	for index := uint64(0); index < count; index++ {
+		if len(data)-offset < 4 {
+			return nil
+		}
+		tag, size := binary.LittleEndian.Uint16(data[offset:offset+2]), int(binary.LittleEndian.Uint16(data[offset+2:offset+4]))
+		offset += 4
+		if size > len(data)-offset || seen[tag] {
+			return nil
+		}
+		seen[tag] = true
+		value := data[offset : offset+size]
+		offset += size
+		if tag == 5 {
+			if size == 0 || value[size-1] != 0 {
+				return nil
+			}
+			device.Hostname = extractPrintableString(value)
 		}
 	}
-	if allZero {
-		device.AmsNetId = ""
+	if offset != len(data) {
+		return nil
 	}
-
-	// Hostname at offset 28 (length at offset 26)
-	if len(data) > 28 {
-		hostnameLen := int(data[26])
-		if hostnameLen > 0 && 28+hostnameLen <= len(data) {
-			device.Hostname = extractPrintableString(data[28 : 28+hostnameLen])
-		}
-	}
-
-	// Build product name
 	if device.Hostname != "" {
-		device.ProductName = fmt.Sprintf("TwinCAT on %s", device.Hostname)
-	} else {
-		device.ProductName = "Beckhoff TwinCAT"
+		device.ProductName = "TwinCAT on " + device.Hostname
 	}
-
 	return device
 }
 
@@ -171,15 +173,13 @@ func extractPrintableString(data []byte) string {
 
 // Discover scans a list of IP addresses for TwinCAT devices via TCP port 48898.
 func Discover(ips []net.IP, timeout time.Duration, concurrency int) []DiscoveredDevice {
-	if len(ips) == 0 {
+	if !netutil.ValidScan(ips) {
 		return nil
 	}
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
-	if concurrency <= 0 {
-		concurrency = 20
-	}
+	concurrency = netutil.ScanWorkers(concurrency, len(ips))
 
 	var (
 		results []DiscoveredDevice
@@ -217,161 +217,50 @@ func DiscoverSubnet(cidr string, timeout time.Duration, concurrency int) ([]Disc
 	return Discover(ips, timeout, concurrency), nil
 }
 
-// probeADS attempts to connect to a TwinCAT device via TCP.
+// probeADS returns only a verified ADS identity, never an arbitrary open port.
 func probeADS(ip net.IP, timeout time.Duration) *DiscoveredDevice {
-	addr := fmt.Sprintf("%s:%d", ip.String(), DefaultTCPPort)
-
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if ip.To4() == nil {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort(ip.String(), fmt.Sprint(DefaultTCPPort)))
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-
-	// Try to get device info via ADS protocol
-	if device := tryADSDeviceInfo(conn, ip); device != nil {
-		return device
-	}
-
-	// TCP connected but no ADS response - device exists but no route configured
-	return &DiscoveredDevice{
-		IP:          ip,
-		Port:        DefaultTCPPort,
-		ProductName: "Beckhoff TwinCAT (no route)",
-		Connected:   false,
-		HasRoute:    false,
-	}
+	return tryADSDeviceInfoUntil(conn, ip, deadline)
 }
 
-// tryADSDeviceInfo attempts to read device info via ADS ReadDeviceInfo command.
 func tryADSDeviceInfo(conn net.Conn, ip net.IP) *DiscoveredDevice {
-	// Build AMS Net ID from IP (convention: ip.ip.ip.ip.1.1)
-	var netId [6]byte
-	ip4 := ip.To4()
-	if ip4 != nil {
-		netId = [6]byte{ip4[0], ip4[1], ip4[2], ip4[3], 1, 1}
-	} else if len(ip) >= 16 {
-		netId = [6]byte{ip[12], ip[13], ip[14], ip[15], 1, 1}
-	} else {
-		return nil
-	}
-
-	// Build ADS ReadDeviceInfo request
-	packet := make([]byte, 38)
-	binary.LittleEndian.PutUint16(packet[0:2], 0)  // Reserved
-	binary.LittleEndian.PutUint32(packet[2:6], 32) // AMS header length
-
-	copy(packet[6:12], netId[:])                              // Target Net ID
-	binary.LittleEndian.PutUint16(packet[12:14], PortTC3PLC1) // Target Port
-	copy(packet[14:20], netId[:])                             // Source Net ID
-	binary.LittleEndian.PutUint16(packet[20:22], 32768)       // Source Port
-	binary.LittleEndian.PutUint16(packet[22:24], CmdReadDeviceInfo)
-	binary.LittleEndian.PutUint16(packet[24:26], StateFlagRequest)
-	binary.LittleEndian.PutUint32(packet[26:30], 0) // Data length
-	binary.LittleEndian.PutUint32(packet[30:34], 0) // Error code
-	binary.LittleEndian.PutUint32(packet[34:38], 1) // Invoke ID
-
-	if _, err := conn.Write(packet); err != nil {
-		return nil
-	}
-
-	// Read response header
-	respHeader := make([]byte, 6)
-	if _, err := conn.Read(respHeader); err != nil {
-		return nil
-	}
-
-	respLen := binary.LittleEndian.Uint32(respHeader[2:6])
-	if respLen < 32 || respLen > 1024 {
-		return nil
-	}
-
-	respData := make([]byte, respLen)
-	if _, err := conn.Read(respData); err != nil {
-		return nil
-	}
-
-	if len(respData) < 32 {
-		return nil
-	}
-
-	// Verify response
-	cmdId := binary.LittleEndian.Uint16(respData[16:18])
-	if cmdId != CmdReadDeviceInfo {
-		return nil
-	}
-
-	stateFlags := binary.LittleEndian.Uint16(respData[18:20])
-	if stateFlags&0x0001 == 0 {
-		return nil
-	}
-
-	amsNetIdStr := fmt.Sprintf("%d.%d.%d.%d.%d.%d", netId[0], netId[1], netId[2], netId[3], netId[4], netId[5])
-
-	errorCode := binary.LittleEndian.Uint32(respData[24:28])
-	if errorCode != 0 || len(respData) < 56 {
-		return &DiscoveredDevice{
-			IP:          ip,
-			Port:        DefaultTCPPort,
-			AmsNetId:    amsNetIdStr,
-			ProductName: "Beckhoff TwinCAT",
-			Connected:   true,
-			HasRoute:    true,
-		}
-	}
-
-	// Parse device info
-	deviceData := respData[32:]
-	major := deviceData[0]
-	minor := deviceData[1]
-	build := binary.LittleEndian.Uint16(deviceData[2:4])
-	deviceName := extractPrintableString(deviceData[4:20])
-
-	productName := fmt.Sprintf("%s v%d.%d.%d", deviceName, major, minor, build)
-	if deviceName == "" {
-		productName = fmt.Sprintf("TwinCAT v%d.%d.%d", major, minor, build)
-	}
-
-	return &DiscoveredDevice{
-		IP:             ip,
-		Port:           DefaultTCPPort,
-		AmsNetId:       amsNetIdStr,
-		ProductName:    productName,
-		TwinCATVersion: fmt.Sprintf("%d.%d.%d", major, minor, build),
-		Connected:      true,
-		HasRoute:       true,
-	}
+	return tryADSDeviceInfoUntil(conn, ip, time.Now().Add(500*time.Millisecond))
 }
 
-// expandCIDR expands a CIDR notation to a list of IP addresses.
-func expandCIDR(cidr string) ([]net.IP, error) {
-	ip, ipnet, err := net.ParseCIDR(cidr)
+func tryADSDeviceInfoUntil(conn net.Conn, ip net.IP, deadline time.Time) *DiscoveredDevice {
+	target, err := AmsNetIdFromIP(ip.String())
 	if err != nil {
-		return nil, fmt.Errorf("invalid CIDR: %w", err)
+		return nil
 	}
-
-	var ips []net.IP
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
-		ones, bits := ipnet.Mask.Size()
-		if bits-ones >= 8 {
-			if ip[len(ip)-1] == 0 || ip[len(ip)-1] == 255 {
-				continue
-			}
-		}
-		ipCopy := make(net.IP, len(ip))
-		copy(ipCopy, ip)
-		ips = append(ips, ipCopy)
-	}
-
-	return ips, nil
-}
-
-// inc increments an IP address.
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
+	local := AmsNetId{127, 0, 0, 1, 1, 1}
+	if address, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+		local, err = AmsNetIdFromIP(address.IP.String())
+		if err != nil {
+			return nil
 		}
 	}
+	stream := newAdsConnection(conn, local, 32768)
+	stream.maxPayload = 1024
+	data, err := stream.sendRequestUntil(target, PortTC3PLC1, CmdReadDeviceInfo, nil, deadline)
+	if err != nil {
+		return nil
+	}
+	info, err := decodeDeviceInfo(data)
+	if err != nil {
+		return nil
+	}
+	return &DiscoveredDevice{IP: append(net.IP(nil), ip...), Port: DefaultTCPPort, AmsNetId: target.String(), ProductName: info.String(), TwinCATVersion: fmt.Sprintf("%d.%d.%d", info.MajorVersion, info.MinorVersion, info.BuildVersion), Connected: true, HasRoute: true}
 }
+
+// DiscoverSubnet reports broad/IPv6 CIDRs as errors before any network traffic.
+func expandCIDR(cidr string) ([]net.IP, error) { return netutil.ExpandIPv4(cidr) }

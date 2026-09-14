@@ -197,17 +197,24 @@ for _, r := range results {
 
 ### Decoded Value Types
 
+The table describes unified driver values. Native protocol APIs retain their
+existing representations and wire widths. Primitive arrays use typed slices;
+record members follow the same widened categories. Canonical numeric Write inputs
+are checked against the target width without routing integers through floating
+point; existing time and text semantics are preserved. See
+[compatibility changes](plcio-compatibility.md).
+
 | File Type | Go Type | Notes |
 |---|---|---|
-| N (Integer) | `int16` | 16-bit signed |
-| F (Float) | `float32` | IEEE 754 |
-| L (Long) | `int32` | 32-bit signed |
-| B, O, I, S, A (16-bit word) | `int16` | When reading the full word |
+| N (Integer) | `int64` | 16-bit signed |
+| F (Float) | `float64` | IEEE 754 |
+| L (Long) | `int64` | 32-bit signed |
+| B, O, I, S, A (16-bit word) | `int64` | When reading the full word |
 | Bit access (`/N`) | `bool` | Single bit extracted from word |
-| T (Timer, full) | `map[string]interface{}` | Keys: `control`, `PRE`, `ACC`, `EN`, `TT`, `DN` |
-| C (Counter, full) | `map[string]interface{}` | Keys: `control`, `PRE`, `ACC`, `CU`, `CD`, `DN`, `OV`, `UN` |
-| R (Control, full) | `map[string]interface{}` | Keys: `control`, `LEN`, `POS`, `EN`, `EU`, `DN`, `EM`, `ER`, `UL`, `IN`, `FD` |
-| T/C/R sub-element (PRE, ACC, LEN, POS) | `int16` | Individual 16-bit sub-element |
+| T (Timer, full) | `map[string]interface{}` | Keys: `PRE`, `ACC`, `EN`, `TT`, `DN` |
+| C (Counter, full) | `map[string]interface{}` | Keys: `PRE`, `ACC`, `CU`, `CD`, `DN`, `OV`, `UN` |
+| R (Control, full) | `map[string]interface{}` | Keys: `LEN`, `POS`, `EN`, `EU`, `DN`, `EM`, `ER`, `UL`, `IN`, `FD` |
+| T/C/R sub-element (PRE, ACC, LEN, POS) | `int64` | Individual 16-bit sub-element |
 | T/C/R status bit (DN, EN, etc.) | `bool` | Individual bit from control word |
 | ST (String) | `string` | Decoded from 84-byte element |
 

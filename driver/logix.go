@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"github.com/yatesdr/plcio/cip"
@@ -161,7 +162,7 @@ func (a *LogixAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 	}
 
 	values, err := a.client.Read(names...)
-	if err != nil {
+	if err != nil && len(values) == 0 {
 		return nil, err
 	}
 
@@ -182,7 +183,7 @@ func (a *LogixAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 
 		// Use decoded value for structures when possible
 		var goValue interface{}
-		goValue = v.GoValueDecoded(a.client)
+		goValue = normalizeDecoded(v.GoValueDecoded(a.client))
 
 		result[i] = &TagValue{
 			Name:        v.Name,
@@ -196,13 +197,37 @@ func (a *LogixAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 	}
 
-	return result, nil
+	return result, err
 }
 
 // Write writes a value to a tag.
 func (a *LogixAdapter) Write(tag string, value interface{}) error {
 	if a.client == nil {
 		return fmt.Errorf("not connected")
+	}
+	if canonicalNumeric(value) {
+		code, known := a.client.ResolveTagType(tag)
+		if !known {
+			values, err := a.client.Read(tag)
+			if err != nil {
+				return err
+			}
+			if len(values) != 1 || values[0] == nil {
+				return fmt.Errorf("missing tag type response")
+			}
+			if values[0].Error != nil {
+				return values[0].Error
+			}
+			code = values[0].DataType
+		}
+		width, signed, floating := logixNumeric(code)
+		data, count, handled, err := canonicalStorage(value, width, signed, floating, binary.LittleEndian)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return a.client.PLC().WriteTagCount(tag, code&0x0fff, data, uint16(count))
+		}
 	}
 	return a.client.Write(tag, value)
 }

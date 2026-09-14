@@ -9,7 +9,7 @@ plcio runs four discovery methods in parallel:
 | Method | Protocol | Targets | Technique |
 |---|---|---|---|
 | EIP Broadcast | EtherNet/IP | Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Omron NJ/NX | UDP broadcast on port 44818 |
-| S7 Port Scan | S7comm | Siemens S7-* | TCP connect scan on port 102 |
+| S7 Port Scan | S7comm | Siemens S7-* | TCP protocol probe on port 102 |
 | ADS Broadcast + Scan | ADS | Beckhoff TwinCAT | UDP broadcast + TCP scan on port 48898 |
 | FINS Scan | FINS | Omron CS/CJ/CP | Network scan on port 9600 |
 
@@ -84,7 +84,7 @@ type DiscoveredDevice struct {
 - `amsNetId` &mdash; AMS Net ID
 - `hostname` &mdash; Device hostname
 - `tcVersion` &mdash; TwinCAT version
-- `hasRoute` &mdash; Whether an ADS route exists to this device
+- `hasRoute` &mdash; Whether a working ADS device-info exchange verified a route; false means unverified
 
 **FINS (Omron):**
 - `node` &mdash; FINS node number
@@ -159,3 +159,17 @@ When multiple discovery methods find the same device (e.g., an Omron NJ responds
 | FINS | 9600 | Outbound TCP | Unicast scan |
 
 Firewalls and VLANs may block discovery. UDP broadcasts do not cross router boundaries unless explicitly forwarded.
+
+## Scan and ADS identity limits
+
+ADS, S7 and FINS subnet scans accept IPv4 only and reject unsupported IPv6 or
+CIDRs larger than 4096 expanded addresses before opening scan sockets. Workers
+are bounded at 128 and by the number of hosts. /31 and /32 retain usable boundary
+addresses; network/broadcast exclusions use the actual mask rather than the last
+octet. Invalid explicit scan IP lists are also rejected before I/O.
+
+ADS UDP replies validate advertised identity and do not prove an ADS route.
+`HasRoute` is true only after a valid TCP ADS device-info exchange; a reachable
+TCP port with an invalid, truncated or ADS-error response does not create a device.
+The broadcast operation shares one deadline across broadcast destinations. Route
+installation is outside discovery. See [Beckhoff ADS](beckhoff.md).

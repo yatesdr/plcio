@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -1082,6 +1083,12 @@ func (c *Client) writeFINS(address string, value interface{}, typeHint string) e
 	}
 
 	if parsed.TypeCode == TypeBool {
+		if bits, ok := value.([]bool); ok {
+			if len(bits) == 0 || len(bits) > FINSMaxBitsPerRead {
+				return fmt.Errorf("BOOL array write requires 1..%d bits", FINSMaxBitsPerRead)
+			}
+			return c.fins.writeBits(BitAreaFromWordArea(parsed.MemoryArea), parsed.Address, parsed.BitOffset, bits)
+		}
 		var bitVal bool
 		switch v := value.(type) {
 		case bool:
@@ -1159,9 +1166,17 @@ func (c *Client) writeEIP(tagName string, value interface{}) error {
 	}
 
 	// Build write request
+	count := 1
+	values := reflect.ValueOf(value)
+	if values.IsValid() && values.Kind() == reflect.Slice && BaseType(dataType) != TypeString && BaseType(dataType) != TypeCIPSTRING {
+		count = values.Len()
+	}
+	if count == 0 || count > 65535 {
+		return fmt.Errorf("array write requires 1..65535 elements")
+	}
 	writeData := make([]byte, 4+len(encodedData))
 	binary.LittleEndian.PutUint16(writeData[0:2], dataType)
-	binary.LittleEndian.PutUint16(writeData[2:4], 1)
+	binary.LittleEndian.PutUint16(writeData[2:4], uint16(count))
 	copy(writeData[4:], encodedData)
 
 	writeReq := cip.Request{

@@ -1,30 +1,51 @@
 package driver
 
 import (
+	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/yatesdr/plcio/ads"
+	"github.com/yatesdr/plcio/internal/adsbridge"
+	"github.com/yatesdr/plcio/metadata"
 )
 
 // ADSAdapter wraps ads.Client to implement the Driver interface.
 type ADSAdapter struct {
 	client *ads.Client
 	config *PLCConfig
+	opts   []ads.Option
+	mu     sync.RWMutex
+	epoch  uint64
 }
 
 // NewADSAdapter creates a new ADSAdapter from configuration.
 // The connection is not established until Connect() is called.
 func NewADSAdapter(cfg *PLCConfig) (*ADSAdapter, error) {
+	return NewADSAdapterWithOptions(cfg)
+}
+
+// NewADSAdapterWithOptions exposes ADS identity and resource options without
+// changing the shared configuration or the published NewADSAdapter signature.
+func NewADSAdapterWithOptions(cfg *PLCConfig, opts ...ads.Option) (*ADSAdapter, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")
 	}
-	return &ADSAdapter{
-		config: cfg,
-	}, nil
+	return &ADSAdapter{config: cfg, opts: append([]ads.Option(nil), opts...)}, nil
+}
+
+func (a *ADSAdapter) currentClient() *ads.Client {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.client
 }
 
 // Connect establishes connection to the TwinCAT PLC.
 func (a *ADSAdapter) Connect() error {
+	a.mu.RLock()
+	epoch := a.epoch
+	a.mu.RUnlock()
 	opts := []ads.Option{}
 
 	if a.config.Timeout > 0 {
@@ -37,27 +58,44 @@ func (a *ADSAdapter) Connect() error {
 		opts = append(opts, ads.WithAmsPort(a.config.AmsPort))
 	}
 
+	opts = append(opts, a.opts...)
 	client, err := ads.Connect(a.config.Address, opts...)
 	if err != nil {
 		return fmt.Errorf("ads connect: %w", err)
 	}
 
+	a.mu.Lock()
+	if a.epoch != epoch {
+		a.mu.Unlock()
+		client.Close()
+		return fmt.Errorf("ADS connect superseded by Close")
+	}
+	previous := a.client
 	a.client = client
+	a.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 	return nil
 }
 
 // Close releases the connection.
 func (a *ADSAdapter) Close() error {
-	if a.client != nil {
-		a.client.Close()
-		a.client = nil
+	a.mu.Lock()
+	client := a.client
+	a.client = nil
+	a.epoch++
+	a.mu.Unlock()
+	if client != nil {
+		client.Close()
 	}
 	return nil
 }
 
 // IsConnected returns true if connected to the PLC.
 func (a *ADSAdapter) IsConnected() bool {
-	return a.client != nil && a.client.IsConnected()
+	client := a.currentClient()
+	return client != nil && client.IsConnected()
 }
 
 // Family returns the PLC family.
@@ -67,19 +105,21 @@ func (a *ADSAdapter) Family() PLCFamily {
 
 // ConnectionMode returns a description of the connection mode.
 func (a *ADSAdapter) ConnectionMode() string {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return "Not connected"
 	}
-	return a.client.ConnectionMode()
+	return client.ConnectionMode()
 }
 
 // GetDeviceInfo returns information about the connected PLC.
 func (a *ADSAdapter) GetDeviceInfo() (*DeviceInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	info, err := a.client.GetDeviceInfo()
+	info, err := client.GetDeviceInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -101,39 +141,49 @@ func (a *ADSAdapter) SupportsDiscovery() bool {
 
 // AllTags returns all symbols from the PLC.
 func (a *ADSAdapter) AllTags() ([]TagInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	tags, err := a.client.AllTags()
+	tags, deadline, err := adsbridge.Catalog(client)
 	if err != nil {
 		return nil, err
 	}
 
 	result := make([]TagInfo, len(tags))
 	for i, t := range tags {
-		result[i] = TagInfo{
-			Name:     t.Name,
-			TypeCode: t.TypeCode,
-			TypeName: t.TypeName,
-			Writable: t.IsWritable(),
+		if i%64 == 0 && !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("ADS catalog projection: %w", context.DeadlineExceeded)
 		}
+		result[i] = TagInfo{
+			Name:       t.Name,
+			TypeCode:   t.TypeCode,
+			TypeName:   t.TypeName,
+			Writable:   t.Writable,
+			Dimensions: t.Dimensions,
+		}
+	}
+	if !time.Now().Before(deadline) {
+		return nil, fmt.Errorf("ADS catalog projection: %w", context.DeadlineExceeded)
 	}
 
 	return result, nil
 }
 
-// Programs returns "MAIN" and "GVL" as common TwinCAT POUs.
+// Programs returns the published top-level namespaces from the catalog.
 func (a *ADSAdapter) Programs() ([]string, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
-	return a.client.Programs()
+	return client.Programs()
 }
 
 // Read reads tag values from the PLC.
 func (a *ADSAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
@@ -142,14 +192,10 @@ func (a *ADSAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		names[i] = req.Name
 	}
 
-	values, err := a.client.Read(names...)
-	if err != nil {
-		return nil, err
-	}
-
+	values, err := client.ReadDecoded(names...)
 	result := make([]*TagValue, len(values))
 	for i, v := range values {
-		if v == nil {
+		if v == nil || v.Raw == nil {
 			result[i] = &TagValue{
 				Name:   names[i],
 				Family: "ads",
@@ -158,29 +204,31 @@ func (a *ADSAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 			continue
 		}
 
-		goValue := v.GoValue()
+		goValue := v.Value
+		raw := v.Raw
 
 		result[i] = &TagValue{
-			Name:        v.Name,
-			DataType:    v.DataType,
+			Name:        raw.Name,
+			DataType:    raw.DataType,
 			Family:      "ads",
 			Value:       goValue,
 			StableValue: goValue,
-			Bytes:       v.Bytes,
-			Count:       v.Count,
-			Error:       v.Error,
+			Bytes:       raw.Bytes,
+			Count:       raw.Count,
+			Error:       raw.Error,
 		}
 	}
 
-	return result, nil
+	return result, err
 }
 
 // Write writes a value to a tag.
 func (a *ADSAdapter) Write(tag string, value interface{}) error {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return fmt.Errorf("not connected")
 	}
-	return a.client.Write(tag, value)
+	return client.Write(tag, value)
 }
 
 // Keepalive is a no-op for ADS (TCP keepalive handles connection maintenance).
@@ -195,5 +243,16 @@ func (a *ADSAdapter) IsConnectionError(err error) bool {
 
 // Client returns the underlying ads.Client for advanced operations.
 func (a *ADSAdapter) Client() *ads.Client {
-	return a.client
+	return a.currentClient()
 }
+
+// Describe inspects a current ADS symbol without changing the ordinary I/O flow.
+func (a *ADSAdapter) Describe(request TagRequest) (*metadata.Symbol, error) {
+	client := a.currentClient()
+	if client == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	return client.Describe(request.Name)
+}
+
+var _ Describer = (*ADSAdapter)(nil)

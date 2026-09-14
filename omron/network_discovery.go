@@ -1,10 +1,12 @@
 package omron
 
 import (
-	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/yatesdr/plcio/internal/netutil"
 
 	"github.com/yatesdr/plcio/logging"
 )
@@ -28,15 +30,13 @@ type NetworkDeviceInfo struct {
 //
 // Returns discovered devices that responded to Omron protocols.
 func NetworkDiscover(ips []net.IP, timeout time.Duration, concurrency int) []NetworkDeviceInfo {
-	if len(ips) == 0 {
+	if !netutil.ValidScan(ips) {
 		return nil
 	}
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
-	if concurrency <= 0 {
-		concurrency = 20
-	}
+	concurrency = netutil.ScanWorkers(concurrency, len(ips))
 
 	var (
 		results []NetworkDeviceInfo
@@ -97,7 +97,7 @@ func probeOmron(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 
 // probeFINSUDP attempts to connect via FINS/UDP.
 func probeFINSUDP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
-	addr := fmt.Sprintf("%s:%d", ip.String(), defaultFINSPort)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(defaultFINSPort))
 
 	conn, err := net.DialTimeout("udp", addr, timeout)
 	if err != nil {
@@ -113,16 +113,16 @@ func probeFINSUDP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 	// Build a simple FINS status read command (Controller Status Read)
 	// FINS Frame: ICF(1) RSV(1) GCT(1) DNA(1) DA1(1) DA2(1) SNA(1) SA1(1) SA2(1) SID(1) CMD(2) DATA...
 	fins := []byte{
-		0x80, // ICF: Command, needs response
-		0x00, // RSV: Reserved
-		0x02, // GCT: Gateway count
-		0x00, // DNA: Destination network (local)
-		node, // DA1: Destination node (PLC)
-		0x00, // DA2: Destination unit
-		0x00, // SNA: Source network (local)
-		0x01, // SA1: Source node (us)
-		0x00, // SA2: Source unit
-		0x00, // SID: Service ID
+		0x80,       // ICF: Command, needs response
+		0x00,       // RSV: Reserved
+		0x02,       // GCT: Gateway count
+		0x00,       // DNA: Destination network (local)
+		node,       // DA1: Destination node (PLC)
+		0x00,       // DA2: Destination unit
+		0x00,       // SNA: Source network (local)
+		0x01,       // SA1: Source node (us)
+		0x00,       // SA2: Source unit
+		0x00,       // SID: Service ID
 		0x06, 0x01, // Command: Controller Status Read
 	}
 
@@ -170,7 +170,7 @@ func probeFINSUDP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 
 // probeFINSTCP attempts to connect via FINS/TCP.
 func probeFINSTCP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
-	addr := fmt.Sprintf("%s:%d", ip.String(), defaultFINSPort)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(defaultFINSPort))
 
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -226,35 +226,4 @@ func probeFINSTCP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 }
 
 // expandCIDRomron expands a CIDR notation to a list of IP addresses.
-func expandCIDRomron(cidr string) ([]net.IP, error) {
-	ip, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid CIDR: %w", err)
-	}
-
-	var ips []net.IP
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); incOmron(ip) {
-		// Skip network and broadcast addresses for /24 and larger
-		ones, bits := ipnet.Mask.Size()
-		if bits-ones >= 8 {
-			if ip[len(ip)-1] == 0 || ip[len(ip)-1] == 255 {
-				continue
-			}
-		}
-		ipCopy := make(net.IP, len(ip))
-		copy(ipCopy, ip)
-		ips = append(ips, ipCopy)
-	}
-
-	return ips, nil
-}
-
-// incOmron increments an IP address.
-func incOmron(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
-}
+func expandCIDRomron(cidr string) ([]net.IP, error) { return netutil.ExpandIPv4(cidr) }

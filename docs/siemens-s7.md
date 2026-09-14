@@ -139,17 +139,24 @@ for _, r := range results {
 
 ### Supported Data Types
 
+The table describes unified driver values. Native protocol APIs retain their
+existing representations and wire widths. Primitive arrays use typed slices;
+record members follow the same widened categories. Canonical numeric Write inputs
+are checked against the target width without routing integers through floating
+point; existing time and text semantics are preserved. See
+[compatibility changes](plcio-compatibility.md).
+
 | Type Hint | S7 Type | Go Type | Size | Byte Order |
 |---|---|---|---|---|
 | `BOOL` | BOOL | `bool` | 1 bit | N/A |
-| `BYTE` | BYTE | `uint8` | 1 byte | N/A |
-| `SINT` | SINT | `int8` | 1 byte | N/A |
-| `CHAR` | CHAR | `string` (1 char) | 1 byte | N/A |
-| `WORD` | WORD | `uint16` | 2 bytes | Big-endian |
-| `INT` | INT | `int16` | 2 bytes | Big-endian |
-| `DWORD` | DWORD | `uint32` | 4 bytes | Big-endian |
-| `DINT` | DINT | `int32` | 4 bytes | Big-endian |
-| `REAL` | REAL | `float32` | 4 bytes | Big-endian |
+| `BYTE` | BYTE | `uint64` | 1 byte | N/A |
+| `SINT` | SINT | `int64` | 1 byte | N/A |
+| `CHAR` | CHAR | `uint64` character code | 1 byte | N/A |
+| `WORD` | WORD | `uint64` | 2 bytes | Big-endian |
+| `INT` | INT | `int64` | 2 bytes | Big-endian |
+| `DWORD` | DWORD | `uint64` | 4 bytes | Big-endian |
+| `DINT` | DINT | `int64` | 4 bytes | Big-endian |
+| `REAL` | REAL | `float64` | 4 bytes | Big-endian |
 | `LWORD` | LWORD | `uint64` | 8 bytes | Big-endian |
 | `LINT` | LINT | `int64` | 8 bytes | Big-endian |
 | `LREAL` | LREAL | `float64` | 8 bytes | Big-endian |

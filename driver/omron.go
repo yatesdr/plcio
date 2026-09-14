@@ -173,7 +173,7 @@ func (a *OmronAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 	}
 
 	values, err := a.client.ReadWithTypes(omronRequests)
-	if err != nil {
+	if err != nil && len(values) == 0 {
 		return nil, err
 	}
 
@@ -189,6 +189,9 @@ func (a *OmronAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 
 		goValue := v.GoValue()
+		if omronPrimitive(v.DataType) {
+			goValue = normalizePrimitive(goValue)
+		}
 
 		result[i] = &TagValue{
 			Name:        v.Name,
@@ -202,7 +205,7 @@ func (a *OmronAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 	}
 
-	return result, nil
+	return result, err
 }
 
 // Write writes a value to a tag.
@@ -222,6 +225,33 @@ func (a *OmronAdapter) Write(tag string, value interface{}) error {
 		}
 	}
 
+	if canonicalNumeric(value) {
+		var code uint16
+		if a.protocol == "eip" {
+			values, err := a.client.Read(tag)
+			if err != nil {
+				return err
+			}
+			if len(values) != 1 || values[0] == nil {
+				return fmt.Errorf("missing tag type response")
+			}
+			if values[0].Error != nil {
+				return values[0].Error
+			}
+			code = values[0].DataType
+		} else {
+			parsed, err := omron.ParseAddressWithType(tag, typeHint)
+			if err != nil {
+				return err
+			}
+			code = parsed.TypeCode
+		}
+		var err error
+		value, err = omronCanonical(code, value)
+		if err != nil {
+			return err
+		}
+	}
 	return a.client.WriteWithType(tag, value, typeHint)
 }
 
@@ -241,4 +271,18 @@ func (a *OmronAdapter) IsConnectionError(err error) bool {
 // Client returns the underlying omron.Client for advanced operations.
 func (a *OmronAdapter) Client() *omron.Client {
 	return a.client
+}
+
+// Match categories actually decoded by Omron, rather than guessing from a width.
+func omronPrimitive(code uint16) bool {
+	switch omron.BaseType(code) {
+	case omron.TypeBool, omron.TypeCIPBool, omron.TypeByte, omron.TypeCIPUSINT,
+		omron.TypeSByte, omron.TypeCIPSINT, omron.TypeWord, omron.TypeCIPUINT,
+		omron.TypeInt16, omron.TypeCIPINT, omron.TypeDWord, omron.TypeCIPUDINT,
+		omron.TypeInt32, omron.TypeCIPDINT, omron.TypeLWord, omron.TypeCIPULINT,
+		omron.TypeInt64, omron.TypeCIPLINT, omron.TypeReal, omron.TypeCIPREAL,
+		omron.TypeLReal, omron.TypeCIPLREAL, omron.TypeString, omron.TypeCIPSTRING:
+		return true
+	}
+	return false
 }

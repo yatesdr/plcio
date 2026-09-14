@@ -175,7 +175,7 @@ type TagRequest struct {
 }
 ```
 
-Used as input to `Driver.Read()`. The `TypeHint` field is **required** for S7 and Omron FINS, and ignored for Logix, PCCC, and ADS (which carry type information in the protocol). PCCC addresses encode their type via the address prefix (e.g., `N` for integer, `F` for float).
+Used as input to `Driver.Read()`. The `TypeHint` field selects interpretation for simple S7 offsets and Omron FINS word addresses. Explicit S7 size prefixes retain their native type; unspecified FINS words default to WORD. It is ignored for Logix, PCCC, and ADS. PCCC addresses encode their type via the address prefix (e.g., `N` for integer, `F` for float).
 
 ---
 
@@ -200,12 +200,27 @@ type TagValue struct {
 |---|---|
 | `SetIgnoreList(ignoreList []string)` | Computes and sets `StableValue` by filtering out ignored members |
 
-The `Value` field contains a decoded Go type:
-- Numeric types → `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`
-- Booleans → `bool`
-- Strings → `string`
-- Structures/UDTs → `map[string]interface{}`
-- Arrays → `[]interface{}`
+Successful unified `Value` and `StableValue` use `int64`, `uint64`, `float64`,
+`bool`, `string`, typed primitive slices and recursively conforming
+`map[string]any` records. Record arrays contain maps in `[]any`; opaque fallback
+buffers are preserved where the native adapter supports them. Native type codes
+and `Bytes` retain their protocol meaning. REAL is widened after float32 decoding.
+Check each `TagValue.Error`; a top-level connection error may accompany successful
+earlier slots. See [compatibility changes](plcio-compatibility.md).
+
+The optional `driver.Describer` interface does not add a mandatory Driver method:
+
+```go
+type Describer interface {
+    Describe(request TagRequest) (*metadata.Symbol, error)
+}
+```
+
+ADS implements it. `metadata.Symbol` contains Name, Type, Readable and Writable.
+Type exposes Kind, Bits, DeclaredName, Dimensions, Members, Unit, Epoch and
+UnsupportedReason; each Dimension has signed LowerBound and uint32 Length.
+Descriptions are deep caller-owned copies. Ordinary Read/Write resolve ADS schemas
+internally, independent of whether the caller uses Describe.
 
 ---
 
@@ -348,3 +363,27 @@ func (a *LogixAdapter) GetMemberTypes(typeCode uint16) map[string]string
 // Store discovered tags for optimized reads (element count hints)
 func (a *LogixAdapter) SetTags(tags []TagInfo) []TagInfo
 ```
+
+## ADS protocol extensions
+
+Existing raw `ads.Client.Read(names...)` and stateless `ads.TagValue.GoValue()`
+remain available; unknown raw storage still uses the legacy opaque `[]int` fallback.
+Decoded protocol access shares the same read engine and returns a bridge:
+
+```go
+type DecodedTagValue struct {
+    Raw   *TagValue
+    Value any
+}
+func (c *Client) ReadDecoded(names ...string) ([]*DecodedTagValue, error)
+func (c *Client) Describe(name string) (*metadata.Symbol, error)
+func NewADSAdapterWithOptions(cfg *PLCConfig, opts ...ads.Option) (*ADSAdapter, error)
+```
+
+No fields were added to existing exported result or shared configuration structs.
+`ads.Connect(address, opts...)` accepts existing target AMS/timeout options plus
+WithLocalAmsNetId, WithLocalAmsPort, WithMaxPayload, WithMaxBatchItems,
+WithMetadataLimits, WithExpansionLimits and WithStringEncoding. Timeout covers a
+complete client operation; reconnect retains the original TCP endpoint and options.
+For defaults, strict write rules, supported layouts and best-effort generation
+limitations, see [Beckhoff ADS](beckhoff.md).

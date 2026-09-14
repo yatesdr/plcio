@@ -29,7 +29,7 @@ func (t *TagInfo) IsReadable() bool {
 func (t *TagInfo) IsWritable() bool {
 	// Check flags for write access
 	// In TwinCAT, most variables are writable unless marked as CONSTANT
-	// Flag bit 4 (0x10) typically indicates read-only
+	// Documented READONLY is bit 5 (0x20).
 	return (t.Flags & SymFlagReadOnly) == 0
 }
 
@@ -55,15 +55,33 @@ func (t *TagInfo) String() string {
 	return fmt.Sprintf("%s (%s, %d bytes)", t.Name, t.TypeName, t.Size)
 }
 
-// SymbolFlags contains bit flags for symbol attributes.
+// SymbolFlags contains documented ADS symbol flags.
 const (
-	SymFlagPersistent uint32 = 0x0001 // Persistent variable
-	SymFlagBitValue   uint32 = 0x0002 // Bit value (part of larger type)
-	SymFlagReserved   uint32 = 0x0004 // Reserved
-	SymFlagReference  uint32 = 0x0008 // Reference to another variable
-	SymFlagReadOnly   uint32 = 0x0010 // Read-only (CONSTANT)
-	SymFlagStaticVar  uint32 = 0x0020 // Static variable
-	SymFlagInput      uint32 = 0x0040 // Input variable
-	SymFlagOutput     uint32 = 0x0080 // Output variable
-	SymFlagInOut      uint32 = 0x0100 // InOut variable
+	SymFlagPersistent uint32 = 0x0001
+	SymFlagBitValue   uint32 = 0x0002
+	// SymFlagReserved is retained for source compatibility.
+	// Deprecated: this value means REFERENCETO; use SymFlagReferenceTo.
+	SymFlagReserved uint32 = 0x0004
+	// SymFlagReference is retained for source compatibility.
+	// Deprecated: this value means TYPEGUID; use SymFlagTypeGUID or SymFlagReferenceTo.
+	SymFlagReference uint32 = 0x0008
+	SymFlagReadOnly  uint32 = 0x0020
+	// Deprecated: this value is READONLY, not static storage.
+	SymFlagStaticVar uint32 = 0x0020
+	// Deprecated: this value is not a documented input direction flag.
+	SymFlagInput uint32 = 0x0040
+	// Deprecated: this value is not a documented output direction flag.
+	SymFlagOutput uint32 = 0x0080
+	// Deprecated: this value belongs to the context mask, not InOut direction.
+	SymFlagInOut            uint32 = 0x0100
+	SymFlagReferenceTo      uint32 = 0x0004
+	SymFlagTypeGUID         uint32 = 0x0008
+	SymFlagInterfacePointer uint32 = 0x0010
+	SymFlagContextMask      uint32 = 0x0f00
+	SymFlagItfMethodAccess  uint32 = 0x0040
+	SymFlagMethodDeref      uint32 = 0x0080
+	SymFlagAttributes       uint32 = 0x1000
+	SymFlagStatic           uint32 = 0x2000
+	SymFlagInitOnReset      uint32 = 0x4000
+	SymFlagExtendedFlags    uint32 = 0x8000
 )

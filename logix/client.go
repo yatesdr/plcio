@@ -33,12 +33,12 @@ func (c *Client) connErrorIfDown() error {
 // Client is a high-level wrapper that manages connection lifecycle
 // and provides simplified methods for common PLC operations.
 type Client struct {
-	plc             *PLC               // Low-level access preserved
-	micro800        bool               // True for Micro800 series (no batch reads)
-	tagInfo         map[string]TagInfo // Discovered tags for element count lookup
-	templateSizes   map[uint16]uint32  // Cache of template ID -> size in bytes
+	plc             *PLC                 // Low-level access preserved
+	micro800        bool                 // True for Micro800 series (no batch reads)
+	tagInfo         map[string]TagInfo   // Discovered tags for element count lookup
+	templateSizes   map[uint16]uint32    // Cache of template ID -> size in bytes
 	templates       map[uint16]*Template // Cache of template ID -> full template definition
-	failedTemplates map[uint16]bool    // Cache of template IDs that failed to fetch
+	failedTemplates map[uint16]bool      // Cache of template IDs that failed to fetch
 }
 
 // options holds configuration options for Connect.
@@ -424,7 +424,6 @@ func (c *Client) AllTags() ([]TagInfo, error) {
 
 	return tags, nil
 }
-
 
 // Read reads one or more tags by name and returns their values.
 // Each tag in the result includes its own error status (nil if successful).
@@ -1822,6 +1821,13 @@ func (c *Client) decodeUDTWithTemplateInternal(tmpl *Template, data []byte, topL
 func (c *Client) decodeMemberValue(member *TemplateMember, data []byte) (interface{}, error) {
 	if member.IsArray() {
 		return c.decodeArrayMember(member, data)
+	}
+	if !member.IsStructure() && BaseType(member.Type) == TypeBOOL {
+		byteOffset := int(member.BitOffset / 8)
+		if byteOffset >= len(data) {
+			return nil, fmt.Errorf("insufficient data for packed BOOL")
+		}
+		return data[byteOffset]&(1<<(member.BitOffset%8)) != 0, nil
 	}
 
 	return c.decodeScalarMember(member.Type, data)

@@ -1,29 +1,31 @@
 package ads
 
 import (
-	"encoding/binary"
 	"fmt"
-	"math"
+	"reflect"
+
+	"github.com/yatesdr/plcio/metadata"
 )
 
-// ADS/TwinCAT data type codes
-// These match the internal TwinCAT type system.
-// ADS uses little-endian byte order (native x86 format).
+// ADS primitive codes and legacy semantic helper codes. TIME/date/long-time
+// helpers do not replace the native ADS storage code carried by published
+// symbols; connected I/O resolves their declared type names. Arrays use the
+// library's TypeArrayFlag. ADS value storage is little endian.
 const (
-	TypeVoid   uint16 = 0x00
-	TypeBool   uint16 = 0x21 // BOOL (1 byte)
-	TypeByte   uint16 = 0x11 // BYTE/USINT (1 byte unsigned)
-	TypeSByte  uint16 = 0x10 // SINT (1 byte signed)
-	TypeWord   uint16 = 0x12 // WORD/UINT (2 bytes unsigned)
-	TypeInt16  uint16 = 0x02 // INT (2 bytes signed)
-	TypeDWord  uint16 = 0x13 // DWORD/UDINT (4 bytes unsigned)
-	TypeInt32  uint16 = 0x03 // DINT (4 bytes signed)
-	TypeLWord  uint16 = 0x15 // LWORD/ULINT (8 bytes unsigned)
-	TypeInt64  uint16 = 0x14 // LINT (8 bytes signed)
-	TypeReal   uint16 = 0x04 // REAL (4 bytes float)
-	TypeLReal  uint16 = 0x05 // LREAL (8 bytes double)
-	TypeString uint16 = 0x1E // STRING
-	TypeWString uint16 = 0x1F // WSTRING
+	TypeVoid      uint16 = 0x00
+	TypeBool      uint16 = 0x21 // BOOL (1 byte)
+	TypeByte      uint16 = 0x11 // BYTE/USINT (1 byte unsigned)
+	TypeSByte     uint16 = 0x10 // SINT (1 byte signed)
+	TypeWord      uint16 = 0x12 // WORD/UINT (2 bytes unsigned)
+	TypeInt16     uint16 = 0x02 // INT (2 bytes signed)
+	TypeDWord     uint16 = 0x13 // DWORD/UDINT (4 bytes unsigned)
+	TypeInt32     uint16 = 0x03 // DINT (4 bytes signed)
+	TypeLWord     uint16 = 0x15 // LWORD/ULINT (8 bytes unsigned)
+	TypeInt64     uint16 = 0x14 // LINT (8 bytes signed)
+	TypeReal      uint16 = 0x04 // REAL (4 bytes float)
+	TypeLReal     uint16 = 0x05 // LREAL (8 bytes double)
+	TypeString    uint16 = 0x1E // STRING
+	TypeWString   uint16 = 0x1F // WSTRING
 	TypeTime      uint16 = 0x30 // TIME (32-bit, milliseconds)
 	TypeLTime     uint16 = 0x16 // LTIME (64-bit, nanoseconds)
 	TypeDate      uint16 = 0x31 // DATE
@@ -159,382 +161,99 @@ func TypeSize(typeCode uint16) int {
 		return 1
 	case TypeWord, TypeInt16:
 		return 2
-	case TypeDWord, TypeInt32, TypeReal, TypeTime, TypeDate, TypeTimeOfDay:
+	case TypeDWord, TypeInt32, TypeReal, TypeTime, TypeDate, TypeTimeOfDay, TypeDateTime:
 		return 4
-	case TypeLWord, TypeInt64, TypeLReal, TypeDateTime, TypeLTime:
+	case TypeLWord, TypeInt64, TypeLReal, TypeLTime:
 		return 8
 	default:
 		return 0 // Variable or unknown
 	}
 }
 
-// EncodeValueWithType encodes a value using a specific type code.
-// This is used when we know the target type from symbol info.
+// primitiveSchemas are immutable native definitions shared by stateless helpers.
+var primitiveSchemas = func() map[uint16]*schemaType {
+	result := make(map[uint16]*schemaType)
+	resolver := newResolver(nil, defaultOptions())
+	for _, code := range []uint16{TypeBool, TypeByte, TypeSByte, TypeWord, TypeInt16, TypeDWord, TypeInt32, TypeLWord, TypeInt64, TypeReal, TypeLReal, TypeTime, TypeLTime, TypeDate, TypeTimeOfDay, TypeDateTime, TypeString, TypeWString} {
+		result[code] = resolver.resolveName(TypeName(code), 1)
+	}
+	return result
+}()
+
+// EncodeValueWithType encodes checked native scalar or flat array values.
+// It has no target declaration: string arrays use a uniform capacity large
+// enough for their input. Client.Write instead uses the published target size,
+// dimensions, encoding and access restrictions. Exact raw []byte storage remains
+// an advanced input; fixed-width storage must contain complete elements.
 func EncodeValueWithType(value interface{}, typeCode uint16) ([]byte, error) {
-	// Handle array types - check both the typeCode flag and the value type
-	// TwinCAT often reports arrays with just the base type (no array flag)
-	baseType := typeCode
+	cfg := defaultOptions()
+	base := BaseType(typeCode)
+	if data, ok := value.([]byte); ok {
+		width := TypeSize(base)
+		if uint64(len(data)) > uint64(cfg.maxPayload) || (width != 0 && len(data)%width != 0) {
+			return nil, fmt.Errorf("invalid raw storage length for %s", TypeName(base))
+		}
+		return append([]byte(nil), data...), nil
+	}
+	schema := primitiveSchemas[base]
+	if schema == nil {
+		return nil, fmt.Errorf("unsupported type %s", TypeName(base))
+	}
+	values := reflect.ValueOf(value)
+	if values.IsValid() && (values.Kind() == reflect.Slice || values.Kind() == reflect.Array) {
+		count := values.Len()
+		if uint64(count) > uint64(cfg.maxElements) {
+			return nil, fmt.Errorf("array element limit exceeded")
+		}
+		if count == 0 {
+			return []byte{}, nil
+		}
+		element := *schema
+		if schema.kind == metadata.KindString {
+			element.size = 0
+			for i := 0; i < count; i++ {
+				text, ok := values.Index(i).Interface().(string)
+				if !ok {
+					return nil, fmt.Errorf("string array element %d has type %T", i, values.Index(i).Interface())
+				}
+				encoded, err := encodeText(text, schema.wide, false)
+				if err != nil {
+					return nil, err
+				}
+				if uint64(len(encoded)) > element.size {
+					element.size = uint64(len(encoded))
+				}
+			}
+		}
+		if element.size == 0 || uint64(count) > uint64(cfg.maxPayload)/element.size {
+			return nil, fmt.Errorf("array payload limit exceeded")
+		}
+		data := make([]byte, int(element.size)*count)
+		for i := 0; i < count; i++ {
+			start := i * int(element.size)
+			if err := encodeInto(&element, values.Index(i).Interface(), data[start:start+int(element.size)], cfg.deadline); err != nil {
+				return nil, fmt.Errorf("element %d: %w", i, err)
+			}
+		}
+		return data, nil
+	}
 	if IsArray(typeCode) {
-		baseType = BaseType(typeCode)
+		return nil, fmt.Errorf("array input required")
 	}
-
-	// Check if value is a slice - if so, encode as array regardless of typeCode flag
-	if isSliceValue(value) {
-		return encodeArrayValue(value, baseType)
+	if schema.kind == metadata.KindString {
+		text, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("string input required, got %T", value)
+		}
+		data, err := encodeText(text, schema.wide, false)
+		if uint64(len(data)) > uint64(cfg.maxPayload) {
+			return nil, fmt.Errorf("string payload limit exceeded")
+		}
+		return data, err
 	}
-
-	size := TypeSize(typeCode)
-	if size == 0 && typeCode != TypeString && typeCode != TypeWString {
-		return nil, fmt.Errorf("cannot encode to type %s", TypeName(typeCode))
+	data := make([]byte, int(schema.size))
+	if err := encodeInto(schema, value, data, cfg.deadline); err != nil {
+		return nil, err
 	}
-
-	switch typeCode {
-	case TypeBool:
-		var b byte
-		switch v := value.(type) {
-		case bool:
-			if v {
-				b = 1
-			}
-		case int:
-			if v != 0 {
-				b = 1
-			}
-		case int32:
-			if v != 0 {
-				b = 1
-			}
-		case int64:
-			if v != 0 {
-				b = 1
-			}
-		case float64:
-			if v != 0 {
-				b = 1
-			}
-		default:
-			return nil, fmt.Errorf("cannot convert %T to BOOL", value)
-		}
-		return []byte{b}, nil
-
-	case TypeByte:
-		switch v := value.(type) {
-		case uint8:
-			return []byte{v}, nil
-		case int:
-			return []byte{byte(v)}, nil
-		case int32:
-			return []byte{byte(v)}, nil
-		case int64:
-			return []byte{byte(v)}, nil
-		case float64:
-			return []byte{byte(int64(v))}, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to BYTE", value)
-		}
-
-	case TypeSByte:
-		switch v := value.(type) {
-		case int8:
-			return []byte{byte(v)}, nil
-		case int:
-			return []byte{byte(v)}, nil
-		case int32:
-			return []byte{byte(v)}, nil
-		case int64:
-			return []byte{byte(v)}, nil
-		case float64:
-			return []byte{byte(int8(v))}, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to SINT", value)
-		}
-
-	case TypeWord:
-		buf := make([]byte, 2)
-		switch v := value.(type) {
-		case uint16:
-			binary.LittleEndian.PutUint16(buf, v)
-		case int:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case int32:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case int64:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case float64:
-			binary.LittleEndian.PutUint16(buf, uint16(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to WORD", value)
-		}
-		return buf, nil
-
-	case TypeInt16:
-		buf := make([]byte, 2)
-		switch v := value.(type) {
-		case int16:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case int:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case int32:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case int64:
-			binary.LittleEndian.PutUint16(buf, uint16(v))
-		case float64:
-			binary.LittleEndian.PutUint16(buf, uint16(int16(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to INT", value)
-		}
-		return buf, nil
-
-	case TypeDWord:
-		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case uint32:
-			binary.LittleEndian.PutUint32(buf, v)
-		case int:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int32:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int64:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case float64:
-			binary.LittleEndian.PutUint32(buf, uint32(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to DWORD", value)
-		}
-		return buf, nil
-
-	case TypeInt32:
-		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case int32:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int64:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case float64:
-			binary.LittleEndian.PutUint32(buf, uint32(int32(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to DINT", value)
-		}
-		return buf, nil
-
-	case TypeLWord:
-		buf := make([]byte, 8)
-		switch v := value.(type) {
-		case uint64:
-			binary.LittleEndian.PutUint64(buf, v)
-		case int:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case int32:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case int64:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case float64:
-			binary.LittleEndian.PutUint64(buf, uint64(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to LWORD", value)
-		}
-		return buf, nil
-
-	case TypeInt64:
-		buf := make([]byte, 8)
-		switch v := value.(type) {
-		case int64:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case int:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case int32:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case float64:
-			binary.LittleEndian.PutUint64(buf, uint64(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to LINT", value)
-		}
-		return buf, nil
-
-	case TypeReal:
-		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case float32:
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(v))
-		case float64:
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(float32(v)))
-		case int:
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(float32(v)))
-		case int32:
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(float32(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to REAL", value)
-		}
-		return buf, nil
-
-	case TypeLReal:
-		buf := make([]byte, 8)
-		switch v := value.(type) {
-		case float64:
-			binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
-		case float32:
-			binary.LittleEndian.PutUint64(buf, math.Float64bits(float64(v)))
-		case int:
-			binary.LittleEndian.PutUint64(buf, math.Float64bits(float64(v)))
-		case int32:
-			binary.LittleEndian.PutUint64(buf, math.Float64bits(float64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to LREAL", value)
-		}
-		return buf, nil
-
-	case TypeLTime:
-		// LTIME is 64-bit nanoseconds
-		buf := make([]byte, 8)
-		switch v := value.(type) {
-		case int64:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case int:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case int32:
-			binary.LittleEndian.PutUint64(buf, uint64(v))
-		case uint64:
-			binary.LittleEndian.PutUint64(buf, v)
-		default:
-			return nil, fmt.Errorf("cannot convert %T to LTIME", value)
-		}
-		return buf, nil
-
-	case TypeTime:
-		// TIME is 32-bit milliseconds
-		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case int32:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int64:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case uint32:
-			binary.LittleEndian.PutUint32(buf, v)
-		default:
-			return nil, fmt.Errorf("cannot convert %T to TIME", value)
-		}
-		return buf, nil
-
-	case TypeDate, TypeTimeOfDay, TypeDateTime:
-		// DATE, TOD, DT are all 32-bit values
-		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case int32:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case int64:
-			binary.LittleEndian.PutUint32(buf, uint32(v))
-		case uint32:
-			binary.LittleEndian.PutUint32(buf, v)
-		default:
-			return nil, fmt.Errorf("cannot convert %T to %s", value, TypeName(typeCode))
-		}
-		return buf, nil
-
-	case TypeString:
-		switch v := value.(type) {
-		case string:
-			return append([]byte(v), 0), nil
-		case []byte:
-			return append(v, 0), nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to STRING", value)
-		}
-
-	case TypeWString:
-		// WSTRING is UTF-16LE encoded with 2-byte null terminator
-		switch v := value.(type) {
-		case string:
-			buf := make([]byte, len(v)*2+2) // Each char becomes 2 bytes + null terminator
-			for i, r := range v {
-				buf[i*2] = byte(r)
-				buf[i*2+1] = byte(r >> 8)
-			}
-			// Last 2 bytes are already zero from make()
-			return buf, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to WSTRING", value)
-		}
-
-	default:
-		return nil, fmt.Errorf("unsupported type code: %s", TypeName(typeCode))
-	}
-}
-
-// isSliceValue returns true if the value is a slice type that should be encoded as an array.
-func isSliceValue(value interface{}) bool {
-	switch value.(type) {
-	case []int32, []int64, []float32, []float64, []bool, []string, []byte:
-		return true
-	default:
-		return false
-	}
-}
-
-// encodeArrayValue encodes a slice of values for the given base type.
-func encodeArrayValue(value interface{}, baseType uint16) ([]byte, error) {
-	var result []byte
-
-	switch v := value.(type) {
-	case []int32:
-		for _, elem := range v {
-			encoded, err := EncodeValueWithType(elem, baseType)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-	case []int64:
-		for _, elem := range v {
-			encoded, err := EncodeValueWithType(elem, baseType)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-	case []float32:
-		for _, elem := range v {
-			encoded, err := EncodeValueWithType(elem, baseType)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-	case []float64:
-		for _, elem := range v {
-			encoded, err := EncodeValueWithType(elem, baseType)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-	case []bool:
-		for _, elem := range v {
-			encoded, err := EncodeValueWithType(elem, baseType)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-	case []string:
-		for _, elem := range v {
-			encoded, err := EncodeValueWithType(elem, baseType)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-	case []byte:
-		// Already in byte form, just return as-is
-		return v, nil
-	default:
-		return nil, fmt.Errorf("cannot convert %T to array of %s", value, TypeName(baseType))
-	}
-
-	return result, nil
+	return data, nil
 }

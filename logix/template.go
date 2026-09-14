@@ -25,7 +25,7 @@ type TemplateMember struct {
 	Type      uint16 // Type code (can be nested struct if 0x8xxx)
 	Offset    uint32 // Byte offset within structure
 	ArrayDims []int  // Array dimensions (nil for scalar)
-	BitOffset uint8  // Bit offset for BOOL members within a byte
+	BitOffset uint8  // Published BOOL bit location (0..31; 0..7 for a SINT host)
 	Hidden    bool   // True if this is a hidden/internal member
 }
 
@@ -125,10 +125,6 @@ func (p *PLC) GetTemplate(templateID uint16) (*Template, error) {
 		debugLogVerbose("GetTemplate: failed to parse definition for template %d: %v", templateID, err)
 		return nil, fmt.Errorf("failed to parse template definition: %w", err)
 	}
-
-	// Calculate BOOL bit positions for packed BOOLs sharing the same offset
-	// (Offsets come from PLC, but bit positions within a DINT need calculation)
-	tmpl.calculateBoolBitOffsets()
 
 	debugLogVerbose("GetTemplate: parsed template %d %q with %d visible members", templateID, tmpl.Name, len(tmpl.MemberMap))
 	return tmpl, nil
@@ -426,7 +422,7 @@ func (t *Template) parseDefinition(data []byte, memberCount int) error {
 		entry := data[idx : idx+8]
 
 		// Parse member entry (per pycomm3/CIP format):
-		// Bytes 0-1: Type info (UINT) - array size for arrays
+		// Bytes 0-1: INFO (UINT) - array size, or the published BOOL bit location
 		// Bytes 2-3: Type code (UINT) - lower 12 bits = type, bit 13-14 = array flag, bit 15 = struct flag
 		// Bytes 4-7: Member offset (UDINT) - actual byte offset within structure provided by PLC
 		arraySize := binary.LittleEndian.Uint16(entry[0:2])
@@ -440,6 +436,12 @@ func (t *Template) parseDefinition(data []byte, memberCount int) error {
 		member := TemplateMember{
 			Type:   typeVal,      // Keep full type value for IsStructure() check
 			Offset: memberOffset, // Use actual offset from PLC, not calculated
+		}
+		if typeVal&TypeStructureMask == 0 && isArray == 0 && dataTypeValue == TypeBOOL {
+			if arraySize > 31 {
+				return fmt.Errorf("BOOL member %d has invalid bit location %d", i, arraySize)
+			}
+			member.BitOffset = uint8(arraySize)
 		}
 
 		// Set array dimensions if this is an array
@@ -527,33 +529,6 @@ func (t *Template) parseDefinition(data []byte, memberCount int) error {
 
 	debugLogVerbose("parseDefinition: template %q has %d visible members (offsets from PLC)", t.Name, len(t.MemberMap))
 	return nil
-}
-
-// calculateBoolBitOffsets calculates bit positions for BOOL members that share the same byte offset.
-// PLC provides byte offsets, but BOOLs packed into a DINT share the same offset with different bit positions.
-func (t *Template) calculateBoolBitOffsets() {
-	if len(t.Members) == 0 {
-		return
-	}
-
-	// Track bit position for BOOLs at each offset
-	boolBitAtOffset := make(map[uint32]uint8)
-
-	for i := range t.Members {
-		member := &t.Members[i]
-		baseType := member.Type & 0x0FFF
-
-		if baseType == TypeBOOL {
-			// Get current bit position for this offset, then increment
-			bitPos := boolBitAtOffset[member.Offset]
-			member.BitOffset = bitPos
-			boolBitAtOffset[member.Offset] = bitPos + 1
-
-			if bitPos < 5 {
-				debugLogVerbose("  BOOL member %q: offset=%d, bitOffset=%d", member.Name, member.Offset, bitPos)
-			}
-		}
-	}
 }
 
 // parseNullTerminatedStrings parses null-terminated strings from a byte slice.

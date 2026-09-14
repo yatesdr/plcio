@@ -8,6 +8,7 @@ import (
 
 	"github.com/yatesdr/plcio/ads"
 	"github.com/yatesdr/plcio/eip"
+	"github.com/yatesdr/plcio/internal/netutil"
 	"github.com/yatesdr/plcio/logging"
 	"github.com/yatesdr/plcio/omron"
 	"github.com/yatesdr/plcio/s7"
@@ -15,14 +16,14 @@ import (
 
 // DiscoveredDevice represents a PLC discovered on the network.
 type DiscoveredDevice struct {
-	IP          net.IP            // Device IP address
-	Port        uint16            // Protocol port
-	Family      PLCFamily  // PLC family (logix, s7, beckhoff, omron)
-	ProductName string            // Product name or description
-	Protocol    string            // Protocol used for discovery
-	Vendor      string            // Vendor name
-	Extra       map[string]string // Additional info (serial, revision, etc.)
-	DiscoveredAt time.Time        // When this device was discovered
+	IP           net.IP            // Device IP address
+	Port         uint16            // Protocol port
+	Family       PLCFamily         // PLC family (logix, s7, beckhoff, omron)
+	ProductName  string            // Product name or description
+	Protocol     string            // Protocol used for discovery
+	Vendor       string            // Vendor name
+	Extra        map[string]string // Additional info (serial, revision, etc.)
+	DiscoveredAt time.Time         // When this device was discovered
 }
 
 // Key returns a unique identifier for deduplication.
@@ -245,6 +246,10 @@ func discoverS7(cidr string, timeout time.Duration, concurrency int) []Discovere
 
 // discoverADS scans for Beckhoff TwinCAT PLCs using both UDP broadcast and TCP port scanning.
 func discoverADS(cidr string, timeout time.Duration, concurrency int) []DiscoveredDevice {
+	if _, err := netutil.ExpandIPv4(cidr); err != nil {
+		logging.DebugLog("Discovery", "ADS scan rejected: %v", err)
+		return nil
+	}
 	logging.DebugLog("tui", "discoverADS: starting combined UDP broadcast and TCP scan")
 
 	var (
@@ -263,8 +268,8 @@ func discoverADS(cidr string, timeout time.Duration, concurrency int) []Discover
 			results = append(results, dev)
 		} else {
 			// If we already have this device but the new one has more info (hasRoute=true),
-			// replace the existing one. This handles the case where TCP scan finds a device
-			// as "no route" but UDP broadcast later finds it with AMS Net ID.
+			// replace the existing one. This handles the case where UDP identifies a device
+			// with unverified route knowledge and a successful ADS runtime probe later arrives.
 			if dev.Extra["hasRoute"] == "true" {
 				for i, existing := range results {
 					if existing.IP.String() == key && existing.Extra["hasRoute"] == "false" {
