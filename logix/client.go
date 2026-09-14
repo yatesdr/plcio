@@ -155,18 +155,18 @@ func (c *Client) IsConnected() bool {
 // Returns connected (CIP connection active), size (negotiated connection size in bytes).
 // If not using connected messaging, size is 0.
 func (c *Client) ConnectionInfo() (connected bool, size uint16) {
-	if c == nil || c.plc == nil {
+	if c == nil || c.plc == nil || !c.plc.IsConnected() || c.plc.cipConn == nil {
 		return false, 0
 	}
-	return c.plc.IsConnected(), c.plc.connSize
+	return true, c.plc.connSize
 }
 
 // ConnectionMode returns a human-readable string describing the connection mode.
 func (c *Client) ConnectionMode() string {
-	if c == nil || c.plc == nil {
+	if c == nil || c.plc == nil || !c.plc.IsConnected() {
 		return "Not connected"
 	}
-	if c.plc.IsConnected() {
+	if c.plc.cipConn != nil {
 		if c.plc.connSize == ConnectionSizeLarge {
 			return "Connected (Large Forward Open, 4002 bytes)"
 		}
@@ -219,7 +219,7 @@ func (c *Client) getElementCount(tagName string) uint16 {
 	if c == nil || c.tagInfo == nil {
 		return 1
 	}
-	if info, ok := c.tagInfo[tagName]; ok {
+	if info, ok := c.resolveTagInfo(tagName); ok {
 		count := info.ElementCount()
 		if count > 65535 {
 			return 65535 // Max uint16
@@ -236,7 +236,7 @@ func (c *Client) isArrayTag(tagName string) bool {
 	if c == nil || c.tagInfo == nil {
 		return false
 	}
-	if info, ok := c.tagInfo[tagName]; ok {
+	if info, ok := c.resolveTagInfo(tagName); ok {
 		return len(info.Dimensions) > 0
 	}
 	return false
@@ -247,7 +247,7 @@ func (c *Client) isStructTag(tagName string) bool {
 	if c == nil || c.tagInfo == nil {
 		return false
 	}
-	if info, ok := c.tagInfo[tagName]; ok {
+	if info, ok := c.resolveTagInfo(tagName); ok {
 		return IsStructure(info.TypeCode)
 	}
 	return false
@@ -260,7 +260,7 @@ func (c *Client) getInstanceID(tagName string) uint32 {
 	if c == nil || c.tagInfo == nil {
 		return 0
 	}
-	if info, ok := c.tagInfo[tagName]; ok {
+	if info, ok := c.resolveTagInfo(tagName); ok {
 		return info.Instance
 	}
 	return 0
@@ -286,11 +286,23 @@ func (c *Client) ResolveTagType(tagName string) (uint16, bool) {
 	if c == nil || c.plc == nil {
 		return 0, false
 	}
-	info, err := c.plc.FindSymbolByName(tagName)
+	if info, ok := c.resolveTagInfo(tagName); ok {
+		return info.TypeCode, true
+	}
+	root := rootTagName(tagName)
+	if _, known := c.tagInfo[root]; known {
+		return 0, false // Invalid/unresolved member; retain the discovered root.
+	}
+	info, err := c.plc.FindSymbolByName(root)
 	if err != nil || info == nil {
 		return 0, false
 	}
-	return info.TypeCode, true
+	if c.tagInfo == nil {
+		c.tagInfo = make(map[string]TagInfo)
+	}
+	c.tagInfo[root] = *info
+	resolved, ok := c.resolveTagInfo(tagName)
+	return resolved.TypeCode, ok
 }
 
 // GetElementCount returns the element count that would be used when reading a tag.
@@ -305,8 +317,10 @@ func (c *Client) GetElementCount(tagName string) uint16 {
 func (c *Client) GetElementSize(typeCode uint16) uint32 {
 	// For atomic types, use TypeSize
 	baseType := BaseType(typeCode)
-	if size := TypeSize(baseType); size > 0 {
-		return uint32(size)
+	if !IsStructure(typeCode) {
+		if size := TypeSize(baseType); size > 0 {
+			return uint32(size)
+		}
 	}
 
 	// For structures, look up or query the template size
@@ -317,6 +331,9 @@ func (c *Client) GetElementSize(typeCode uint16) uint32 {
 		}
 
 		// Check cache first
+		if tmpl, ok := c.templates[templateID]; ok && tmpl.Size > 0 {
+			return tmpl.Size
+		}
 		if c.templateSizes != nil {
 			if size, ok := c.templateSizes[templateID]; ok {
 				return size
@@ -458,108 +475,28 @@ func (c *Client) Read(tagNames ...string) ([]*TagValue, error) {
 
 	results := make([]*TagValue, 0, len(tagNames))
 
-	// Read arrays and structures individually with proper element counts
+	// Read complex values with resolved element/member metadata.
 	for _, name := range individual {
 		count := c.getElementCount(name)
-		instanceID := c.getInstanceID(name)
-
-		// For structures, get expected size from template for complete reads
-		var expectedSize uint32
-		isStruct := c.isStructTag(name)
-		if isStruct {
-			if info, ok := c.tagInfo[name]; ok {
-				expectedSize = c.GetElementSize(info.TypeCode)
-				debugLogVerbose("Read struct %q: typeCode=0x%04X, expectedSize=%d, count=%d",
-					name, info.TypeCode, expectedSize, count)
-				// For arrays of structures, multiply by element count
-				if count > 1 {
-					expectedSize *= uint32(count)
-				}
-			} else {
-				debugLogVerbose("Read struct %q: NOT FOUND in tagInfo", name)
-			}
-		}
-
-		tag, err := c.plc.ReadTagCountWithInstance(name, count, instanceID)
+		value, err := c.readTagWithMetadata(name, count)
 		if err != nil {
-			debugLogVerbose("Read individual tag %q (count=%d, instance=%d) failed: %v", name, count, instanceID, err)
-
-			// If direct read failed and this is a structure, try fragmented read
-			if isStruct && expectedSize > 0 {
-				debugLogVerbose("Trying fragmented read for %q (expected size: %d)", name, expectedSize)
-				tag, err = c.plc.ReadTagFragmented(name, expectedSize)
-				if err == nil {
-					debugLogVerbose("Fragmented read for %q succeeded: got %d bytes", name, len(tag.Bytes))
+			if count == 1 && c.isStructTag(name) && c.plc.IsConnected() {
+				if members, memberErr := c.readStructMembers(name); memberErr == nil && len(members) > 0 {
+					results = append(results, members...)
+					continue
 				}
 			}
-
-			if err != nil {
-				// If fragmented read also failed, try reading members individually
-				if isStruct {
-					memberResults, memberErr := c.readStructMembers(name)
-					if memberErr == nil && len(memberResults) > 0 {
-						debugLogVerbose("Read UDT %q via %d members succeeded", name, len(memberResults))
-						results = append(results, memberResults...)
-						continue
-					}
-					debugLogVerbose("Read UDT %q members also failed: %v", name, memberErr)
-				}
-
-				results = append(results, &TagValue{
-					Name:  name,
-					Error: err,
-				})
-				continue
-			}
+			value = &TagValue{Name: name, Error: err}
 		}
-
-		// Check if we got incomplete data for structures
-		debugLogVerbose("Read %q got %d bytes (isStruct=%v, expectedSize=%d)",
-			name, len(tag.Bytes), isStruct, expectedSize)
-		if isStruct && expectedSize > 0 && uint32(len(tag.Bytes)) < expectedSize {
-			debugLogVerbose("Read %q got incomplete data (%d/%d bytes), trying fragmented read",
-				name, len(tag.Bytes), expectedSize)
-			fragTag, fragErr := c.plc.ReadTagFragmented(name, expectedSize)
-			if fragErr == nil && len(fragTag.Bytes) > len(tag.Bytes) {
-				debugLogVerbose("Fragmented read for %q got more data: %d bytes", name, len(fragTag.Bytes))
-				tag = fragTag
-			} else if fragErr != nil {
-				debugLogVerbose("Fragmented read for %q failed: %v", name, fragErr)
-			} else {
-				debugLogVerbose("Fragmented read for %q got same or less data: %d bytes", name, len(fragTag.Bytes))
-			}
-		}
-
-		// Prefer tag info type code (from discovery) over read response
-		// The PLC read response sometimes returns a simplified type code
-		// that lacks the structure flag for UDTs
-		dataType := tag.DataType
-		if info, ok := c.tagInfo[name]; ok && info.TypeCode != 0 {
-			// Use discovered type code - it has correct structure/array flags
-			dataType = info.TypeCode
-		}
-		results = append(results, &TagValue{
-			Name:     tag.Name,
-			DataType: dataType,
-			Bytes:    tag.Bytes,
-			Error:    nil,
-		})
+		results = append(results, value)
 	}
 
 	// Batch read scalars
 	if len(scalars) > 0 {
-		// Determine batch size based on connection mode
-		batchSize := 5 // Conservative for unconnected messaging
-		if c.plc.IsConnected() {
-			batchSize = 50
-		}
-
-		for i := 0; i < len(scalars); i += batchSize {
-			end := i + batchSize
-			if end > len(scalars) {
-				end = len(scalars)
-			}
+		for i := 0; i < len(scalars); {
+			end := i + c.readBatchSize(scalars[i:])
 			batch := scalars[i:end]
+			i = end
 
 			tags, err := c.plc.ReadMultiple(batch)
 			if err != nil {
@@ -581,9 +518,13 @@ func (c *Client) Read(tagNames ...string) ([]*TagValue, error) {
 						Error: fmt.Errorf("tag read failed"),
 					})
 				} else {
+					dataType := tag.DataType
+					if info, ok := c.resolveTagInfo(tag.Name); ok && info.TypeCode != 0 && IsCIPStructResponse(tag.DataType) {
+						dataType = info.TypeCode
+					}
 					results = append(results, &TagValue{
 						Name:     tag.Name,
-						DataType: tag.DataType,
+						DataType: dataType,
 						Bytes:    tag.Bytes,
 						Error:    nil,
 					})
@@ -609,23 +550,7 @@ func (c *Client) ReadWithCount(tagName string, count uint16) (*TagValue, error) 
 		count = 1
 	}
 
-	tag, err := c.plc.ReadTagCount(tagName, count)
-	if err != nil {
-		return nil, err
-	}
-
-	// Prefer tag info type code (from discovery) over read response
-	dataType := tag.DataType
-	if info, ok := c.tagInfo[tagName]; ok && info.TypeCode != 0 {
-		dataType = info.TypeCode
-	}
-
-	return &TagValue{
-		Name:     tag.Name,
-		DataType: dataType,
-		Bytes:    tag.Bytes,
-		Error:    nil,
-	}, nil
+	return c.readTagWithMetadata(tagName, count)
 }
 
 // readIndividual reads tags one at a time (for Micro800 which doesn't support batch reads).
@@ -633,31 +558,11 @@ func (c *Client) readIndividual(tagNames []string) ([]*TagValue, error) {
 	results := make([]*TagValue, 0, len(tagNames))
 
 	for _, name := range tagNames {
-		// Look up element count and instance ID for better reliability
-		count := c.getElementCount(name)
-		instanceID := c.getInstanceID(name)
-		tag, err := c.plc.ReadTagCountWithInstance(name, count, instanceID)
+		value, err := c.readTagWithMetadata(name, c.getElementCount(name))
 		if err != nil {
-			results = append(results, &TagValue{
-				Name:  name,
-				Error: err,
-			})
-		} else {
-			// Prefer tag info type code (from discovery) over read response
-			// The PLC read response sometimes returns a simplified type code
-			// that lacks the structure flag for UDTs
-			dataType := tag.DataType
-			if info, ok := c.tagInfo[name]; ok && info.TypeCode != 0 {
-				// Use discovered type code - it has correct structure/array flags
-				dataType = info.TypeCode
-			}
-			results = append(results, &TagValue{
-				Name:     tag.Name,
-				DataType: dataType,
-				Bytes:    tag.Bytes,
-				Error:    nil,
-			})
+			value = &TagValue{Name: name, Error: err}
 		}
+		results = append(results, value)
 	}
 
 	return results, c.connErrorIfDown()
@@ -669,7 +574,7 @@ func (c *Client) readIndividual(tagNames []string) ([]*TagValue, error) {
 // Nested UDTs are recursively expanded to their atomic members.
 func (c *Client) readStructMembers(tagName string) ([]*TagValue, error) {
 	// Get the type code for this tag
-	info, ok := c.tagInfo[tagName]
+	info, ok := c.resolveTagInfo(tagName)
 	if !ok {
 		return nil, fmt.Errorf("no tag info for %q", tagName)
 	}
@@ -703,19 +608,11 @@ func (c *Client) readStructMembers(tagName string) ([]*TagValue, error) {
 	// Read all members - use batch read if possible
 	results := make([]*TagValue, 0, len(memberPaths))
 
-	// Determine batch size based on connection mode
-	batchSize := 5 // Conservative for unconnected messaging
-	if c.plc.IsConnected() {
-		batchSize = 50
-	}
-
-	for i := 0; i < len(memberPaths); i += batchSize {
-		end := i + batchSize
-		if end > len(memberPaths) {
-			end = len(memberPaths)
-		}
+	for i := 0; i < len(memberPaths); {
+		end := i + c.readBatchSize(memberPaths[i:])
 		batch := memberPaths[i:end]
 		batchTypes := memberTypes[i:end]
+		i = end
 
 		// Try batch read first
 		tags, err := c.plc.ReadMultiple(batch)
@@ -1843,6 +1740,9 @@ func (c *Client) decodeScalarMember(typeCode uint16, data []byte) (interface{}, 
 			return data, nil
 		}
 		// Nested structures don't have a handle prefix - only top-level reads do
+		if isStringTemplate(tmpl) {
+			return decodeTemplateString(tmpl, data, false)
+		}
 		return c.decodeUDTWithTemplateInternal(tmpl, data, false)
 	}
 

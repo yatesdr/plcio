@@ -215,6 +215,20 @@ func (v *TagValue) GoValueDecoded(client *Client) interface{} {
 	// Check if this is a structure type
 	isStruct := IsStructure(v.DataType)
 	if isStruct && client != nil {
+		if tmpl, err := client.GetTemplate(v.DataType); err == nil {
+			if IsArrayType(v.DataType) || v.Count > 1 {
+				if values, err := client.decodeStructureArray(tmpl, v.Bytes, v.Count); err == nil {
+					return values
+				}
+				return v.GoValue()
+			}
+			if isStringTemplate(tmpl) {
+				if text, err := decodeTemplateString(tmpl, v.Bytes, true); err == nil {
+					return text
+				}
+				return v.GoValue() // Invalid STRING data stays opaque.
+			}
+		}
 		decoded, err := client.DecodeUDT(v.DataType, v.Bytes)
 		if err == nil {
 			debugLogVerbose("GoValueDecoded: decoded UDT %q (type 0x%04X) with %d members",

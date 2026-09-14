@@ -331,7 +331,7 @@ func (p *PLC) ReadMultiple(tagNames []string) ([]*Tag, error) {
 
 		// Unwrap UCMM if routed
 		if len(p.RoutePath) > 0 {
-			cipResp, err = unwrapUCMMResponse(cipResp)
+			cipResp, err = unwrapUCMMResponse(cipResp, reqData[0]|0x80)
 			if err != nil {
 				return nil, fmt.Errorf("ReadMultiple: %w", err)
 			}

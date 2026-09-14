@@ -2,7 +2,7 @@
 
 A pure Go library for communicating with industrial PLCs (Programmable Logic Controllers) across multiple vendors and protocols. plcio provides a unified `Driver` interface for reading tags, writing values, discovering devices, and browsing symbol tables across Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Siemens, Beckhoff, and Omron PLCs.
 
-> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. v0.3.0 adds published Beckhoff record/array support; remaining hardware validation is tracked in the implementation report. SLC 500, MicroLogix, and Omron FINS are moderately tested. PLC-5 and Omron EIP are untested/experimental.
+> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. v0.3.1 fixes indexed Logix UDT/STRING reads and buffer-dependent batching/fragmentation, building on v0.3.0 Beckhoff record/array support. See the [read validation report](docs/plcio-v0.3.1-validation.md) for tested paths and remaining hardware limits. SLC 500, MicroLogix, and Omron FINS are moderately tested. PLC-5 and Omron EIP are untested/experimental.
 
 ## Supported PLC Families
 

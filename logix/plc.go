@@ -14,7 +14,7 @@ import (
 // Keep CIP/Logix logic here; eip remains transport + session + CPF.
 type PLC struct {
 	IpAddress  string
-	Slot       byte           // CPU slot for ControlLogix (default 0)
+	Slot       byte // CPU slot for ControlLogix (default 0)
 	Connection *eip.EipClient
 
 	// Routing controls how CIP requests are sent:
@@ -264,8 +264,15 @@ func (p *PLC) readTagChunked(tagName string, totalCount uint16, initialTag *Tag)
 // This is used for large structures that exceed the packet size.
 // It reads in chunks using byte offsets and reassembles the full data.
 func (p *PLC) ReadTagFragmented(tagName string, expectedSize uint32) (*Tag, error) {
+	return p.readTagFragmentedCount(tagName, 1, expectedSize)
+}
+
+func (p *PLC) readTagFragmentedCount(tagName string, count uint16, expectedSize uint32) (*Tag, error) {
 	if p == nil || p.Connection == nil {
 		return nil, fmt.Errorf("ReadTagFragmented: nil plc or connection")
+	}
+	if count == 0 || expectedSize == 0 {
+		return nil, fmt.Errorf("ReadTagFragmented: count and expected size must be positive")
 	}
 
 	// Build the symbolic EPath for the tag name
@@ -274,60 +281,66 @@ func (p *PLC) ReadTagFragmented(tagName string, expectedSize uint32) (*Tag, erro
 		return nil, fmt.Errorf("ReadTagFragmented: failed to build path: %w", err)
 	}
 
-	// Calculate max chunk size based on connection
-	maxChunk := uint32(480) // Conservative default for unconnected messaging
-	if p.connSize > 0 {
-		maxChunk = uint32(p.connSize) - 100 // Leave room for protocol overhead
-	}
-
 	var allBytes []byte
 	var dataType uint16
+	var structureHandle uint16
 	offset := uint32(0)
 
 	for offset < expectedSize {
-		// Request remaining bytes, capped at max chunk
-		remaining := expectedSize - offset
-		chunkSize := remaining
-		if chunkSize > maxChunk {
-			chunkSize = maxChunk
-		}
-
 		// Build Read Tag Fragmented request:
 		// [Service 0x52] [PathSize] [Path] [ElementCount:2] [Offset:4]
 		reqData := make([]byte, 0, 2+len(path)+6)
 		reqData = append(reqData, SvcReadTagFragmented)
 		reqData = append(reqData, path.WordLen())
 		reqData = append(reqData, path...)
-		reqData = binary.LittleEndian.AppendUint16(reqData, 1) // Element count = 1
+		reqData = binary.LittleEndian.AppendUint16(reqData, count)
 		reqData = binary.LittleEndian.AppendUint32(reqData, offset)
 
 		cipResp, err := p.sendCipRequest(reqData)
 		if err != nil {
-			if len(allBytes) > 0 {
-				// Return what we have
-				break
-			}
 			return nil, fmt.Errorf("ReadTagFragmented: %w", err)
 		}
 
 		tag, partial, err := parseReadTagFragmentedResponse(cipResp, tagName)
 		if err != nil {
-			if len(allBytes) > 0 {
-				break
-			}
 			return nil, fmt.Errorf("ReadTagFragmented: %w", err)
 		}
 
 		// First chunk gives us the data type
 		if offset == 0 {
 			dataType = tag.DataType
+		} else if dataType != tag.DataType {
+			return nil, fmt.Errorf("ReadTagFragmented: data type changed between fragments")
 		}
 
-		allBytes = append(allBytes, tag.Bytes...)
-		offset += uint32(len(tag.Bytes))
+		data := tag.Bytes
+		if IsCIPStructResponse(dataType) {
+			if len(data) < 2 {
+				return nil, fmt.Errorf("ReadTagFragmented: missing structure handle")
+			}
+			handle := binary.LittleEndian.Uint16(data[:2])
+			if offset == 0 {
+				structureHandle = handle
+				allBytes = append(allBytes, data[:2]...)
+			} else if handle != structureHandle {
+				return nil, fmt.Errorf("ReadTagFragmented: structure handle changed between fragments")
+			}
+			data = data[2:]
+		}
+		if len(data) == 0 || uint64(offset)+uint64(len(data)) > uint64(expectedSize) {
+			return nil, fmt.Errorf("ReadTagFragmented: empty or oversized fragment")
+		}
+		allBytes = append(allBytes, data...)
+		offset += uint32(len(data))
+		if partial && offset == expectedSize {
+			return nil, fmt.Errorf("ReadTagFragmented: controller reports more data than expected")
+		}
 
 		// If no partial transfer, we're done
 		if !partial {
+			if offset != expectedSize {
+				return nil, fmt.Errorf("ReadTagFragmented: incomplete data (%d/%d bytes)", offset, expectedSize)
+			}
 			break
 		}
 	}
@@ -492,7 +505,7 @@ func (p *PLC) sendCipRequest(reqData []byte) ([]byte, error) {
 
 	// Unwrap UCMM response if routed
 	if len(p.RoutePath) > 0 {
-		cipResp, err = unwrapUCMMResponse(cipResp)
+		cipResp, err = unwrapUCMMResponse(cipResp, reqData[0]|0x80)
 		if err != nil {
 			return nil, err
 		}
@@ -505,7 +518,7 @@ func (p *PLC) sendCipRequest(reqData []byte) ([]byte, error) {
 
 // unwrapUCMMResponse unwraps an Unconnected_Send response to get the embedded response.
 // UCMM response format: [ReplyService 1] [Reserved 1] [Status 1] [AddlStatusSize 1] [AddlStatus n] [EmbeddedResponse n]
-func unwrapUCMMResponse(data []byte) ([]byte, error) {
+func unwrapUCMMResponse(data []byte, expectedReply byte) ([]byte, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("UCMM response too short: %d bytes", len(data))
 	}
@@ -520,6 +533,15 @@ func unwrapUCMMResponse(data []byte) ([]byte, error) {
 		// Not a UCMM response, return as-is (might be direct response)
 		return data, nil
 	}
+	// Read Tag Fragmented and Unconnected Send share service 0x52. Gateways
+	// can return the embedded service reply directly. Its 0xD2 header and
+	// partial-transfer status must not be mistaken for a failed UCMM wrapper.
+	embeddedStart := 4 + int(addlStatusSize)*2
+	if expectedReply == 0xD2 && (status == StatusPartialTransfer ||
+		(status == StatusSuccess && (embeddedStart+4 > len(data) ||
+			data[embeddedStart] != expectedReply || data[embeddedStart+1] != 0))) {
+		return data, nil
+	}
 
 	// Check UCMM status
 	if status != StatusSuccess {
@@ -527,7 +549,6 @@ func unwrapUCMMResponse(data []byte) ([]byte, error) {
 	}
 
 	// Extract the embedded response (skip 4-byte header + additional status)
-	embeddedStart := 4 + int(addlStatusSize)*2
 	if embeddedStart >= len(data) {
 		return nil, fmt.Errorf("UCMM response has no embedded data")
 	}

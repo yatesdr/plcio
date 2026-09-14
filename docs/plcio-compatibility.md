@@ -1,4 +1,23 @@
-# v0.3.0 compatibility contract
+# Compatibility contract
+
+## v0.3.1 Logix read corrections
+
+Existing method signatures, result/configuration layouts and raw storage remain
+source compatible. Indexed/member paths now use discovered root/template metadata;
+standard STRING templates decode as text, including nested strings and STRING
+arrays. Consumers previously treating these values as opaque buffers or LEN/DATA
+maps should use their decoded values. Unified driver DataType remains the native
+resolved code, including structure codes for STRING templates; Bytes remains the
+original storage. Client.DecodeUDT retains its top-level map return type.
+
+Interrupted or inconsistent fragmented transfers now return errors rather than
+successful partial records. ConnectionInfo reports CIP Forward Open status rather
+than TCP status; IsConnected retains its transport-liveness meaning.
+
+See [v0.3.1 validation](plcio-v0.3.1-validation.md) for the single/count/batch/buffer
+matrix, read-only hardware checks and remaining limitations.
+
+## v0.3.0 baseline contract
 
 Implementation baseline: `1431799176522451efdc205e09521007a0ab1d16`
 (v0.2.11). v0.3.0 is a deliberate minor release within the project's beta status.
