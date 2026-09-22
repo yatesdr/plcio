@@ -41,7 +41,37 @@ func (a *Adapter) handleSendRRData(conn net.Conn, f *eip.Frame) {
 	cipResp := a.dispatch(cipReq, f.SessionHandle, 0)
 
 	replyCPF := buildUnconnectedCPF(cipResp)
+	if len(cipReq) > 0 && (cipReq[0] == 0x54 || cipReq[0] == 0x5B) && len(cipResp) >= 12 && cipResp[2] == cip.StatusSuccess {
+		if c := a.connMgr.lookupByOT(binary.LittleEndian.Uint32(cipResp[4:8])); c != nil {
+			if peer, ok := conn.RemoteAddr().(*net.TCPAddr); ok && peer.IP.To4() != nil {
+				port := uint16(2222)
+				for _, item := range pkt.Items {
+					if item.TypeId == 0x8001 && len(item.Data) == 16 && binary.BigEndian.Uint16(item.Data[:2]) == 2 {
+						if p := binary.BigEndian.Uint16(item.Data[2:4]); p != 0 {
+							port = p
+						}
+					}
+				}
+				c.mu.Lock()
+				copy(c.peerAddr.ip[:], peer.IP.To4())
+				c.peerAddr.port = port
+				c.mu.Unlock()
+				response, _ := eip.ParseEipCommonPacket(replyCPF)
+				local := conn.LocalAddr().(*net.TCPAddr)
+				response.Items = append(response.Items, socketItem(0x8000, local.IP, uint16(a.IOAddr().Port)), socketItem(0x8001, peer.IP, port))
+				replyCPF = response.Bytes()
+			}
+		}
+	}
 	a.sendFrame(conn, f.Reply(eip.EncapStatusSuccess, eip.BuildRRData(replyCPF)))
+}
+
+func socketItem(kind uint16, ip net.IP, port uint16) eip.EipCommonPacketItem {
+	data := make([]byte, 16)
+	binary.BigEndian.PutUint16(data, 2)
+	binary.BigEndian.PutUint16(data[2:], port)
+	copy(data[4:8], ip.To4())
+	return eip.EipCommonPacketItem{TypeId: kind, Length: 16, Data: data}
 }
 
 // handleSendUnitData processes a connected explicit message. The CPF should

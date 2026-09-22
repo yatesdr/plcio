@@ -1,5 +1,27 @@
 # Compatibility contract
 
+## v0.3.2 EtherNet/IP adapter corrections
+
+Public APIs and existing scanner/tag-access paths are unchanged. Cyclic Class 1
+UDP output now contains raw CPF, without the encapsulation header and six-byte
+interface/timeout prefix used by explicit messaging. TCP explicit-message framing
+is unchanged. This matches the separate I/O encoding in
+[OpENer's CPF implementation](https://github.com/EIPStackGroup/OpENer/blob/master/source/src/enet_encap/cpf.c).
+
+The adapter still accepts legacy wrapped UDP input. Custom consumers built around
+the old wrapped UDP output must switch to raw CPF. Forward_Open now selects the
+originator's requested unicast receive port (2222 by default) rather than inferring
+it from the source port of the first output packet.
+
+Output assembly payloads must match the expected length after removing protocol
+headers; oversized payloads are no longer silently truncated. Packets from an
+unexpected source IP and malformed output lengths do not refresh the watchdog.
+Connections with no initial output traffic now expire using the O->T timeout.
+
+Regression tests cover raw packet bytes, negotiated socket endpoints, legacy
+wrapped input, invalid lengths/peers, and watchdog arithmetic/initial timeout.
+These tests do not replace real PLC interoperability or conformance testing.
+
 ## v0.3.1 Logix read corrections
 
 Existing method signatures, result/configuration layouts and raw storage remain

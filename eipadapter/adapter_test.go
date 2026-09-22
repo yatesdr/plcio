@@ -266,6 +266,7 @@ func TestAssemblyReadWrite(t *testing.T) {
 
 func TestForwardOpenAndCyclicIO(t *testing.T) {
 	input := NewAssembly(101, AssemblyInput, 4)
+	input.SetBytes(0, []byte{0xCA, 0xFE, 0xBA, 0xBE})
 	a, stop := startAdapter(t, input)
 	defer stop()
 
@@ -275,6 +276,11 @@ func TestForwardOpenAndCyclicIO(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Disconnect()
+	uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
 
 	// Build a Forward_Open request: connection path = class 4, instance 0x80
 	// (no config), connection point 101 (produce only — input-only adapter).
@@ -287,10 +293,17 @@ func TestForwardOpenAndCyclicIO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The shared builder defaults to Class 3; this fixture negotiates cyclic Class 1.
+	binary.LittleEndian.PutUint32(foReq[28:32], 100_000)
+	binary.LittleEndian.PutUint16(foReq[32:34], 0x4002)
+	binary.LittleEndian.PutUint32(foReq[34:38], 100_000)
+	binary.LittleEndian.PutUint16(foReq[38:40], 0x4000|uint16(input.Size+2))
+	foReq[40] = 1
 
 	cpf := eip.EipCommonPacket{Items: []eip.EipCommonPacketItem{
 		{TypeId: eip.CpfAddressNullId},
 		{TypeId: eip.CpfUnconnectedMessageId, Length: uint16(len(foReq)), Data: foReq},
+		socketItem(0x8001, net.IPv4(127, 0, 0, 1), uint16(uc.LocalAddr().(*net.UDPAddr).Port)),
 	}}
 	resp, err := c.SendRRData(cpf)
 	if err != nil {
@@ -314,25 +327,7 @@ func TestForwardOpenAndCyclicIO(t *testing.T) {
 	}
 	t.Logf("Forward_Open accepted: O->T=0x%08X T->O=0x%08X", fo.OTConnectionID, fo.TOConnectionID)
 
-	// Listen for cyclic I/O from the adapter on a local UDP port and send
-	// one O->T packet so the adapter knows our address.
-	io := a.IOAddr()
-	uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer uc.Close()
-
-	// Send a Class 0 / "wake-up" O->T packet — minimal CPF with a Sequenced
-	// Address Item only, used so the adapter learns our IP:port.
-	wake := buildO2TPacket(fo.OTConnectionID, 1, nil)
-	if _, err := uc.WriteToUDP(wake, io); err != nil {
-		t.Fatal(err)
-	}
-
-	// Update input assembly so producer has something distinctive to send.
-	input.SetBytes(0, []byte{0xCA, 0xFE, 0xBA, 0xBE})
-
+	// Receive before sending O->T traffic: the endpoint must come from Forward_Open.
 	_ = uc.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 1500)
 	n, _, err := uc.ReadFromUDP(buf)
@@ -340,19 +335,8 @@ func TestForwardOpenAndCyclicIO(t *testing.T) {
 		t.Fatalf("waiting for producer packet: %v", err)
 	}
 
-	// Parse incoming producer packet. Encap frame followed by CPF.
-	f, err := eip.ParseFrame(buf[:n])
-	if err != nil {
-		t.Fatalf("ParseFrame: %v", err)
-	}
-	if f.Command != eip.SendUnitData {
-		t.Errorf("expected SendUnitData, got 0x%04X", f.Command)
-	}
-	cpfBytes, err := eip.ParseRRData(f.Data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pkt, err := eip.ParseEipCommonPacket(cpfBytes)
+	// UDP Class 1 I/O is raw CPF, not an encapsulation frame.
+	pkt, err := eip.ParseEipCommonPacket(buf[:n])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,9 +420,7 @@ func buildO2TPacket(otConnID, netSeq uint32, data []byte) []byte {
 	cpf = append(cpf, addr...)
 	cpf = append(cpf, dItem...)
 
-	rrdata := eip.BuildRRData(cpf)
-	f := &eip.Frame{Command: eip.SendUnitData, Data: rrdata}
-	return f.Bytes()
+	return cpf
 }
 
 // Cover the concurrent assembly access path.
