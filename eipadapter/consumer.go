@@ -11,8 +11,8 @@ import (
 )
 
 // serveIOUDP handles inbound Class 1 cyclic I/O (O->T) on UDP port 2222.
-// Frames here are typically encap frames with command 0x70 (SendUnitData).
-// We also accept raw CPF in case a scanner omits the encap header (some do).
+// Standard I/O datagrams contain raw CPF, without an encapsulation header.
+// Legacy encapsulated packets are accepted for compatibility.
 func (a *Adapter) serveIOUDP(ctx context.Context) {
 	defer a.wg.Done()
 	buf := make([]byte, 1500)
@@ -85,17 +85,6 @@ func (a *Adapter) handleIOPacket(data []byte, src *net.UDPAddr) {
 		return
 	}
 
-	// Record peer address so producer knows where to send.
-	if v4 := src.IP.To4(); v4 != nil {
-		c.mu.Lock()
-		if c.peerAddr.port == 0 {
-			copy(c.peerAddr.ip[:], v4)
-			c.peerAddr.port = uint16(src.Port)
-		}
-		c.mu.Unlock()
-	}
-	c.markInbound(time.Now())
-
 	// Class 1 connected data has a 16-bit sequence count at the start. Some
 	// scanners also prepend a 32-bit Run/Idle header (bit0=Run); we accept
 	// either layout by checking the payload length against the consume
@@ -108,6 +97,7 @@ func (a *Adapter) handleIOPacket(data []byte, src *net.UDPAddr) {
 	}
 
 	if c.Consume == nil {
+		c.acceptPeer(src, a.cfg.Now())
 		return
 	}
 
@@ -117,9 +107,29 @@ func (a *Adapter) handleIOPacket(data []byte, src *net.UDPAddr) {
 	if len(dataBytes) == c.Consume.Size+4 {
 		dataBytes = dataBytes[4:]
 	}
-	if len(dataBytes) > c.Consume.Size {
-		dataBytes = dataBytes[:c.Consume.Size]
+	if len(dataBytes) != c.Consume.Size || !c.acceptPeer(src, a.cfg.Now()) {
+		return
 	}
-
 	c.Consume.receiveFromScanner(dataBytes)
+}
+
+func (c *Connection) acceptPeer(src *net.UDPAddr, now time.Time) bool {
+	v4 := src.IP.To4()
+	if v4 == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false
+	}
+	if c.peerAddr.port != 0 && !net.IP(c.peerAddr.ip[:]).Equal(v4) {
+		return false
+	}
+	if c.peerAddr.port == 0 {
+		copy(c.peerAddr.ip[:], v4)
+		c.peerAddr.port = uint16(src.Port)
+	}
+	c.lastInboundAt = now
+	return true
 }

@@ -6,7 +6,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yatesdr/plcio/eip"
 	"github.com/yatesdr/plcio/logging"
 )
 
@@ -16,15 +15,12 @@ import (
 //
 // Sent format per packet:
 //
-//	Encap: command=0x70 SendUnitData, session=0
-//	RRData prefix (4 + 2)
 //	CPF item count = 2
 //	  Sequenced Address Item (0x8002, len=8): T->O connID + 32-bit network seq
 //	  Connected Data Item    (0xB1, len=2+N): 16-bit data seq + N data bytes
 //
 // We don't attempt multicast — the producer unicasts to the peer's address
-// learned from the first inbound packet OR from sockaddr items in the
-// Forward_Open response (TODO: parse sockaddr_info hints from FO).
+// negotiated through Forward_Open or learned from inbound traffic.
 func (a *Adapter) runProducer(c *Connection) {
 	if c.Produce == nil {
 		return
@@ -34,7 +30,7 @@ func (a *Adapter) runProducer(c *Connection) {
 	if rpi < time.Millisecond {
 		rpi = 10 * time.Millisecond
 	}
-	timeout := connectionTimeout(c.TORPI, c.TimeoutMultiplier)
+	timeout := connectionTimeout(c.OTRPI, c.TimeoutMultiplier)
 
 	logging.DebugLog("eipadapter", "producer start conn 0x%08X RPI=%v timeout=%v", c.TOConnID, rpi, timeout)
 
@@ -46,6 +42,9 @@ func (a *Adapter) runProducer(c *Connection) {
 		c.mu.RLock()
 		closed := c.closed
 		last := c.lastInboundAt
+		if last.IsZero() {
+			last = c.createdAt
+		}
 		peer := c.peerAddr
 		c.mu.RUnlock()
 		if closed {
@@ -54,7 +53,7 @@ func (a *Adapter) runProducer(c *Connection) {
 
 		// Bound the wait so a stalled scanner gets the connection torn
 		// down even if we have no other signal.
-		if !last.IsZero() && time.Since(last) > timeout {
+		if a.cfg.Now().Sub(last) > timeout {
 			logging.DebugLog("eipadapter", "producer conn 0x%08X timed out (no inbound)", c.TOConnID)
 			a.connMgr.expire(c)
 			return
@@ -64,7 +63,11 @@ func (a *Adapter) runProducer(c *Connection) {
 		// this tick. Standard scanners send their first O->T packet very
 		// shortly after Forward_Open.
 		if peer.port == 0 {
-			<-tick.C
+			select {
+			case <-tick.C:
+			case <-a.stopCh:
+				return
+			}
 			continue
 		}
 
@@ -77,7 +80,11 @@ func (a *Adapter) runProducer(c *Connection) {
 			logging.DebugError("eipadapter", "producer write", err)
 		}
 
-		<-tick.C
+		select {
+		case <-tick.C:
+		case <-a.stopCh:
+			return
+		}
 	}
 }
 
@@ -102,19 +109,12 @@ func buildProducerPacket(toConnID, netSeq uint32, dataSeq uint16, data []byte) [
 	cpf = append(cpf, addr...)
 	cpf = append(cpf, dataItem...)
 
-	rrdata := eip.BuildRRData(cpf)
-
-	f := &eip.Frame{
-		Command: eip.SendUnitData,
-		Data:    rrdata,
-	}
-	return f.Bytes()
+	return cpf
 }
 
 // connectionTimeout returns the maximum allowed gap between inbound O->T
 // packets before we declare the connection dead. CIP defines this as
-// RPI * 2^multiplier (multiplier in {0..7}, encoded as the index into the
-// powers-of-two list).
+// RPI * 2^(multiplier+2), with multiplier in {0..7}.
 func connectionTimeout(rpiUS uint32, mult byte) time.Duration {
 	// Map multiplier index to multiplier per CIP Vol 1, table 3-5.4:
 	// 0=4, 1=8, 2=16, 3=32, 4=64, 5=128, 6=256, 7=512.
@@ -122,7 +122,7 @@ func connectionTimeout(rpiUS uint32, mult byte) time.Duration {
 	if int(mult) >= len(powers) {
 		mult = 7
 	}
-	return time.Duration(rpiUS*powers[mult]) * time.Microsecond
+	return time.Duration(rpiUS) * time.Duration(powers[mult]) * time.Microsecond
 }
 
 func (m *ConnectionManager) expire(c *Connection) {

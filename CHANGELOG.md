@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-09-22
+
+### Fixed
+- EtherNet/IP adapter cyclic UDP output now sends raw CPF without an explicit-message
+  encapsulation header or interface/timeout prefix.
+- Forward_Open honors the originator's requested unicast receive port and returns
+  socket-address information; the default receive port is 2222.
+- Adapter output packets with incorrect assembly lengths or an unexpected source IP
+  are ignored without refreshing the receive watchdog.
+- The receive watchdog uses the O->T interval, expires connections with no initial
+  traffic, avoids arithmetic overflow, and lets producer loops stop promptly.
+
+### Compatibility and validation
+- Public APIs, scanner/tag-access paths, and TCP explicit-message framing are unchanged.
+  Legacy wrapped UDP input remains accepted; custom consumers expecting wrapped UDP
+  output must accept raw CPF instead. Oversized assembly writes are no longer truncated.
+- Packet fixtures, loopback I/O, and the full race-enabled test suite pass. Physical
+  PLC interoperability and ODVA conformance have not been established for these changes.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
