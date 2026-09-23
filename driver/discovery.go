@@ -32,8 +32,19 @@ func (d *DiscoveredDevice) Key() string {
 }
 
 // DiscoverAll performs network discovery using all supported protocols.
-// This is the synchronous version that waits for completion.
+// This is the synchronous version that waits for completion. Per-protocol
+// failures are dropped; use DiscoverAllWithReport to receive them.
 func DiscoverAll(broadcastIP string, scanCIDR string, timeout time.Duration, concurrency int) []DiscoveredDevice {
+	devices, _ := DiscoverAllWithReport(broadcastIP, scanCIDR, timeout, concurrency)
+	return devices
+}
+
+// DiscoverAllWithReport is DiscoverAll that also returns per-protocol failures,
+// such as an invalid or oversized scan CIDR, a socket that cannot be opened, a
+// broadcast the OS refuses (no broadcast permission / no route) or a protocol
+// scan error. Each error names its protocol. Devices found by other protocols
+// (or other destinations) are still returned. The error order is unspecified.
+func DiscoverAllWithReport(broadcastIP string, scanCIDR string, timeout time.Duration, concurrency int) ([]DiscoveredDevice, []error) {
 	if timeout <= 0 {
 		timeout = 500 * time.Millisecond
 	}
@@ -41,82 +52,82 @@ func DiscoverAll(broadcastIP string, scanCIDR string, timeout time.Duration, con
 		concurrency = 20
 	}
 
-	logging.DebugLog("tui", "DiscoverAll: starting with broadcast=%s cidr=%s timeout=%v concurrency=%d",
+	logging.DebugLog("discovery", "DiscoverAll: starting with broadcast=%s cidr=%s timeout=%v concurrency=%d",
 		broadcastIP, scanCIDR, timeout, concurrency)
 
 	var (
 		results []DiscoveredDevice
+		errs    []error
 		mu      sync.Mutex
 		wg      sync.WaitGroup
 	)
+	collect := func(protocol string, devices []DiscoveredDevice, failures []error) {
+		logging.DebugLog("discovery", "DiscoverAll: %s done, found %d devices, %d errors", protocol, len(devices), len(failures))
+		mu.Lock()
+		results = append(results, devices...)
+		errs = append(errs, failures...)
+		mu.Unlock()
+	}
+
+	scan := scanCIDR != ""
+	if scan {
+		if _, err := netutil.ExpandIPv4(scanCIDR); err != nil {
+			errs = append(errs, fmt.Errorf("scan CIDR %q: %w (S7, ADS and FINS scans skipped)", scanCIDR, err))
+			scan = false
+		}
+	}
 
 	// Run all discoveries in parallel
-	wg.Add(4)
-
 	// 1. EIP broadcast discovery (Allen-Bradley, Omron NJ/NX)
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		logging.DebugLog("tui", "DiscoverAll: EIP starting")
-		devices := discoverEIP(broadcastIP, timeout)
-		logging.DebugLog("tui", "DiscoverAll: EIP done, found %d devices", len(devices))
-		mu.Lock()
-		results = append(results, devices...)
-		mu.Unlock()
+		devices, failures := eipDiscovery(broadcastIP, timeout)
+		collect("EIP", devices, failures)
 	}()
 
-	// 2. S7 port scan (Siemens)
-	go func() {
-		defer wg.Done()
-		if scanCIDR == "" {
-			logging.DebugLog("tui", "DiscoverAll: S7 skipped (no CIDR)")
-			return
-		}
-		logging.DebugLog("tui", "DiscoverAll: S7 starting")
-		devices := discoverS7(scanCIDR, timeout, concurrency)
-		logging.DebugLog("tui", "DiscoverAll: S7 done, found %d devices", len(devices))
-		mu.Lock()
-		results = append(results, devices...)
-		mu.Unlock()
-	}()
-
-	// 3. ADS port scan (Beckhoff)
-	go func() {
-		defer wg.Done()
-		if scanCIDR == "" {
-			logging.DebugLog("tui", "DiscoverAll: ADS skipped (no CIDR)")
-			return
-		}
-		logging.DebugLog("tui", "DiscoverAll: ADS starting")
-		devices := discoverADS(scanCIDR, timeout, concurrency)
-		logging.DebugLog("tui", "DiscoverAll: ADS done, found %d devices", len(devices))
-		mu.Lock()
-		results = append(results, devices...)
-		mu.Unlock()
-	}()
-
-	// 4. FINS discovery (Omron)
-	go func() {
-		defer wg.Done()
-		if scanCIDR == "" {
-			logging.DebugLog("tui", "DiscoverAll: FINS skipped (no CIDR)")
-			return
-		}
-		logging.DebugLog("tui", "DiscoverAll: FINS starting")
-		devices := discoverFINS(scanCIDR, timeout, concurrency)
-		logging.DebugLog("tui", "DiscoverAll: FINS done, found %d devices", len(devices))
-		mu.Lock()
-		results = append(results, devices...)
-		mu.Unlock()
-	}()
+	if scan {
+		wg.Add(4)
+		// 1b. EIP unicast ListIdentity across the CIDR (reaches routed subnets)
+		go func() {
+			defer wg.Done()
+			devices, failures := eipUnicastDiscovery(scanCIDR, timeout)
+			collect("EIP unicast", devices, failures)
+		}()
+		// 2. S7 port scan (Siemens)
+		go func() {
+			defer wg.Done()
+			devices, failures := discoverS7Report(scanCIDR, timeout, concurrency)
+			collect("S7", devices, failures)
+		}()
+		// 3. ADS UDP Get Info + TCP fallback (Beckhoff)
+		go func() {
+			defer wg.Done()
+			devices, failures := discoverADSReport(scanCIDR, timeout, concurrency)
+			collect("ADS", devices, failures)
+		}()
+		// 4. FINS discovery (Omron)
+		go func() {
+			defer wg.Done()
+			devices, failures := discoverFINSReport(scanCIDR, timeout, concurrency)
+			collect("FINS", devices, failures)
+		}()
+	} else if scanCIDR == "" {
+		logging.DebugLog("discovery", "DiscoverAll: S7/ADS/FINS skipped (no CIDR)")
+	}
 
 	wg.Wait()
-	logging.DebugLog("tui", "DiscoverAll: all done, total %d devices before dedup", len(results))
+	logging.DebugLog("discovery", "DiscoverAll: all done, total %d devices before dedup", len(results))
 
 	// Deduplicate by IP (prefer more specific protocol match)
 	deduped := deduplicateDevices(results)
-	logging.DebugLog("tui", "DiscoverAll: returning %d devices after dedup", len(deduped))
-	return deduped
+	logging.DebugLog("discovery", "DiscoverAll: returning %d devices after dedup", len(deduped))
+	return deduped, errs
 }
+
+// eipDiscovery is a seam so tests can exercise DiscoverAllWithReport without
+// broadcasting onto the real network.
+var eipDiscovery = discoverEIPReport
 
 // DiscoverEIPOnly performs EIP broadcast discovery only.
 // This is the most stable discovery method, working for Allen-Bradley and Omron NJ/NX PLCs.
@@ -126,6 +137,12 @@ func DiscoverEIPOnly(broadcastIP string, timeout time.Duration) []DiscoveredDevi
 
 // discoverEIP performs EIP broadcast discovery.
 func discoverEIP(broadcastIP string, timeout time.Duration) []DiscoveredDevice {
+	devices, _ := discoverEIPReport(broadcastIP, timeout)
+	return devices
+}
+
+func discoverEIPReport(broadcastIP string, timeout time.Duration) ([]DiscoveredDevice, []error) {
+	var errs []error
 	if broadcastIP == "" {
 		broadcastIP = "255.255.255.255"
 	}
@@ -138,7 +155,7 @@ func discoverEIP(broadcastIP string, timeout time.Duration) []DiscoveredDevice {
 		}
 	}
 
-	logging.DebugLog("tui", "EIP discovery: trying broadcast addresses: %v", broadcastAddrs)
+	logging.DebugLog("discovery", "EIP discovery: trying broadcast addresses: %v", broadcastAddrs)
 
 	var allIdentities []eip.Identity
 	client := eip.NewEipClient("")
@@ -150,16 +167,25 @@ func discoverEIP(broadcastIP string, timeout time.Duration) []DiscoveredDevice {
 	}
 
 	for _, addr := range broadcastAddrs {
-		logging.DebugLog("tui", "EIP discovery: sending ListIdentity to %s (timeout=%v)", addr, udpTimeout)
+		logging.DebugLog("discovery", "EIP discovery: sending ListIdentity to %s (timeout=%v)", addr, udpTimeout)
 		identities, err := client.ListIdentityUDP(addr, udpTimeout)
 		if err != nil {
-			logging.DebugLog("tui", "EIP discovery: broadcast to %s error: %v", addr, err)
+			logging.DebugLog("discovery", "EIP discovery: broadcast to %s error: %v", addr, err)
+			errs = append(errs, fmt.Errorf("EIP discovery via %s: %w", addr, err))
 			continue
 		}
-		logging.DebugLog("tui", "EIP discovery: %s returned %d identities", addr, len(identities))
+		logging.DebugLog("discovery", "EIP discovery: %s returned %d identities", addr, len(identities))
 		allIdentities = append(allIdentities, identities...)
 	}
 
+	results := eipIdentitiesToDevices(allIdentities)
+	logging.DebugLog("discovery", "EIP discovery: total %d unique device(s)", len(results))
+	return results, errs
+}
+
+// eipIdentitiesToDevices converts ListIdentity replies to discovered devices,
+// one per IP.
+func eipIdentitiesToDevices(allIdentities []eip.Identity) []DiscoveredDevice {
 	// Deduplicate by IP
 	seen := make(map[string]bool)
 	var results []DiscoveredDevice
@@ -190,11 +216,11 @@ func discoverEIP(broadcastIP string, timeout time.Duration) []DiscoveredDevice {
 			vendor = "Omron"
 		default:
 			// Unknown vendor - log it and default to Logix
-			logging.DebugLog("tui", "EIP discovery: unknown vendor ID %d for %s (%s)",
+			logging.DebugLog("discovery", "EIP discovery: unknown vendor ID %d for %s (%s)",
 				id.VendorID, ipStr, id.ProductName)
 		}
 
-		logging.DebugLog("tui", "EIP discovery: found %s at %s (VendorID=%d, Family=%s)",
+		logging.DebugLog("discovery", "EIP discovery: found %s at %s (VendorID=%d, Family=%s)",
 			id.ProductName, ipStr, id.VendorID, family)
 
 		results = append(results, DiscoveredDevice{
@@ -212,16 +238,37 @@ func discoverEIP(broadcastIP string, timeout time.Duration) []DiscoveredDevice {
 		})
 	}
 
-	logging.DebugLog("tui", "EIP discovery: total %d unique device(s)", len(results))
 	return results
 }
 
-// discoverS7 scans for Siemens S7 PLCs.
-func discoverS7(cidr string, timeout time.Duration, concurrency int) []DiscoveredDevice {
+// eipUnicastDiscovery is a seam for tests.
+var eipUnicastDiscovery = discoverEIPUnicastReport
+
+// discoverEIPUnicastReport sends ListIdentity to every address in cidr by
+// unicast UDP, which (unlike broadcast) reaches devices on routed subnets.
+func discoverEIPUnicastReport(cidr string, timeout time.Duration) ([]DiscoveredDevice, []error) {
+	ips, err := netutil.ExpandIPv4(cidr)
+	if err != nil {
+		return nil, []error{fmt.Errorf("EIP unicast discovery: %w", err)}
+	}
+	udpTimeout := timeout * 3
+	if udpTimeout < 2*time.Second {
+		udpTimeout = 2 * time.Second
+	}
+	ids, err := eip.ListIdentityUnicast(ips, udpTimeout)
+	var errs []error
+	if err != nil {
+		errs = append(errs, fmt.Errorf("EIP unicast discovery: %w", err))
+	}
+	return eipIdentitiesToDevices(ids), errs
+}
+
+// discoverS7Report scans for Siemens S7 PLCs.
+func discoverS7Report(cidr string, timeout time.Duration, concurrency int) ([]DiscoveredDevice, []error) {
 	devices, err := s7.DiscoverSubnet(cidr, timeout, concurrency)
 	if err != nil {
 		logging.DebugLog("Discovery", "S7 scan error: %v", err)
-		return nil
+		return nil, []error{fmt.Errorf("S7 discovery: %w", err)}
 	}
 
 	var results []DiscoveredDevice
@@ -241,135 +288,75 @@ func discoverS7(cidr string, timeout time.Duration, concurrency int) []Discovere
 	}
 
 	logging.DebugLog("Discovery", "S7 found %d device(s)", len(results))
-	return results
+	return results, nil
 }
 
-// discoverADS scans for Beckhoff TwinCAT PLCs using both UDP broadcast and TCP port scanning.
-func discoverADS(cidr string, timeout time.Duration, concurrency int) []DiscoveredDevice {
-	if _, err := netutil.ExpandIPv4(cidr); err != nil {
+// discoverADSReport finds Beckhoff TwinCAT devices. One UDP pass sends the TwinCAT
+// Get Info request (port 48899) to every address in cidr (unicast, which also
+// crosses routed subnets) and to every local broadcast address; replies carry
+// the device's real AMS NetID, hostname and TwinCAT version. Only addresses
+// that do not answer UDP are probed over TCP 48898, where the NetID has to be
+// guessed as IP+".1.1". Extra["hasRoute"] is "true" only for a TCP identity.
+func discoverADSReport(cidr string, timeout time.Duration, concurrency int) ([]DiscoveredDevice, []error) {
+	ips, err := netutil.ExpandIPv4(cidr)
+	if err != nil {
 		logging.DebugLog("Discovery", "ADS scan rejected: %v", err)
-		return nil
+		return nil, []error{fmt.Errorf("ADS discovery: %w", err)}
 	}
-	logging.DebugLog("tui", "discoverADS: starting combined UDP broadcast and TCP scan")
-
-	var (
-		results []DiscoveredDevice
-		seen    = make(map[string]bool)
-		mu      sync.Mutex
-		wg      sync.WaitGroup
-	)
-
-	addResult := func(dev DiscoveredDevice) {
-		mu.Lock()
-		defer mu.Unlock()
-		key := dev.IP.String()
-		if !seen[key] {
-			seen[key] = true
-			results = append(results, dev)
-		} else {
-			// If we already have this device but the new one has more info (hasRoute=true),
-			// replace the existing one. This handles the case where UDP identifies a device
-			// with unverified route knowledge and a successful ADS runtime probe later arrives.
-			if dev.Extra["hasRoute"] == "true" {
-				for i, existing := range results {
-					if existing.IP.String() == key && existing.Extra["hasRoute"] == "false" {
-						results[i] = dev
-						break
-					}
-				}
-			}
-		}
+	broadcastAddrs := GetBroadcastAddresses()
+	logging.DebugLog("discovery", "discoverADS: UDP Get Info to %d address(es) and broadcasts %v", len(ips), broadcastAddrs)
+	devices, failures := ads.DiscoverWithReport(ips, broadcastAddrs, timeout, concurrency)
+	errs := make([]error, 0, len(failures))
+	for _, failure := range failures {
+		errs = append(errs, fmt.Errorf("ADS discovery: %w", failure))
 	}
-
-	// 1. UDP broadcast discovery (finds devices without routes)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		logging.DebugLog("tui", "discoverADS: starting UDP broadcast discovery")
-
-		// Get broadcast addresses for UDP discovery
-		broadcastAddrs := GetBroadcastAddresses()
-		logging.DebugLog("tui", "discoverADS: UDP broadcast addresses: %v", broadcastAddrs)
-
-		udpDevices := ads.DiscoverBroadcast(broadcastAddrs, timeout*3)
-		logging.DebugLog("tui", "discoverADS: UDP broadcast found %d devices", len(udpDevices))
-
-		for _, dev := range udpDevices {
-			hasRoute := "false"
-			if dev.HasRoute {
-				hasRoute = "true"
-			}
-
-			addResult(DiscoveredDevice{
-				IP:          dev.IP,
-				Port:        dev.Port,
-				Family:      FamilyBeckhoff,
-				ProductName: dev.ProductName,
-				Protocol:    "ADS",
-				Vendor:      "Beckhoff",
-				Extra: map[string]string{
-					"amsNetId":  dev.AmsNetId,
-					"hostname":  dev.Hostname,
-					"tcVersion": dev.TwinCATVersion,
-					"hasRoute":  hasRoute,
-				},
-			})
-		}
-	}()
-
-	// 2. TCP port scan (finds devices that accept TCP on 48898)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		logging.DebugLog("tui", "discoverADS: starting TCP port scan")
-		devices, err := ads.DiscoverSubnet(cidr, timeout, concurrency)
-		if err != nil {
-			logging.DebugLog("Discovery", "ADS TCP scan error: %v", err)
-			return
-		}
-		logging.DebugLog("tui", "discoverADS: TCP scan found %d devices", len(devices))
-
-		for _, dev := range devices {
-			hasRoute := "false"
-			if dev.HasRoute {
-				hasRoute = "true"
-			}
-
-			addResult(DiscoveredDevice{
-				IP:          dev.IP,
-				Port:        dev.Port,
-				Family:      FamilyBeckhoff,
-				ProductName: dev.ProductName,
-				Protocol:    "ADS",
-				Vendor:      "Beckhoff",
-				Extra: map[string]string{
-					"amsNetId":  dev.AmsNetId,
-					"hostname":  dev.Hostname,
-					"tcVersion": dev.TwinCATVersion,
-					"hasRoute":  hasRoute,
-				},
-			})
-		}
-	}()
-
-	wg.Wait()
+	results := make([]DiscoveredDevice, 0, len(devices))
+	for _, dev := range devices {
+		results = append(results, adsDiscoveredDevice(dev))
+	}
 	logging.DebugLog("Discovery", "ADS found %d device(s) total", len(results))
-	return results
+	return results, errs
+}
+
+func adsDiscoveredDevice(dev ads.DiscoveredDevice) DiscoveredDevice {
+	hasRoute := "false"
+	if dev.HasRoute {
+		hasRoute = "true"
+	}
+	return DiscoveredDevice{
+		IP:          dev.IP,
+		Port:        dev.Port,
+		Family:      FamilyBeckhoff,
+		ProductName: dev.ProductName,
+		Protocol:    "ADS",
+		Vendor:      "Beckhoff",
+		Extra: map[string]string{
+			"amsNetId":  dev.AmsNetId,
+			"hostname":  dev.Hostname,
+			"tcVersion": dev.TwinCATVersion,
+			"hasRoute":  hasRoute,
+		},
+	}
 }
 
 // discoverFINS scans for Omron FINS PLCs.
 func discoverFINS(cidr string, timeout time.Duration, concurrency int) []DiscoveredDevice {
-	logging.DebugLog("tui", "discoverFINS: calling omron.NetworkDiscoverSubnet with cidr=%s", cidr)
+	devices, _ := discoverFINSReport(cidr, timeout, concurrency)
+	return devices
+}
+
+func discoverFINSReport(cidr string, timeout time.Duration, concurrency int) ([]DiscoveredDevice, []error) {
+	logging.DebugLog("discovery", "discoverFINS: calling omron.NetworkDiscoverSubnet with cidr=%s", cidr)
 	devices, err := omron.NetworkDiscoverSubnet(cidr, timeout, concurrency)
-	logging.DebugLog("tui", "discoverFINS: NetworkDiscoverSubnet returned err=%v devices=%d", err, len(devices))
+	logging.DebugLog("discovery", "discoverFINS: NetworkDiscoverSubnet returned err=%v devices=%d", err, len(devices))
 	if err != nil {
 		logging.DebugLog("Discovery", "FINS scan error: %v", err)
-		return nil
+		return nil, []error{fmt.Errorf("FINS discovery: %w", err)}
 	}
 
 	var results []DiscoveredDevice
 	for i, dev := range devices {
-		logging.DebugLog("tui", "discoverFINS: device %d: IP=%s Protocol=%s ProductName=%q Node=%d",
+		logging.DebugLog("discovery", "discoverFINS: device %d: IP=%s Protocol=%s ProductName=%q Node=%d",
 			i, dev.IP.String(), dev.Protocol, dev.ProductName, dev.Node)
 		results = append(results, DiscoveredDevice{
 			IP:          dev.IP,
@@ -384,8 +371,8 @@ func discoverFINS(cidr string, timeout time.Duration, concurrency int) []Discove
 		})
 	}
 
-	logging.DebugLog("tui", "discoverFINS: returning %d devices", len(results))
-	return results
+	logging.DebugLog("discovery", "discoverFINS: returning %d devices", len(results))
+	return results, nil
 }
 
 // deduplicateDevices removes duplicate devices, preferring confirmed connections.

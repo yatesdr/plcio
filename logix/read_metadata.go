@@ -8,15 +8,29 @@ import (
 // resolveTagInfo derives an exact indexed/member path from the discovered root
 // and its templates. Derived paths stay out of the catalog and use symbolic
 // addressing; an element must not inherit its container's count or instance.
+// Only the SetTags catalog is consulted, so read behavior does not depend on
+// earlier type lookups.
 func (c *Client) resolveTagInfo(name string) (TagInfo, bool) {
+	return c.resolveTagInfoIn(name, false)
+}
+
+// resolveTagInfoIn resolves name against the catalog and, when withResolved
+// is set, against roots cached by resolveWithLookup.
+func (c *Client) resolveTagInfoIn(name string, withResolved bool) (TagInfo, bool) {
 	if c == nil {
 		return TagInfo{}, false
 	}
-	if info, ok := c.tagInfo[name]; ok {
+	lookup := func(name string) (TagInfo, bool) {
+		if info, ok := c.lookupTagInfo(name); ok || !withResolved {
+			return info, ok
+		}
+		return c.lookupResolvedType(name)
+	}
+	if info, ok := lookup(name); ok {
 		return info, true
 	}
 	root := rootTagName(name)
-	info, ok := c.tagInfo[root]
+	info, ok := lookup(root)
 	if !ok {
 		return TagInfo{}, false
 	}

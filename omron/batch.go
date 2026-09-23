@@ -14,10 +14,23 @@ import (
 
 // Batch configuration constants
 const (
-	// FINS limits
-	FINSMaxWordsPerRead   = 998  // Max words per single FINS read (protocol limit)
-	FINSMaxMultiAreas     = 64   // Max areas in multi-memory read (model dependent, conservative)
-	FINSMaxBitsPerRead    = 256  // Max bits per single FINS bit read
+	// FINS limits. W342-E1-18 section 5-2-2 "Number of Elements for I/O
+	// MEMORY AREA READ (0101) and I/O MEMORY AREA WRITE (0102)": over
+	// Ethernet (FINS/UDP and FINS/TCP alike) at most 999 words are read and
+	// 997 words written per command. These follow from the frame limits in
+	// the W342 section 3-2 frame diagram: command text <= 2,000 bytes after
+	// the command code (6 bytes of area/address/count + 997*2), response
+	// text <= 1,998 bytes after the end code (999*2). A route through
+	// SYSMAC LINK, DeviceNet or SYSWAY lowers them to 269/267 words; the PLC
+	// then refuses the command with an end code (never a silent truncation).
+	FINSMaxWordsPerRead = 999 // Max words per single Memory Area Read (0x0101)
+	FINSMaxMultiAreas   = 64  // Items per Multiple Memory Area Read (0x0104); W342 5-3-5 allows 167 over Ethernet
+	FINSMaxBitsPerRead  = 256 // Max bits per single FINS bit write (conservative)
+
+	// finsMaxWordsPerWrite bounds a single Memory Area Write (0x0102).
+	// Larger writes are rejected, never split: a split write would not be
+	// atomic and a failure half way would leave the PLC half-written.
+	finsMaxWordsPerWrite = 997
 
 	// EIP/CIP limits
 	EIPMaxServicesPerMSP  = 200  // CIP Multiple Service Packet limit
@@ -239,8 +252,16 @@ func (c *Client) readEIPBatch(tagNames []string) ([]*TagValue, error) {
 		logging.DebugLog("EIP", "MSP response[%d] %s: service=0x%02X status=0x%02X dataLen=%d",
 			i, tagNames[i], resp.Service, resp.Status, len(resp.Data))
 
-		// Status 0x00 = success, 0x06 = partial transfer (OK for reads)
-		if resp.Status != 0x00 && resp.Status != 0x06 {
+		// Only 0x00 is a complete value. 0x06 (partial transfer) on Read
+		// Tag means the value did not fit in the reply: decoding the
+		// fragment would yield a truncated or zero value.
+		if resp.Status == 0x06 {
+			setCIPReadValue(tv, resp.Data) // keep the type for diagnostics
+			tv.Error = errCIPPartialRead
+			results[i] = tv
+			continue
+		}
+		if resp.Status != 0x00 {
 			statusMsg := cipStatusMessage(resp.Status)
 			tv.Error = fmt.Errorf("CIP error 0x%02X (%s)", resp.Status, statusMsg)
 			logging.DebugLog("EIP", "MSP response[%d] %s: ERROR %s", i, tagNames[i], statusMsg)
@@ -248,17 +269,7 @@ func (c *Client) readEIPBatch(tagNames []string) ([]*TagValue, error) {
 			continue
 		}
 
-		if len(resp.Data) < 2 {
-			tv.Error = fmt.Errorf("response data too short: %d bytes", len(resp.Data))
-			logging.DebugLog("EIP", "MSP response[%d] %s: data too short", i, tagNames[i])
-			results[i] = tv
-			continue
-		}
-
-		tv.DataType = binary.LittleEndian.Uint16(resp.Data[0:2])
-		if len(resp.Data) > 2 {
-			tv.Bytes = resp.Data[2:]
-		}
+		setCIPReadValue(tv, resp.Data)
 
 		logging.DebugLog("EIP", "MSP response[%d] %s: type=0x%04X (%s) dataLen=%d",
 			i, tagNames[i], tv.DataType, TypeName(tv.DataType), len(tv.Bytes))
@@ -434,22 +445,36 @@ func (c *Client) readEIPSingle(tagName string) *TagValue {
 		Data:    reqData,
 	}
 
-	respData, err := c.sendCIPRequest(req)
+	respData, status, err := c.sendCIPRequestWithStatus(req)
 	if err != nil {
 		tv.Error = err
 		return tv
 	}
-
-	if len(respData) < 2 {
-		tv.Error = fmt.Errorf("response too short")
-		return tv
-	}
-
-	tv.DataType = binary.LittleEndian.Uint16(respData[0:2])
-	if len(respData) > 2 {
-		tv.Bytes = respData[2:]
+	setCIPReadValue(tv, respData)
+	if status == 0x06 {
+		tv.Error = errCIPPartialRead
 	}
 	return tv
+}
+
+// errCIPPartialRead reports a Read Tag reply with general status 0x06.
+var errCIPPartialRead = fmt.Errorf("CIP partial transfer (0x06): the value is larger than one reply and was not read")
+
+// setCIPReadValue fills tv from Read Tag reply data (W506 7-6-1), marking
+// short, truncated or out-of-range data as an error.
+func setCIPReadValue(tv *TagValue, respData []byte) {
+	typeCode, data, err := parseCIPReadReply(respData)
+	if err != nil {
+		tv.Error = err
+		return
+	}
+	tv.DataType = typeCode
+	if len(data) > 0 {
+		tv.Bytes = data
+	}
+	if err := checkCIPReadData(typeCode, data); err != nil {
+		tv.Error = err
+	}
 }
 
 // readFINSBatched reads multiple FINS addresses using optimized batching.
@@ -592,9 +617,10 @@ func (c *Client) groupContiguousAddresses(requests []finsReadRequest) []readGrou
 		req := requests[i]
 
 		// Check if this request is contiguous with current group
-		expectedAddr := currentGroup.startAddr + uint16(currentGroup.wordCount)
+		// (int arithmetic: a group ending at word 65535 must not wrap to 0)
+		expectedAddr := int(currentGroup.startAddr) + currentGroup.wordCount
 		isContiguous := req.parsed.MemoryArea == currentGroup.area &&
-			req.parsed.Address == expectedAddr &&
+			int(req.parsed.Address) == expectedAddr &&
 			currentGroup.wordCount+req.wordCount <= FINSMaxWordsPerRead
 
 		if isContiguous {
@@ -624,8 +650,23 @@ func (c *Client) readFINSGroup(group readGroup, results []*TagValue) {
 	logging.DebugLog("Omron", "FINS group read: area=0x%02X addr=%d count=%d (%d tags)",
 		group.area, group.startAddr, group.wordCount, len(group.requests))
 
-	// Read all words in one request
-	words, err := c.fins.readWords(group.area, group.startAddr, uint16(group.wordCount))
+	// Read all words, split into FINS-sized requests when a single tag
+	// exceeds the per-command limit.
+	var words []uint16
+	var err error
+	for done := 0; done < group.wordCount; {
+		n := group.wordCount - done
+		if n > FINSMaxWordsPerRead {
+			n = FINSMaxWordsPerRead
+		}
+		var chunk []uint16
+		chunk, err = c.fins.readWords(group.area, uint16(int(group.startAddr)+done), uint16(n))
+		if err != nil {
+			break
+		}
+		words = append(words, chunk...)
+		done += n
+	}
 	if err != nil {
 		// Mark all requests in group as failed
 		for _, req := range group.requests {
@@ -673,10 +714,11 @@ func (c *Client) readFINSMultiMemory(groups []readGroup, results []*TagValue) er
 	}
 
 	// Check if any group needs more than 1 word - if so, fall back to individual reads
-	// because FINS 0x0104 only reads 1 word per address entry
+	// because FINS 0x0104 only reads 1 word per address entry. Bit areas return
+	// 1-byte items and are not batched here either.
 	needFallback := false
 	for _, group := range groups {
-		if group.wordCount > 1 {
+		if group.wordCount > 1 || IsBitArea(group.area) {
 			needFallback = true
 			break
 		}
@@ -742,40 +784,23 @@ func (c *Client) readFINSBits(req finsReadRequest, results []*TagValue) {
 }
 
 // BuildMultiMemoryReadRequest builds a FINS 0x0104 multi-memory read request.
-// Per Omron W227 FINS Commands Reference, Memory Area Read Multiple (0x0104):
-// Request format: [number_of_elements(1)] + [area(1) + address(3)]×n
-// Where address is: beginning_address_high(1) + beginning_address_low(1) + bit_position(1)
-// Note: This is NOT the same as 0x0101 format (which has count per area)
-// 0x0104 reads exactly 1 word per specified address.
+// Per Omron W227 (5-3-3 MULTIPLE MEMORY AREA READ) the command data is a
+// sequence of read items with NO leading item count:
 //
-// For reading multiple consecutive words, we need to list each address individually,
-// OR use the standard 0x0101 Memory Read which supports count.
+//	[area code(1)][beginning address word(2, big-endian)][bit position(1)] x n
 //
-// Fallback: This implementation uses individual 0x0101 calls instead.
+// Each item reads exactly one element (one word for word area codes), so
+// contiguous blocks use 0x0101 instead.
 func BuildMultiMemoryReadRequest(groups []readGroup) []byte {
-	// IMPORTANT: FINS 0x0104 reads 1 word per address entry. It does NOT support
-	// specifying a count per area. To read multiple words, we would need to list
-	// each address individually (which is inefficient for large contiguous blocks).
-	//
-	// This format matches what was originally intended but may need adjustment
-	// based on actual PLC behavior. The format below attempts to be compatible:
-	//
-	// Format: [number_of_elements(1)] + [area(1), addr_hi(1), addr_lo(1), bit(1)]×n
-	// This reads 1 word per entry. For contiguous reads, use 0x0101 instead.
-
-	// For now, we log a warning if any group has wordCount > 1
 	for _, group := range groups {
 		if group.wordCount > 1 {
 			logging.DebugLog("FINS", "WARNING: MultiMemoryRead group has wordCount=%d but 0x0104 reads 1 word per address", group.wordCount)
 		}
 	}
 
-	// Build request: each entry is 4 bytes (area + 3-byte address)
-	data := make([]byte, 1+len(groups)*4)
-	data[0] = byte(len(groups))
-
+	data := make([]byte, len(groups)*4)
 	for i, group := range groups {
-		offset := 1 + i*4
+		offset := i * 4
 		data[offset] = group.area
 		data[offset+1] = byte(group.startAddr >> 8) // Address high byte
 		data[offset+2] = byte(group.startAddr)      // Address low byte
@@ -790,34 +815,35 @@ func BuildMultiMemoryReadRequest(groups []readGroup) []byte {
 }
 
 // ParseMultiMemoryReadResponse parses a FINS 0x0104 response.
-// Per Omron W227, 0x0104 response format:
-// - Data: [word1_hi][word1_lo] + [word2_hi][word2_lo] + ...
-// - Each address entry returns exactly 2 bytes (1 word)
+// Per Omron W227, the response data repeats, in request order:
+//
+//	[area code(1)][data(2 bytes for a word area code)]
+//
+// Every echoed area code is validated and the total length must match
+// exactly; on any mismatch an error is returned and results are left
+// untouched (the caller falls back to single reads) rather than risking
+// misaligned values.
 func ParseMultiMemoryReadResponse(resp []byte, groups []readGroup, results []*TagValue) error {
 	logging.DebugLog("FINS", "Parsing MultiMemory response: %d bytes for %d groups", len(resp), len(groups))
 
-	// For 0x0104: each group returns 1 word (2 bytes)
-	expectedTotal := len(groups) * 2
-	if len(resp) < expectedTotal {
-		logging.DebugLog("FINS", "MultiMemory response too short: got %d bytes, expected %d", len(resp), expectedTotal)
-		// Mark all as errors
-		for _, group := range groups {
-			for _, req := range group.requests {
-				results[req.originalIndex] = &TagValue{
-					Name:      req.address,
-					Error:     fmt.Errorf("multi-memory response too short: got %d bytes, expected %d", len(resp), expectedTotal),
-					bigEndian: true,
-				}
-			}
+	const itemSize = 3 // area code + one word
+	for _, group := range groups {
+		if IsBitArea(group.area) || group.wordCount != 1 {
+			return fmt.Errorf("multi-memory read supports single-word word-area items only (area 0x%02X, %d words)", group.area, group.wordCount)
 		}
-		return fmt.Errorf("response too short")
+	}
+	if len(resp) != len(groups)*itemSize {
+		logging.DebugLog("FINS", "MultiMemory response length mismatch: got %d bytes, expected %d", len(resp), len(groups)*itemSize)
+		return fmt.Errorf("multi-memory response length mismatch: got %d bytes, expected %d", len(resp), len(groups)*itemSize)
+	}
+	for i, group := range groups {
+		if got := resp[i*itemSize]; got != group.area {
+			return fmt.Errorf("multi-memory response item %d: area code 0x%02X does not match requested 0x%02X", i, got, group.area)
+		}
 	}
 
-	// Each group gets 2 bytes (1 word)
-	offset := 0
 	for i, group := range groups {
-		wordData := resp[offset : offset+2]
-		offset += 2
+		wordData := resp[i*itemSize+1 : i*itemSize+itemSize]
 
 		logging.DebugLog("FINS", "MultiMemory entry %d: area=0x%02X addr=%d data=%X (value=%d)",
 			i, group.area, group.startAddr, wordData, binary.BigEndian.Uint16(wordData))
@@ -827,11 +853,14 @@ func ParseMultiMemoryReadResponse(resp []byte, groups []readGroup, results []*Ta
 			tv := &TagValue{
 				Name:      req.address,
 				DataType:  req.parsed.TypeCode,
-				Count:     1, // 0x0104 returns 1 word per entry
+				Count:     req.parsed.Count, // may be >1 for sub-word elements, e.g. BYTE[2]
 				Bytes:     make([]byte, 2),
 				bigEndian: true,
 			}
 			copy(tv.Bytes, wordData)
+			if req.parsed.Count > 1 {
+				tv.DataType = MakeArrayType(req.parsed.TypeCode)
+			}
 
 			results[req.originalIndex] = tv
 		}

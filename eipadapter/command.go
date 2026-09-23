@@ -38,27 +38,32 @@ func (a *Adapter) handleSendRRData(conn net.Conn, f *eip.Frame) {
 		return
 	}
 
-	cipResp := a.dispatch(cipReq, f.SessionHandle, 0)
+	// The originator of any Class 1 connection opened by this request is the
+	// TCP peer. T->O data goes to its IP at UDP 2222, or at the port from a
+	// T->O Sockaddr Info item (0x8001) in the request; O->T data is only
+	// accepted from that IP.
+	var origin *peerAddr
+	if peer, ok := conn.RemoteAddr().(*net.TCPAddr); ok && peer.IP.To4() != nil {
+		o := peerAddr{port: 2222}
+		copy(o.ip[:], peer.IP.To4())
+		for _, item := range pkt.Items {
+			if item.TypeId == 0x8001 && len(item.Data) == 16 && binary.BigEndian.Uint16(item.Data[:2]) == 2 {
+				if p := binary.BigEndian.Uint16(item.Data[2:4]); p != 0 {
+					o.port = p
+				}
+			}
+		}
+		origin = &o
+	}
+
+	cipResp := a.dispatchFrom(cipReq, f.SessionHandle, 0, origin)
 
 	replyCPF := buildUnconnectedCPF(cipResp)
-	if len(cipReq) > 0 && (cipReq[0] == 0x54 || cipReq[0] == 0x5B) && len(cipResp) >= 12 && cipResp[2] == cip.StatusSuccess {
+	if origin != nil && len(cipReq) > 0 && (cipReq[0] == 0x54 || cipReq[0] == 0x5B) && len(cipResp) >= 12 && cipResp[2] == cip.StatusSuccess {
 		if c := a.connMgr.lookupByOT(binary.LittleEndian.Uint32(cipResp[4:8])); c != nil {
-			if peer, ok := conn.RemoteAddr().(*net.TCPAddr); ok && peer.IP.To4() != nil {
-				port := uint16(2222)
-				for _, item := range pkt.Items {
-					if item.TypeId == 0x8001 && len(item.Data) == 16 && binary.BigEndian.Uint16(item.Data[:2]) == 2 {
-						if p := binary.BigEndian.Uint16(item.Data[2:4]); p != 0 {
-							port = p
-						}
-					}
-				}
-				c.mu.Lock()
-				copy(c.peerAddr.ip[:], peer.IP.To4())
-				c.peerAddr.port = port
-				c.mu.Unlock()
-				response, _ := eip.ParseEipCommonPacket(replyCPF)
+			if response, err := eip.ParseEipCommonPacket(replyCPF); err == nil {
 				local := conn.LocalAddr().(*net.TCPAddr)
-				response.Items = append(response.Items, socketItem(0x8000, local.IP, uint16(a.IOAddr().Port)), socketItem(0x8001, peer.IP, port))
+				response.Items = append(response.Items, socketItem(0x8000, local.IP, uint16(a.IOAddr().Port)), socketItem(0x8001, net.IP(origin.ip[:]), origin.port))
 				replyCPF = response.Bytes()
 			}
 		}
@@ -106,15 +111,16 @@ func (a *Adapter) handleSendUnitData(conn net.Conn, f *eip.Frame) {
 	if cipReq == nil {
 		return
 	}
-	if a.connMgr.lookupByOT(connID) == nil {
+	// Capture the connection once: the request may be a Forward_Close for
+	// this very connection, or the watchdog may expire it, while dispatching.
+	c := a.connMgr.lookupByOT(connID)
+	if c == nil {
 		logging.DebugLog("eipadapter", "SendUnitData on unknown conn 0x%08X", connID)
 		return
 	}
 
 	cipResp := a.dispatch(cipReq, f.SessionHandle, connID)
-	// Build connected reply: same connection ID for T->O direction in explicit
-	// connected messaging is the originator's OTConnID echoed back.
-	c := a.connMgr.lookupByOT(connID)
+	// Build the connected reply, tagged with the connection's T->O ID.
 	replyCPF := buildConnectedCPF(c.TOConnID, seq, cipResp)
 	a.sendFrame(conn, f.Reply(eip.EncapStatusSuccess, eip.BuildRRData(replyCPF)))
 }
@@ -122,6 +128,12 @@ func (a *Adapter) handleSendUnitData(conn net.Conn, f *eip.Frame) {
 // dispatch decodes a CIP request and routes it to the correct object. The
 // returned bytes are the full CIP response (including reply header).
 func (a *Adapter) dispatch(req []byte, session, connID uint32) []byte {
+	return a.dispatchFrom(req, session, connID, nil)
+}
+
+// dispatchFrom is dispatch with the originator's I/O address (nil if
+// unknown), which a Forward_Open needs to bind the new connection.
+func (a *Adapter) dispatchFrom(req []byte, session, connID uint32, origin *peerAddr) []byte {
 	if len(req) < 2 {
 		return errResponse(0, cip.StatusPathSegmentError)
 	}
@@ -161,11 +173,14 @@ func (a *Adapter) dispatch(req []byte, session, connID uint32) []byte {
 		Data:    data,
 		Session: session,
 		ConnID:  connID,
+		origin:  origin,
 	})
 	if resp.Status == cip.StatusSuccess {
 		return okResponse(svc, resp.Data)
 	}
-	return errResponse(svc, resp.Status, resp.ExtData...)
+	// Error responses may carry a body too (e.g. the unsuccessful
+	// Forward_Open response, CIP Vol 1 3-5.5.2).
+	return append(errResponse(svc, resp.Status, resp.ExtData...), resp.Data...)
 }
 
 // buildUnconnectedCPF wraps a CIP response into a CPF for SendRRData reply.

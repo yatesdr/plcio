@@ -178,9 +178,10 @@ func decodeValueUnchecked(schema *schemaType, data []byte, deadline time.Time) (
 		default:
 			return nil, fmt.Errorf("unsupported unsigned width")
 		}
-		if err := validateTimeOfDay(schema, value); err != nil {
-			return nil, err
-		}
+		// TOD/LTOD reads are not range-checked: the raw count since midnight
+		// is returned even when it is >= 24h (a PLC can hold such a value, e.g.
+		// after arithmetic), so a successful read never becomes an error.
+		// Writes still reject out-of-range values in encode.go.
 		return value, nil
 	case metadata.KindFloat:
 		if schema.bits == 32 {

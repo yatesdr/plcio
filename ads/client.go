@@ -217,6 +217,136 @@ func (c *Client) invalidateCaches() {
 	c.lookupBytes = 0
 }
 
+// invalidateLive discards generation-scoped caches on the current healthy
+// stream and releases the discarded handles immediately, before this client can
+// acquire replacements; a deferred release could free a reissued handle number.
+// Reconnect and Close use invalidateCaches: an old stream's handles are gone.
+func (c *Client) invalidateLive() {
+	var handles []uint32
+	seen := make(map[uint32]bool)
+	for _, entry := range c.symbols {
+		if entry.Handle != 0 && !seen[entry.Handle] {
+			seen[entry.Handle] = true
+			handles = append(handles, entry.Handle)
+		}
+		entry.Handle = 0 // An operation still holding the entry cannot reuse it.
+	}
+	c.invalidateCaches()
+	c.releaseHandles(handles)
+}
+
+// trimLookupCaches keeps the direct-lookup caches (element paths, aliases and
+// catalog-miss lookups) from failing permanently once their count/byte budgets
+// fill. When the next operation, resolving up to n names, might not fit, all
+// non-catalog lookup state is evicted (clear-on-full). It runs only at an
+// operation boundary, before the operation resolves any name, so no in-flight
+// entry loses its handle; evicted handles are released immediately, before any
+// replacement can be acquired (the same ordering as invalidateLive). Catalog
+// entries, their handles and the schema snapshot are retained. A single
+// request that alone exceeds the budgets still fails with the limit error.
+func (c *Client) trimLookupCaches(n int) {
+	cfg := c.effectiveOptions()
+	need, limit := uint64(n), uint64(cfg.maxSymbols)
+	var snapshotBytes uint64
+	if c.snapshot != nil {
+		snapshotBytes = c.snapshot.bytes
+	}
+	perLookup := uint64(0)
+	if len(c.lookupSymbols) > 0 {
+		perLookup = c.lookupBytes/uint64(len(c.lookupSymbols)) + 1
+	}
+	catalogCount := 0
+	if c.snapshot != nil {
+		catalogCount = len(c.snapshot.catalog)
+	}
+	dynamic := len(c.lookupSymbols) > 0 || len(c.symbols) > catalogCount
+	full := uint64(len(c.symbols))+need > limit || uint64(len(c.lookupSymbols))+need > limit ||
+		snapshotBytes+c.lookupBytes+need*perLookup > uint64(cfg.maxMetadata)
+	if full && dynamic {
+		c.evictLookups()
+	}
+}
+
+// evictLookups drops every symbol-cache key that is not a catalog name, plus
+// all direct-lookup records, releasing handles no retained key still shares.
+func (c *Client) evictLookups() {
+	isCatalog := func(name string) bool {
+		return c.snapshot != nil && c.snapshot.symbols[name] != nil
+	}
+	retained := make(map[*SymbolEntry]bool)
+	for name, entry := range c.symbols {
+		if isCatalog(name) {
+			retained[entry] = true
+		}
+	}
+	var handles []uint32
+	seen := make(map[uint32]bool)
+	for name, entry := range c.symbols {
+		if isCatalog(name) {
+			continue
+		}
+		delete(c.symbols, name)
+		if retained[entry] {
+			continue // a case alias of a retained catalog entry
+		}
+		if entry.Handle != 0 && !seen[entry.Handle] {
+			seen[entry.Handle] = true
+			handles = append(handles, entry.Handle)
+		}
+		entry.Handle = 0
+	}
+	c.lookupSymbols = make(map[string]*symbolRecord)
+	c.lookupBytes = 0
+	c.releaseHandles(handles)
+}
+
+// releaseHandles is best effort and never reports failure: ADS rejections (for
+// example already-invalid handles after an online change) are ignored. It runs
+// only while at least half of the operation budget remains, so cleanup cannot
+// consume the recovery that follows; skipped handles are dropped, not deferred.
+func (c *Client) releaseHandles(handles []uint32) {
+	budget := c.cfg.timeout
+	if budget == 0 {
+		budget = 5 * time.Second
+	}
+	usable := func() bool {
+		return c.conn != nil && !c.conn.dead.Load() && time.Until(c.deadline) >= budget/2
+	}
+	limit := c.effectiveOptions().maxBatch
+	for len(handles) > 0 && usable() {
+		count := len(handles)
+		if uint64(count) > uint64(limit) {
+			count = int(limit)
+		}
+		// SumUp write request: 12-byte header per item plus its 4-byte handle.
+		for count > 1 && (16+16*uint64(count) > uint64(c.conn.maxPayload) || 8+4*uint64(count) > uint64(c.conn.maxPayload)) {
+			count /= 2
+		}
+		if count == 1 {
+			if err := c.releaseHandleUnsafe(handles[0]); isConnectionError(err) {
+				return
+			}
+			handles = handles[1:]
+			continue
+		}
+		write := make([]byte, 16*count)
+		for i, handle := range handles[:count] {
+			binary.LittleEndian.PutUint32(write[i*12:], IndexGroupSymbolReleaseHandle)
+			binary.LittleEndian.PutUint32(write[i*12+8:], 4)
+			binary.LittleEndian.PutUint32(write[12*count+4*i:], handle)
+		}
+		_, err := c.readWriteData(IndexGroupSumUpWrite, uint32(count), uint32(4*count), write)
+		if unsupportedService(err) {
+			limit = 1 // Release individually while the budget allows.
+			continue
+		}
+		if isConnectionError(err) {
+			return
+		}
+		handles = handles[count:]
+	}
+}
+
 // Close is idempotent and spends at most one budget on total handle cleanup.
 // Active I/O is aborted immediately; a busy/desynchronized stream is not reused.
 func (c *Client) Close() {
@@ -233,8 +363,10 @@ func (c *Client) Close() {
 		defer func() { gate <- struct{}{} }()
 		c.deadline = time.Now().Add(budget)
 		if conn != nil && !conn.dead.Load() {
+			released := make(map[uint32]bool) // case aliases share one entry/handle
 			for _, entry := range c.symbols {
-				if entry.Handle != 0 {
+				if entry.Handle != 0 && !released[entry.Handle] {
+					released[entry.Handle] = true
 					err := c.releaseHandleUnsafe(entry.Handle)
 					if err != nil && errors.Is(err, ErrConnectionLost) {
 						break
@@ -328,6 +460,49 @@ func (c *Client) GetDeviceInfo() (*DeviceInfo, error) {
 
 func (c *Client) Identity() (*DeviceInfo, error) { return c.GetDeviceInfo() }
 
+// ADS states reported by ReadState (AdsState in the Beckhoff ADS specification).
+const (
+	AdsStateInvalid  uint16 = 0
+	AdsStateIdle     uint16 = 1
+	AdsStateReset    uint16 = 2
+	AdsStateInit     uint16 = 3
+	AdsStateStart    uint16 = 4
+	AdsStateRun      uint16 = 5
+	AdsStateStop     uint16 = 6
+	AdsStateConfig   uint16 = 15
+	AdsStateReconfig uint16 = 16
+)
+
+// ReadState performs ADS ReadState (command 4) on the target AMS port and
+// returns the ADS state (for example AdsStateRun) and the device state. It is a
+// cheap, read-only exchange bounded by the operation timeout and is suitable as
+// a keepalive. A transport failure closes the stream and wraps
+// ErrConnectionLost; a device rejection is returned as *AdsError and keeps the
+// stream usable. It is never retried.
+func (c *Client) ReadState() (adsState, deviceState uint16, err error) {
+	_, done, err := c.begin(false)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer done()
+	resp, err := c.exchange(CmdReadState, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	rest, err := commandResult(resp)
+	var device *AdsError
+	if err != nil {
+		if errors.As(err, &device) {
+			return 0, 0, err
+		}
+		return 0, 0, c.conn.fail(err)
+	}
+	if len(rest) != 4 {
+		return 0, 0, c.conn.fail(fmt.Errorf("ADS ReadState size %d, want 4", len(rest)))
+	}
+	return binary.LittleEndian.Uint16(rest[:2]), binary.LittleEndian.Uint16(rest[2:4]), nil
+}
+
 // Internal command helpers require operation gate ownership.
 func (c *Client) exchange(command uint16, data []byte) ([]byte, error) {
 	if c.conn == nil {
@@ -359,6 +534,27 @@ func (c *Client) readData(group, offset, size uint32) ([]byte, error) {
 	binary.LittleEndian.PutUint32(req[4:8], offset)
 	binary.LittleEndian.PutUint32(req[8:12], size)
 	return c.checkedReadResponse(c.exchange(CmdRead, req))
+}
+
+// readUpload reads one complete metadata upload whose exact size the PLC
+// advertised beforehand and loadSchema already checked against the aggregate
+// metadata budget. That budget, not the per-command value payload budget, bounds
+// the response; the request itself is still a single complete bounded read.
+func (c *Client) readUpload(group, size uint32) ([]byte, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("%w: %w", ErrConnectionLost, net.ErrClosed)
+	}
+	limit := uint64(c.conn.maxPayload)
+	if need := uint64(size) + 8; need > limit {
+		if need > uint64(^uint32(0)-38) || need > uint64(c.effectiveOptions().maxMetadata)+8 {
+			return nil, fmt.Errorf("ADS upload size %d exceeds metadata limit", size)
+		}
+		limit = need
+	}
+	req := make([]byte, 12)
+	binary.LittleEndian.PutUint32(req[:4], group)
+	binary.LittleEndian.PutUint32(req[8:12], size)
+	return c.checkedReadResponse(c.conn.sendRequestLimit(c.targetNetId, c.targetPort, CmdRead, req, c.deadline, uint32(limit)))
 }
 
 func (c *Client) readWriteData(group, offset, size uint32, write []byte) ([]byte, error) {
@@ -418,6 +614,42 @@ func symbolNameBytes(name string) ([]byte, error) {
 	return append([]byte(name), 0), nil
 }
 
+// TwinCAT symbol identifiers are ASCII and case-insensitive. Only ASCII letters
+// fold, so cache identity never depends on Unicode case-folding rules.
+func foldSymbolName(name string) string {
+	for i := 0; i < len(name); i++ {
+		if name[i] >= 'a' && name[i] <= 'z' {
+			folded := []byte(name)
+			for j := i; j < len(folded); j++ {
+				if folded[j] >= 'a' && folded[j] <= 'z' {
+					folded[j] -= 'a' - 'A'
+				}
+			}
+			return string(folded)
+		}
+	}
+	return name
+}
+
+func sameSymbolName(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if x >= 'a' && x <= 'z' {
+			x -= 'a' - 'A'
+		}
+		if y >= 'a' && y <= 'z' {
+			y -= 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Client) getSymbolInfo(name string) (*TagInfo, error) {
 	cfg := c.effectiveOptions()
 	if uint64(len(c.lookupSymbols)) >= uint64(cfg.maxSymbols) {
@@ -451,23 +683,37 @@ func (c *Client) getSymbolInfo(name string) (*TagInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	if record.info.Name != name || strictErr != nil {
-		if err := c.validateBitLookup(name, record, &budget); err != nil {
+	// TwinCAT resolves names case-insensitively and reports its canonical
+	// spelling; the record keeps that canonical name for metadata/access joins.
+	if !sameSymbolName(record.info.Name, name) || strictErr != nil {
+		canonical, err := c.validateBitLookup(name, record, &budget)
+		if err != nil {
 			return nil, err
 		}
-		record.info.Name = name // Handles always address the requested member.
+		record.info.Name = canonical // Handles always address the requested member.
 	}
 	if c.lookupSymbols == nil {
 		c.lookupSymbols = make(map[string]*symbolRecord)
 	}
-	c.lookupSymbols[name] = record
+	c.lookupSymbols[record.info.Name] = record
 	c.lookupBytes += uint64(len(payload))
 	return &record.info, nil
 }
 
+// getSymbolEntry resolves exact names first, then case-insensitively through the
+// loaded catalog, then through the PLC lookup. A differently cased request is
+// cached as an alias of the canonical entry, so both share one handle.
 func (c *Client) getSymbolEntry(name string) (*SymbolEntry, error) {
 	if entry := c.symbols[name]; entry != nil {
 		return entry, nil
+	}
+	if c.snapshot != nil {
+		if canonical := c.snapshot.folded[foldSymbolName(name)]; canonical != "" {
+			if entry := c.symbols[canonical]; entry != nil {
+				c.aliasSymbol(name, entry)
+				return entry, nil
+			}
+		}
 	}
 	if uint64(len(c.symbols)) >= uint64(c.effectiveOptions().maxSymbols) {
 		return nil, fmt.Errorf("symbol/handle cache count limit exceeded")
@@ -476,12 +722,24 @@ func (c *Client) getSymbolEntry(name string) (*SymbolEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entry := &SymbolEntry{Info: *info}
 	if c.symbols == nil {
 		c.symbols = make(map[string]*SymbolEntry)
 	}
-	c.symbols[name] = entry
+	entry := c.symbols[info.Name]
+	if entry == nil {
+		entry = &SymbolEntry{Info: *info}
+		c.symbols[info.Name] = entry
+	}
+	c.aliasSymbol(name, entry)
 	return entry, nil
+}
+
+// aliasSymbol caches a requested spelling when the count budget allows; an
+// uncached alias is only resolved again, never an error.
+func (c *Client) aliasSymbol(name string, entry *SymbolEntry) {
+	if c.symbols[name] == nil && uint64(len(c.symbols)) < uint64(c.effectiveOptions().maxSymbols) {
+		c.symbols[name] = entry
+	}
 }
 
 func (c *Client) acquireHandle(name string) (uint32, error) {
@@ -762,7 +1020,7 @@ func (c *Client) Write(name string, value interface{}) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		err = c.loadSchemaForIO()
 		if staleSymbolError(err) && attempt == 0 {
-			c.invalidateCaches()
+			c.invalidateLive()
 			continue
 		}
 		if err != nil {
@@ -770,6 +1028,7 @@ func (c *Client) Write(name string, value interface{}) error {
 		}
 		break
 	}
+	c.trimLookupCaches(1)
 	before := c.symbolVersion
 	entry, err := c.getSymbolEntry(name)
 	if err != nil {
@@ -778,7 +1037,7 @@ func (c *Client) Write(name string, value interface{}) error {
 	if !entry.Info.IsWritable() {
 		return fmt.Errorf("symbol %q is read-only", name)
 	}
-	paths, err := c.readOnlyPaths(name)
+	paths, err := c.readOnlyPaths(entry.Info.Name) // canonical spelling of the catalog index
 	if err != nil {
 		return err
 	}
@@ -793,9 +1052,10 @@ func (c *Client) Write(name string, value interface{}) error {
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", name, err)
 	}
+	cachedHandle := entry.Handle != 0
 	if err := c.ensureHandle(name, entry); err != nil {
 		if staleSymbolError(err) {
-			c.invalidateCaches()
+			c.invalidateLive()
 		}
 		return err
 	}
@@ -806,8 +1066,10 @@ func (c *Client) Write(name string, value interface{}) error {
 		return &AdsError{Code: ErrDeviceSymbolVersionInvalid}
 	}
 	err = c.writeData(IndexGroupSymbolValueByHandle, entry.Handle, data)
-	if staleSymbolError(err) {
-		c.invalidateCaches()
+	// A rejected write was not performed, but it is still never replayed: the
+	// next operation re-resolves the stale handle and metadata instead.
+	if staleSymbolError(err) || (cachedHandle && staleHandleNotFound(err)) {
+		c.invalidateLive()
 	}
 	if isConnectionError(err) {
 		return fmt.Errorf("write outcome uncertain; value may have been sent: %w", err)
@@ -847,6 +1109,7 @@ func (c *Client) Describe(name string) (*metadata.Symbol, error) {
 			}
 			return nil, err
 		}
+		c.trimLookupCaches(1)
 		entry, err := c.getSymbolEntry(name)
 		if err != nil {
 			return nil, err
@@ -858,11 +1121,11 @@ func (c *Client) Describe(name string) (*metadata.Symbol, error) {
 		if err != nil {
 			return nil, err
 		}
-		paths, err := c.readOnlyPaths(name)
+		paths, err := c.readOnlyPaths(entry.Info.Name)
 		if err != nil {
 			return nil, err
 		}
-		rootReadOnly, err := describeAccess(&typeOf, name, paths, &budget)
+		rootReadOnly, err := describeAccess(&typeOf, entry.Info.Name, paths, &budget)
 		if err != nil {
 			return nil, err
 		}
@@ -877,7 +1140,7 @@ func (c *Client) Describe(name string) (*metadata.Symbol, error) {
 			}
 			return nil, &AdsError{Code: ErrDeviceSymbolVersionInvalid}
 		}
-		return &metadata.Symbol{Name: entry.Info.Name, Type: typeOf, Readable: entry.Info.IsReadable(), Writable: entry.Info.IsWritable() && !rootReadOnly}, nil
+		return &metadata.Symbol{Name: name, Type: typeOf, Readable: entry.Info.IsReadable(), Writable: entry.Info.IsWritable() && !rootReadOnly}, nil
 	}
 	panic("unreachable")
 }

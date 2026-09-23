@@ -7,8 +7,8 @@ import "github.com/yatesdr/plcio/cip"
 // fall back to 504 bytes instead of the Large Forward Open size.
 func (c *Client) readBatchSize(names []string) int {
 	budget := 480
-	if c.plc.cipConn != nil && c.plc.connSize > 2 {
-		budget = int(c.plc.connSize) - 2 // Connected sequence number.
+	if conn, connSize := c.plc.activeConn(); conn != nil && connSize > 2 {
+		budget = int(connSize) - 2 // Connected sequence number.
 	} else if len(c.plc.RoutePath) > 0 {
 		budget -= 13 + len(c.plc.RoutePath) // Unconnected Send wrapper and padding.
 	}

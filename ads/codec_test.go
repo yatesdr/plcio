@@ -91,8 +91,14 @@ func TestTimeReadSemantics(t *testing.T) {
 		} else {
 			binary.LittleEndian.PutUint64(bytes, schema.timeOfDayLimit)
 		}
-		if _, err := decodeValue(schema, bytes, defaultOptions()); err == nil {
-			t.Fatalf("invalid %s accepted", name)
+		// Reads return the raw count since midnight even when >= 24h (L4): a
+		// successful read must not turn into an error. Writes stay strict.
+		got, err := decodeValue(schema, bytes, defaultOptions())
+		if err != nil || got != schema.timeOfDayLimit {
+			t.Fatalf("%s at 24h: %v %v", name, got, err)
+		}
+		if _, err := encodeValue(schema, schema.timeOfDayLimit, defaultOptions()); err == nil {
+			t.Fatalf("out-of-range %s write accepted", name)
 		}
 	}
 }

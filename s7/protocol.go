@@ -15,6 +15,8 @@ const (
 	s7MsgAck     = 0x02 // Acknowledgement without data
 	s7MsgAckData = 0x03 // Acknowledgement with data
 
+	s7MsgUserData = 0x07 // UserData (SZL reads etc.)
+
 	// Functions
 	s7FuncSetupComm = 0xF0
 	s7FuncRead      = 0x04
@@ -47,6 +49,10 @@ const (
 	tsDWORD = 0x06
 	tsDINT  = 0x07
 	tsREAL  = 0x08
+	// S5 timers/counters (Snap7 S7WLCounter / S7WLTimer): the S7ANY address
+	// is the timer/counter number itself, not a bit address.
+	tsCOUNTER = 0x1C
+	tsTIMER   = 0x1D
 
 	// S7ANY constants
 	s7AnySpecType = 0x12
@@ -108,7 +114,30 @@ func parseSetupCommResponse(data []byte) (uint16, error) {
 
 	// Extract negotiated PDU size (last 2 bytes of params)
 	pduSize := binary.BigEndian.Uint16(data[18:20])
+	// Every S7 CPU supports at least 240 bytes (S7-300/1200 negotiate 240,
+	// S7-400 480, S7-1500 960). A smaller value would make the request/response
+	// size arithmetic go negative, so treat it as a broken peer.
+	if pduSize < minPDUSize {
+		return 0, fmt.Errorf("implausible negotiated PDU size %d (min %d)", pduSize, minPDUSize)
+	}
+	// The negotiated size can never legitimately exceed what we asked for.
+	if pduSize > maxPDUSize {
+		logging.DebugLog("S7", "PLC negotiated PDU %d above requested %d, using %d", pduSize, maxPDUSize, maxPDUSize)
+		pduSize = maxPDUSize
+	}
 	return pduSize, nil
+}
+
+// itemByteLen converts a read-response data item length to bytes. Following
+// Snap7, the BIT (0x03), REAL (0x07) and OCTET STRING (0x09) response
+// transport sizes carry a byte length; all others carry a bit length.
+func itemByteLen(transportSize byte, length uint16) int {
+	switch transportSize {
+	case 0x03, 0x07, 0x09:
+		return int(length)
+	default:
+		return int((length + 7) / 8)
+	}
 }
 
 // buildReadRequest creates an S7 Read Variable request PDU.
@@ -231,8 +260,21 @@ func parseReadResponse(data []byte, count int) ([][]byte, []error) {
 			errMsg := dataItemError(returnCode)
 			logging.DebugLog("S7", "parseReadResponse item %d: error returnCode=0x%02X (%s)", i, returnCode, errMsg)
 			errors[i] = fmt.Errorf("%s", errMsg)
-			// Skip past this item - S7 error items are 1 byte (just the return code)
-			pos++
+			// A failed item still carries the full 4-byte item header (return
+			// code, transport size 0x00, length 0x0000) plus any data it
+			// declares (normally none), then the fill byte rule below.
+			if pos+4 > len(data) {
+				// Truncated error item - nothing after it can be located
+				for j := i + 1; j < count; j++ {
+					errors[j] = fmt.Errorf("unexpected end of data (item %d of %d)", j+1, count)
+				}
+				break
+			}
+			errLen := itemByteLen(data[pos+1], binary.BigEndian.Uint16(data[pos+2:pos+4]))
+			pos += 4 + errLen
+			if i < count-1 && errLen%2 == 1 {
+				pos++
+			}
 			continue
 		}
 
@@ -252,23 +294,15 @@ func parseReadResponse(data []byte, count int) ([][]byte, []error) {
 
 		// Calculate byte length from response
 		// S7 response transport sizes differ from request codes:
-		//   0x03 = BIT access (length in bits)
-		//   0x04 = BYTE/WORD/INT access (length in bits)
+		//   0x03 = BIT access (length in bytes)
+		//   0x04 = BYTE/WORD/DWORD access (length in bits)
 		//   0x05 = INTEGER (length in bits)
 		//   0x06 = DINT (length in bits)
-		//   0x07 = REAL (length in bits)
+		//   0x07 = REAL (length in bytes)
 		//   0x09 = OCTET STRING (length in bytes)
-		// Only 0x09 (octet string) has length in bytes; all others are in bits
-		var byteLen int
-		if transportSize == 0x09 {
-			// Octet string: length is in bytes
-			byteLen = int(dataLen)
-		} else {
-			// All other types: length is in bits
-			byteLen = int((dataLen + 7) / 8)
-		}
+		byteLen := itemByteLen(transportSize, dataLen)
 
-		logging.DebugLog("S7", "parseReadResponse item %d: transportSize=0x%02X dataLen=%d (bits) byteLen=%d pos=%d remaining=%d",
+		logging.DebugLog("S7", "parseReadResponse item %d: transportSize=0x%02X dataLen=%d byteLen=%d pos=%d remaining=%d",
 			i, transportSize, dataLen, byteLen, pos, len(data)-pos)
 
 		pos += 4 // Skip header
@@ -321,7 +355,14 @@ func buildWriteRequest(addr *Address, writeData []byte, pduRef uint16) []byte {
 		s7FuncWrite, // Function: Write Variable
 		0x01,        // Item count: 1
 	}
-	params = append(params, addressToS7Any(addr)...)
+	// Declare exactly the data being sent: BYTE-transport items count bytes,
+	// WORD/DWORD/REAL-transport items count elements, BIT items count 1.
+	item := *addr
+	item.Size = len(writeData)
+	if size := TypeSize(addr.DataType); size > 0 && len(writeData)%size == 0 {
+		item.Count = len(writeData) / size
+	}
+	params = append(params, addressToS7Any(&item)...)
 
 	// Data section transport size differs from parameter section:
 	// - 0x03 for BIT access (length in bits)
@@ -329,9 +370,19 @@ func buildWriteRequest(addr *Address, writeData []byte, pduRef uint16) []byte {
 	// - 0x09 for OCTET STRING (length in bytes)
 	var dataTransportSize byte
 	var bitLen int
-	if addr.BitNum >= 0 {
+	if isTimerCounter(addr) {
+		// Snap7 sends timer/counter data as OCTET STRING, length in bytes
+		dataTransportSize = 0x09
+		bitLen = len(writeData)
+	} else if addr.BitNum >= 0 {
 		dataTransportSize = 0x03 // BIT
 		bitLen = 1
+	} else if getTransportSize(addr.DataType, false) == tsREAL {
+		// REAL items (parameter transport 0x08) carry data transport 0x07
+		// with the length in bytes, as Snap7 sends them (TS_ResReal); an
+		// S7-1200 rejects 0x04 here with "data type/size mismatch".
+		dataTransportSize = 0x07
+		bitLen = len(writeData)
 	} else {
 		dataTransportSize = 0x04 // BYTE/WORD/DWORD
 		bitLen = len(writeData) * 8
@@ -427,7 +478,17 @@ func addressToS7Any(addr *Address) []byte {
 
 	// Determine count - the number of transport-sized elements to read
 	var count int
-	if addr.BitNum >= 0 {
+	if isTimerCounter(addr) {
+		// Snap7 (s7_micro_client.cpp, opReadArea/opWriteArea): timers and
+		// counters use area 0x1D/0x1C with transport size S7WLTimer (0x1D) /
+		// S7WLCounter (0x1C), the element count, and the raw timer/counter
+		// number as the address (no <<3). Each element is one 2-byte word.
+		transportSize = tsTIMER
+		if addr.Area == AreaC {
+			transportSize = tsCOUNTER
+		}
+		count = max(addr.Count, 1)
+	} else if addr.BitNum >= 0 {
 		count = 1 // Single bit
 	} else if transportSize == tsBYTE || transportSize == tsCHAR {
 		// For byte transport, count is in bytes
@@ -443,7 +504,9 @@ func addressToS7Any(addr *Address) []byte {
 	// Encode address: (byte_offset << 3) | bit_number
 	// 24-bit big-endian
 	bitAddr := addr.Offset * 8
-	if addr.BitNum >= 0 {
+	if isTimerCounter(addr) {
+		bitAddr = addr.Offset
+	} else if addr.BitNum >= 0 {
 		bitAddr += addr.BitNum
 	}
 
@@ -467,6 +530,66 @@ func addressToS7Any(addr *Address) []byte {
 	}
 }
 
+// isTimerCounter reports whether addr is in the S5 timer or counter area.
+func isTimerCounter(addr *Address) bool {
+	return addr.Area == AreaT || addr.Area == AreaC
+}
+
+// buildSZLRequest builds a UserData "read SZL" request (first/only fragment),
+// byte-identical to Snap7's S7_SZL_FIRST template apart from the PDU
+// reference, SZL ID and index.
+func buildSZLRequest(id, index, pduRef uint16) []byte {
+	return []byte{
+		s7ProtocolID, s7MsgUserData, 0x00, 0x00, // header
+		byte(pduRef >> 8), byte(pduRef), // PDU reference
+		0x00, 0x08, // parameter length
+		0x00, 0x08, // data length
+		0x00, 0x01, 0x12, // parameter head
+		0x04,       // parameter length
+		0x11,       // method: request
+		0x44,       // type 4 (request) | function group 4 (CPU functions)
+		0x01,       // subfunction: read SZL
+		0x00,       // sequence number
+		0xFF,       // return code
+		0x09,       // transport size: octet string
+		0x00, 0x04, // data length
+		byte(id >> 8), byte(id), byte(index >> 8), byte(index),
+	}
+}
+
+// parseSZLResponse checks a UserData read-SZL response and returns its data
+// section (SZL ID, index, record length, record count, records). A CPU that
+// refuses the SZL (e.g. 0xD401 "SZL not available") yields an S7 error.
+func parseSZLResponse(data []byte) ([]byte, error) {
+	if len(data) < 10 || data[0] != s7ProtocolID || data[1] != s7MsgUserData {
+		return nil, fmt.Errorf("invalid SZL response")
+	}
+	paramLen := int(binary.BigEndian.Uint16(data[6:8]))
+	dataLen := int(binary.BigEndian.Uint16(data[8:10]))
+	if paramLen < 12 || 10+paramLen+dataLen > len(data) {
+		return nil, fmt.Errorf("SZL response lengths invalid (param %d, data %d, total %d)", paramLen, dataLen, len(data))
+	}
+	params := data[10 : 10+paramLen]
+	if params[5]&0x0F != 0x04 || params[6] != 0x01 {
+		return nil, fmt.Errorf("SZL response is not a read-SZL answer (type 0x%02X, subfunction 0x%02X)", params[5], params[6])
+	}
+	if code := binary.BigEndian.Uint16(params[10:12]); code != 0 {
+		return nil, fmt.Errorf("SZL read refused by CPU (error 0x%04X)", code)
+	}
+	d := data[10+paramLen : 10+paramLen+dataLen]
+	if len(d) < 4 {
+		return nil, fmt.Errorf("SZL response data too short")
+	}
+	if d[0] != dataItemSuccess {
+		return nil, fmt.Errorf("SZL read failed: %s", dataItemError(d[0]))
+	}
+	n := int(binary.BigEndian.Uint16(d[2:4]))
+	if 4+n > len(d) {
+		return nil, fmt.Errorf("SZL response data truncated")
+	}
+	return d[4 : 4+n], nil
+}
+
 // getTransportSize returns the S7 transport size code for a data type.
 func getTransportSize(dataType uint16, isBit bool) byte {
 	if isBit {
@@ -479,7 +602,7 @@ func getTransportSize(dataType uint16, isBit bool) byte {
 		return tsBIT
 	case TypeByte, TypeSInt, TypeChar:
 		return tsBYTE
-	case TypeWord, TypeInt, TypeDate, TypeWChar:
+	case TypeWord, TypeInt, TypeDate, TypeWChar, TypeS5Time:
 		return tsWORD
 	case TypeDWord, TypeDInt, TypeTime, TypeTimeOfDay:
 		return tsDWORD

@@ -91,10 +91,11 @@ const (
 	ControlBitFD = 8  // Found
 )
 
-// PLCType distinguishes the PCCC processor family.
-// When using PCCC-over-CIP via EtherNet/IP, all three processor families use the same
-// SLC Protected Typed Logical Read/Write commands (FNC 0xA2/0xAA). The PLCType is stored
-// for identification/logging but does not currently change the wire protocol behavior.
+// PLCType distinguishes the PCCC processor family. It selects the command set:
+// SLC 500 and MicroLogix use the SLC Protected Typed Logical commands
+// (FNC 0xA2/0xAA/0xAB) with decimal addresses; PLC-5 uses Typed Read/Write
+// (FNC 0x68/0x67) and Read-Modify-Write (FNC 0x26) with logical binary
+// addresses, and its I/O word/bit numbers are octal (see ParseAddressFor).
 type PLCType byte
 
 const (

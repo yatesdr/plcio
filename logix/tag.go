@@ -91,42 +91,28 @@ func (t TagInfo) IsArray() bool {
 }
 
 // GetArrayDimensions fetches the array dimensions for a tag using Get Attribute Single.
-// First tries attribute 8 (byte count), then falls back to attribute 3 (dimensions).
-// Returns nil for scalars. The instance ID must be from the tag's discovery.
+// First tries attribute 8 (array dimensions, 3 x UDINT), then falls back to
+// attribute 3. Returns nil for scalars. The instance ID must be from the
+// tag's discovery.
 func (p *PLC) GetArrayDimensions(instance uint32, typeCode uint16) ([]int, error) {
 	// Check if this is an array type
 	if !IsArrayType(typeCode) {
 		return nil, nil // Not an array
 	}
+	numDims := ArrayDimensions(typeCode)
 
 	var attr8Err, attr3Err error
 
-	// Try attribute 8 (byte count) - more widely supported
-	byteCount, err := p.getSymbolByteCount(instance)
+	// Attribute 8 holds the dimensions themselves (the same values the
+	// symbol list returns), not a byte count.
+	dims, err := p.getSymbolDimensionsAttr8(instance, numDims)
 	if err != nil {
 		attr8Err = err
-	} else if byteCount > 0 {
-		baseType := BaseType(typeCode)
-		elemSize := TypeSize(baseType)
-		if elemSize > 0 {
-			elementCount := int(byteCount) / elemSize
-			if elementCount > 1 {
-				return []int{elementCount}, nil
-			}
-		}
+	} else if len(dims) > 0 {
+		return dims, nil
 	}
 
-	// Fall back to attribute 3 (dimensions) for ControlLogix
-	numDims := ArrayDimensions(typeCode)
-	if numDims == 0 {
-		// Can't try attribute 3 - return attribute 8 error if we had one
-		if attr8Err != nil {
-			return nil, fmt.Errorf("attr8: %w", attr8Err)
-		}
-		return nil, nil
-	}
-
-	dims, err := p.getSymbolDimensions(instance, numDims)
+	dims, err = p.getSymbolDimensions(instance, numDims)
 	if err != nil {
 		attr3Err = err
 	} else if len(dims) > 0 {
@@ -146,8 +132,10 @@ func (p *PLC) GetArrayDimensions(instance uint32, typeCode uint16) ([]int, error
 	return nil, nil
 }
 
-// getSymbolByteCount fetches attribute 8 (byte count) from a Symbol Object instance.
-func (p *PLC) getSymbolByteCount(instance uint32) (uint32, error) {
+// getSymbolDimensionsAttr8 fetches attribute 8 (array dimensions, up to
+// three UDINTs) from a Symbol Object instance and returns the first numDims
+// non-zero dimensions.
+func (p *PLC) getSymbolDimensionsAttr8(instance uint32, numDims int) ([]int, error) {
 	// Build path to Symbol Object, specific instance, attribute 8
 	builder := cip.EPath().Class(0x6B)
 	if instance <= 0xFF {
@@ -159,7 +147,7 @@ func (p *PLC) getSymbolByteCount(instance uint32) (uint32, error) {
 	}
 	path, err := builder.Attribute(8).Build()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	// Build Get Attribute Single request
@@ -170,28 +158,34 @@ func (p *PLC) getSymbolByteCount(instance uint32) (uint32, error) {
 
 	cipResp, err := p.sendCipRequest(reqData)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	if len(cipResp) < 4 {
-		return 0, fmt.Errorf("response too short")
+		return nil, fmt.Errorf("response too short")
 	}
 
 	status := cipResp[2]
 	addlStatusSize := cipResp[3]
 
 	if status != StatusSuccess {
-		return 0, parseCipError(status, addlStatusSize, cipResp[4:])
+		return nil, parseCipError(status, addlStatusSize, cipResp[4:])
 	}
 
-	// Parse byte count (UDINT - 4 bytes)
 	dataStart := 4 + int(addlStatusSize)*2
-	if len(cipResp) < dataStart+4 {
-		return 0, fmt.Errorf("insufficient data for byte count")
+	if dataStart+4 > len(cipResp) {
+		return nil, fmt.Errorf("insufficient data for array dimensions")
 	}
-
-	byteCount := binary.LittleEndian.Uint32(cipResp[dataStart : dataStart+4])
-	return byteCount, nil
+	data := cipResp[dataStart:]
+	var dims []int
+	for d := 0; d < numDims && 4*d+4 <= len(data); d++ {
+		size := binary.LittleEndian.Uint32(data[4*d:])
+		if size == 0 {
+			break
+		}
+		dims = append(dims, int(size))
+	}
+	return dims, nil
 }
 
 // GetTemplateSize returns the size in bytes of a structure/UDT type.
@@ -318,6 +312,9 @@ func (p *PLC) getSymbolDimensions(instance uint32, numDims int) ([]int, error) {
 	}
 
 	dataStart := 4 + int(addlStatusSize)*2
+	if dataStart > len(cipResp) {
+		return nil, fmt.Errorf("additional status (%d words) exceeds %d-byte response", addlStatusSize, len(cipResp))
+	}
 	data := cipResp[dataStart:]
 
 	if len(data) < numDims*4 {
@@ -563,8 +560,9 @@ func (p *PLC) buildSymbolPath(scope string, startInstance uint32) (cip.EPath_t, 
 // - Offset 4: Name length (2 bytes, UINT)
 // - Offset 6: Tag name (nameLen bytes)
 // - Offset 6+nameLen: Symbol type (2 bytes, UINT)
-// - Offset 8+nameLen: Array size (2 bytes, UINT) - element count for arrays
-// - Remaining bytes up to nameLen+20: additional metadata
+// - Offset 8+nameLen: Attribute 8, array dimensions (3 x UDINT: dim0..dim2)
+//
+// The symbol type's bits 13..14 give how many dimensions are in use.
 func parseSymbolListResponse(data []byte) (tags []TagInfo, lastInstance uint32) {
 	i := 0
 
@@ -595,9 +593,6 @@ func parseSymbolListResponse(data []byte) (tags []TagInfo, lastInstance uint32) 
 		// Symbol type at offset 6+nameLen (UINT - 2 bytes)
 		typeCode := binary.LittleEndian.Uint16(entry[6+nameLen : 8+nameLen])
 
-		// Array size at offset 8+nameLen (UINT - 2 bytes) - element count for arrays
-		arraySize := binary.LittleEndian.Uint16(entry[8+nameLen : 10+nameLen])
-
 		// Move to next entry
 		i += entrySize
 
@@ -606,10 +601,15 @@ func parseSymbolListResponse(data []byte) (tags []TagInfo, lastInstance uint32) 
 			continue
 		}
 
-		// Calculate dimensions from array size for array types
+		// Attribute 8 holds up to three UDINT dimensions; keep as many as
+		// the symbol type declares, stopping at an unset (zero) dimension.
 		var dimensions []int
-		if IsArrayType(typeCode) && arraySize > 0 {
-			dimensions = []int{int(arraySize)}
+		for d := 0; d < ArrayDimensions(typeCode); d++ {
+			size := binary.LittleEndian.Uint32(entry[8+nameLen+4*d:])
+			if size == 0 {
+				break
+			}
+			dimensions = append(dimensions, int(size))
 		}
 
 		tags = append(tags, TagInfo{

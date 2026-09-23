@@ -197,7 +197,9 @@ func TestPartialReadEOF(t *testing.T) {
 
 func TestF080FailedSlotStillConsumesRequestedBytes(t *testing.T) {
 	// Independent F080 fixture: two result words, then both requested 4-byte
-	// slots. First fails, second must still decode from its own slot.
+	// slots. First fails, second must still decode from its own slot. The
+	// failure is access-denied: not-found through a cached handle is stale and
+	// correctly triggers one re-resolution (TestCachedHandleNotFoundReResolvesOnce).
 	c := testClient(t, func(request []byte) []byte {
 		group := binary.LittleEndian.Uint32(request[38:42])
 		if group == 0xf006 {
@@ -206,7 +208,7 @@ func TestF080FailedSlotStillConsumesRequestedBytes(t *testing.T) {
 		if group != 0xf080 {
 			t.Errorf("batch group: %x", group)
 		}
-		return testReadReply([]byte{0x10, 7, 0, 0, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 25, 0, 0, 0})
+		return testReadReply([]byte{0x23, 7, 0, 0, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 25, 0, 0, 0})
 	})
 	seedDINT(c, "MAIN.a", 1)
 	seedDINT(c, "MAIN.b", 2)

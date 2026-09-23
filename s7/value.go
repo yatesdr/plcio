@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"time"
 )
 
 // TagValue represents the result of reading an S7 address with type conversion helpers.
@@ -17,7 +18,8 @@ type TagValue struct {
 }
 
 // Bool returns the tag value as a boolean.
-// Works for BOOL type or extracts a specific bit from a byte.
+// Bit addresses (e.g. DB1.DBX12.2) are read with BIT transport, so the PLC
+// returns the addressed bit itself as 0x00/0x01 regardless of BitNum.
 func (v *TagValue) Bool() (bool, error) {
 	if v.Error != nil {
 		return false, v.Error
@@ -25,13 +27,6 @@ func (v *TagValue) Bool() (bool, error) {
 	if len(v.Bytes) < 1 {
 		return false, fmt.Errorf("insufficient data for BOOL")
 	}
-
-	if v.BitNum >= 0 && v.BitNum <= 7 {
-		// Extract specific bit
-		return (v.Bytes[0] & (1 << v.BitNum)) != 0, nil
-	}
-
-	// Non-bit BOOL (full byte)
 	return v.Bytes[0] != 0, nil
 }
 
@@ -133,8 +128,11 @@ func (v *TagValue) Float() (float64, error) {
 //   - BYTE, WORD, DWORD, ULINT -> uint64 (or []uint64 for arrays)
 //   - REAL, LREAL -> float64 (or []float64 for arrays)
 //   - CHAR, WCHAR -> uint64 (character code)
-//   - TIME, TIME_OF_DAY -> int64 (milliseconds)
+//   - TIME -> int64 (signed milliseconds; []int64 for arrays)
+//   - TIME_OF_DAY -> int64 (milliseconds since midnight)
+//   - S5TIME -> int64 (milliseconds)
 //   - DATE -> int64 (days since 1990-01-01)
+//   - DATE_AND_TIME, DTL -> time.Time (PLC wall clock, reported as UTC)
 //   - Unknown -> []int (byte array for JSON compatibility)
 //
 // Note: S7 uses big-endian byte order natively.
@@ -171,9 +169,7 @@ func (v *TagValue) parseScalar(baseType uint16) interface{} {
 	switch baseType {
 	case TypeBool:
 		if len(v.Bytes) >= 1 {
-			if v.BitNum >= 0 && v.BitNum <= 7 {
-				return (v.Bytes[0] & (1 << v.BitNum)) != 0
-			}
+			// BIT transport returns the addressed bit as 0x00/0x01
 			return v.Bytes[0] != 0
 		}
 	case TypeSInt:
@@ -213,9 +209,25 @@ func (v *TagValue) parseScalar(baseType uint16) interface{} {
 			bits := binary.BigEndian.Uint32(v.Bytes)
 			return float64(math.Float32frombits(bits))
 		}
-	case TypeTime, TypeTimeOfDay:
+	case TypeTime:
 		if len(v.Bytes) >= 4 {
-			return int64(binary.BigEndian.Uint32(v.Bytes)) // Milliseconds
+			return int64(int32(binary.BigEndian.Uint32(v.Bytes))) // Signed milliseconds
+		}
+	case TypeTimeOfDay:
+		if len(v.Bytes) >= 4 {
+			return int64(binary.BigEndian.Uint32(v.Bytes)) // Milliseconds since midnight
+		}
+	case TypeS5Time:
+		if ms, err := decodeS5Time(v.Bytes); err == nil {
+			return ms
+		}
+	case TypeDateAndTime:
+		if t, err := decodeDateAndTime(v.Bytes); err == nil {
+			return t
+		}
+	case TypeDTL:
+		if t, err := decodeDTL(v.Bytes); err == nil {
+			return t
 		}
 	case TypeLInt:
 		if len(v.Bytes) >= 8 {
@@ -240,18 +252,9 @@ func (v *TagValue) parseScalar(baseType uint16) interface{} {
 			return string(v.Bytes[2 : 2+strLen])
 		}
 	case TypeWString:
-		// S7 WString format: 2 bytes max length, 2 bytes actual length, then UTF-16BE chars
+		// S7 WString format: 2 bytes max length, 2 bytes actual length, then UTF-16BE code units
 		if len(v.Bytes) >= 4 {
-			strLen := int(binary.BigEndian.Uint16(v.Bytes[2:4])) * 2 // UTF-16 chars
-			if strLen > len(v.Bytes)-4 {
-				strLen = len(v.Bytes) - 4
-			}
-			// Simple ASCII extraction from UTF-16BE
-			result := make([]byte, strLen/2)
-			for i := 0; i < len(result); i++ {
-				result[i] = v.Bytes[4+i*2+1] // Low byte of UTF-16BE
-			}
-			return string(result)
+			return decodeWString(v.Bytes)
 		}
 	}
 
@@ -327,7 +330,40 @@ func (v *TagValue) parseArray(baseType uint16) interface{} {
 		}
 		return result
 
-	case TypeDWord, TypeTime, TypeTimeOfDay: // TypeUDInt is an alias for TypeDWord
+	case TypeTime:
+		result := make([]int64, count)
+		for i := 0; i < count; i++ {
+			result[i] = int64(int32(binary.BigEndian.Uint32(v.Bytes[i*4:])))
+		}
+		return result
+
+	case TypeS5Time:
+		result := make([]int64, count)
+		for i := 0; i < count; i++ {
+			ms, err := decodeS5Time(v.Bytes[i*2:])
+			if err != nil {
+				return v.bytesToIntArray()
+			}
+			result[i] = ms
+		}
+		return result
+
+	case TypeDateAndTime, TypeDTL:
+		result := make([]time.Time, count)
+		for i := 0; i < count; i++ {
+			var err error
+			if baseType == TypeDTL {
+				result[i], err = decodeDTL(v.Bytes[i*elemSize:])
+			} else {
+				result[i], err = decodeDateAndTime(v.Bytes[i*elemSize:])
+			}
+			if err != nil {
+				return v.bytesToIntArray()
+			}
+		}
+		return result
+
+	case TypeDWord, TypeTimeOfDay: // TypeUDInt is an alias for TypeDWord
 		result := make([]uint64, count)
 		for i := 0; i < count; i++ {
 			offset := i * 4
@@ -419,16 +455,7 @@ func (v *TagValue) parseWStringArray() []string {
 	if count == 0 {
 		// Try to parse as a single wstring if we have at least the header
 		if len(v.Bytes) >= 4 {
-			strLen := int(binary.BigEndian.Uint16(v.Bytes[2:4])) * 2
-			if strLen > len(v.Bytes)-4 {
-				strLen = len(v.Bytes) - 4
-			}
-			// Simple ASCII extraction from UTF-16BE
-			chars := make([]byte, strLen/2)
-			for j := 0; j < len(chars); j++ {
-				chars[j] = v.Bytes[4+j*2+1]
-			}
-			return []string{string(chars)}
+			return []string{decodeWString(v.Bytes)}
 		}
 		return []string{}
 	}
@@ -439,19 +466,7 @@ func (v *TagValue) parseWStringArray() []string {
 		if offset+4 > len(v.Bytes) {
 			break
 		}
-		strLen := int(binary.BigEndian.Uint16(v.Bytes[offset+2:offset+4])) * 2 // UTF-16 char count * 2
-		if strLen > 508 {
-			strLen = 508
-		}
-		if offset+4+strLen > len(v.Bytes) {
-			strLen = len(v.Bytes) - offset - 4
-		}
-		// Simple ASCII extraction from UTF-16BE
-		chars := make([]byte, strLen/2)
-		for j := 0; j < len(chars); j++ {
-			chars[j] = v.Bytes[offset+4+j*2+1]
-		}
-		result[i] = string(chars)
+		result[i] = decodeWString(v.Bytes[offset : offset+elemSize])
 	}
 	return result
 }

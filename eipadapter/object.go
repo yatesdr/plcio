@@ -14,6 +14,8 @@ type ObjectRequest struct {
 	Data     []byte // service-specific payload (after path)
 	Session  uint32 // EIP session handle that originated this (0 for UDP)
 	ConnID   uint32 // connection ID if connected; 0 if unconnected
+
+	origin *peerAddr // originator's I/O address (TCP peer); nil if unknown
 }
 
 // ObjectResponse is what an Object returns.

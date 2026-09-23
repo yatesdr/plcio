@@ -55,13 +55,11 @@ func (e *EipClient) ListIdentityTCP() ([]Identity, error) {
 		data:          nil,
 	}
 
-	err := e.sendEncap(req)
+	// transactEncap applies the client's read/write timeout so an unresponsive
+	// peer cannot hold the client mutex indefinitely.
+	resp, err := e.transactEncap(req)
 	if err != nil {
-		return nil, fmt.Errorf("ListIdentityTCP: failed to transmit message.  %w", err)
-	}
-	resp, err := e.recvEncap()
-	if err != nil {
-		return nil, fmt.Errorf("ListIdentityTCP: failed to read response: %w", err)
+		return nil, fmt.Errorf("ListIdentityTCP: %w", err)
 	}
 	if resp.status != 0 {
 		return nil, fmt.Errorf("ListIdentityTCP: encapsulation status=0x%08x", resp.status)

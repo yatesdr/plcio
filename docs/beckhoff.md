@@ -39,6 +39,9 @@ A reachable TCP host does not establish an ADS route. Configure the PLC's existi
 route for the local AMS identity and source IP. plcio does not install routes,
 control the runtime or deploy a PLC program. TCP defaults to port 48898; target
 runtime AMS port defaults to 851. TwinCAT 2 commonly uses AMS port 801.
+Without `AmsNetId` the target NetID is assumed to be the IP plus `.1.1`; when it
+differs, set it explicitly. Discovery reports the real value in
+`Extra["amsNetId"]` (see [Discovery](#discovery-and-validation-status)).
 
 For a configured local route, use the additive adapter constructor:
 
@@ -56,6 +59,9 @@ or IPv6 TCP endpoint requires an explicit target AMS identity; a local IPv6
 connection also needs an explicit local identity. IPv6 subnet discovery is unsupported.
 Reconnect dials the original TCP endpoint and retains all identity and resource
 options. It verifies device identity before publishing the new connection.
+Calling the adapter's `Connect` again first closes the previous client (releasing
+its handles), because the TwinCAT router may reject a second connection from the
+same AMS Net ID; until the new session is verified the adapter reports not connected.
 
 ## Values and metadata
 
@@ -93,6 +99,10 @@ catalog members. `TagInfo.Dimensions` contains effective axis lengths when resol
 Names, declarations and dimensions come from one snapshot within one operation
 timeout. A detected generation change discards the complete result and permits
 one refresh within that same timeout.
+Symbol names are case-insensitive, as in TwinCAT: `main.n` and `MAIN.n` resolve
+to the same symbol and share one handle (ASCII letters only are folded). Read and
+Describe results report the spelling the caller requested; catalog entries,
+read-only checks and schemas use the PLC's published spelling.
 `Programs()` loads the catalog and returns sorted published top-level namespaces,
 e.g. `GVL`, `MAIN`; it is a namespace projection, not a PLC POU enumerator. An empty
 catalog yields an empty list.
@@ -117,11 +127,15 @@ interface and existing configuration/result field layouts remain unchanged.
 | Declaration | Go type | Unit / epoch |
 |---|---|---|
 | TIME | `uint64` | Unsigned milliseconds, 4-byte storage |
-| TOD / TIME_OF_DAY | `uint64` | Milliseconds since midnight, less than 86,400,000 |
+| TOD / TIME_OF_DAY | `uint64` | Milliseconds since midnight; writes must be less than 86,400,000 |
 | DATE / DT / DATE_AND_TIME | `uint64` | Seconds from 1970-01-01, 4-byte storage |
 | LTIME | `uint64` | Unsigned nanoseconds, 8-byte storage |
-| LTOD / LTIME_OF_DAY | `uint64` | Nanoseconds since midnight, less than 86,400,000,000,000 |
+| LTOD / LTIME_OF_DAY | `uint64` | Nanoseconds since midnight; writes must be less than 86,400,000,000,000 |
 | LDATE / LDT / LDATE_AND_TIME | `int64` | Library contract: signed nanoseconds from 1970-01-01 |
+
+TOD/LTOD reads are not range-checked: a stored value of 24 hours or more (which
+the PLC can hold, for example after arithmetic) is returned as the raw count
+rather than turning a successful read into an error. Writes reject such values.
 
 Integers are never routed through floating point. The captured LTIME is exactly
 `8649040500600700`; `TIME` storage `ff ff ff ff` is `uint64(4294967295)`.
@@ -184,8 +198,16 @@ for serialized access, metadata, handles, split batches and one permitted read
 recovery. Close has one total cleanup budget and can abort active I/O. Corrupt,
 truncated, timed-out or disconnected streams become unusable; device rejections
 retain `*ads.AdsError` and leave an otherwise healthy stream reusable. Detect
-connection loss with `errors.Is(err, ads.ErrConnectionLost)` and inspect original
-wrapped I/O errors; check each result's `Error` as well as the top-level error.
+connection loss with `errors.Is(err, ads.ErrConnectionLost)` (or, across all
+families, `driver.IsConnectionLost(err)`) and inspect original wrapped I/O errors;
+check each result's `Error` as well as the top-level error.
+
+`ADSAdapter.Keepalive()` (and `ads.Client.ReadState()`) performs one ADS
+ReadState (command 4) on the target AMS port: a cheap, read-only exchange bounded
+by the operation timeout, never retried. It returns an error when not connected.
+A transport failure matches both `ads.ErrConnectionLost` and
+`driver.ErrConnectionLost`; a device rejection (for example no runtime on the
+configured port) is an `*ads.AdsError` and does not count as connection loss.
 
 Metadata uploads and each value group are bracketed by the supported symbol-version
 service. Reconnect and detected version/stale-handle changes invalidate handles,
@@ -193,6 +215,14 @@ catalog and schemas together. Reads pin one schema snapshot and may refresh/retr
 once within the original budget; no bytes are successfully decoded with a newly
 changed layout. Only explicit unsupported-service/invalid-group replies enable
 primitive fallback. Other metadata/version failures remain failures.
+A "symbol not found" (0x0710) reply through a handle cached by an earlier
+operation is also treated as stale, because a download can invalidate handles
+without changing the version counter: a read re-resolves once, while a write
+returns the error (the value was not written) and the next operation re-resolves.
+Not-found from a name lookup is final. Handles discarded by a detected change on
+a healthy connection are released immediately (SumUp release where supported),
+before replacements are acquired, and only while half the operation budget
+remains; release failures are ignored. Handles of a lost connection are dropped.
 
 Version checking is best effort: Beckhoff's SDK warns that minor online changes
 can leave the symbol counter unchanged. It does not detect every PLC edit and does
@@ -209,22 +239,47 @@ when the target cannot signal them reliably. SDK evidence is recorded in
 | Schema/description depth | 64 | `WithExpansionLimits(depth,elements)` |
 | Expanded members/elements per value operation | 1,000,000 | Same option |
 
-The complete upload must fit a command payload and aggregate budget. Larger
-uploads fail explicitly; unverified chunk/offset semantics are not guessed.
+Direct lookups (element/member paths such as `MAIN.arr[17]`, differently cased
+aliases, names outside the catalog) share the symbol count and metadata byte
+budgets with the catalog. When the next operation might not fit, the client
+evicts all non-catalog lookup state at the start of that operation and releases
+the evicted handles before acquiring new ones; catalog entries, their handles and
+schemas are kept. An HMI reading many distinct paths therefore never hits a
+permanent limit. Only one request that alone exceeds the budget fails.
+
+The command payload limit bounds value, SumUp and lookup exchanges. A symbol or
+datatype upload is one complete read of the size the PLC advertises beforehand,
+bounded instead by the aggregate metadata budget, so large projects do not need a
+larger value payload. Uploads beyond that budget fail explicitly; unverified
+chunk/offset semantics are not guessed. The upload shares the operation timeout;
+raise `PLCConfig.Timeout`/`WithTimeout` for very large catalogs on slow links.
+Adapter users can pass these options through `driver.NewADSAdapterWithOptions`.
 F080 SumUp results include each requested data slot, including failed slots, as
 specified by the [vendor ADS definitions](https://github.com/Beckhoff/ADS/blob/master/AdsLib/standalone/AdsDef.h).
 
 ## Discovery and validation status
 
+Discovery uses the TwinCAT UDP "Get Info" service on port 48899 (the Broadcast
+Search used by TwinCAT engineering, Beckhoff's AdsLib `AdsTool <ip> netid`, and
+pyads `adsGetNetIdForPLC`). `ads.Discover`/`DiscoverSubnet` send it unicast to
+each address, which also works across routed subnets; `DiscoverBroadcast` sends it
+to broadcast addresses; `ads.DiscoverWithReport` does both in one pass and returns
+send/socket failures. The reply carries the device's real AMS NetID (it need not
+be the IP plus `.1.1`: a CX at 192.168.5.212 can be `5.45.219.226.1.1`), hostname
+and TwinCAT version. Only addresses that do not answer UDP fall back to a TCP
+48898 identity probe, which has to guess the NetID as IP + `.1.1`. The reply
+header is validated strictly; tags are parsed defensively (unknown tags skipped,
+a truncated tag dropped without losing the identity).
+
 UDP discovery establishes advertised identity. `HasRoute == false` means a working
 route has not been verified. A validated TCP ADS device-info reply sets it true;
-an open TCP port or broadcast reply alone does not. Invalid/error/truncated
-identity replies are rejected. IPv4 subnet expansion is capped at 4096 addresses,
+an open TCP port or broadcast reply alone does not. Invalid/error/truncated TCP
+identity replies are rejected. Every probe is sent before replies are collected
+for the whole timeout. IPv4 subnet expansion is capped at 4096 addresses,
 workers at 128; /31 and /32 preserve usable boundary addresses. Discovery does not
 change routes.
 
-v0.3.0 has offline wire/schema/conformance tests, parser fuzzing, platform
-compilation and opt-in read-only PLC evidence, including all 43 owner-supplied
-variable/member paths. Live scratch writes, real online changes, Siemens value
-reads and Omron hardware tests remain unverified. See the [implementation report](plcio-implementation-report.md)
+Beckhoff reads and writes are hardware-tested on a CX with TwinCAT 3, in addition
+to offline wire/schema/conformance tests and parser fuzzing. Real online changes
+remain unverified. See the [implementation report](plcio-implementation-report.md)
 and [compatibility migration contract](plcio-compatibility.md).

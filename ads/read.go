@@ -58,13 +58,21 @@ func (c *Client) readEngine(names []string, decode bool) ([]*TagValue, []any, er
 		err := c.loadSchemaForIO()
 		if err != nil {
 			if staleSymbolError(err) && attempt == 0 {
-				c.invalidateCaches()
+				c.invalidateLive()
 				continue
 			}
 			return failedRead(names, err), nil, err
 		}
+		c.trimLookupCaches(len(names))
 		snapshot := c.snapshot
 		resolver := c.currentResolver()
+		// Handles cached before this attempt; a not-found through one of them is
+		// stale. After invalidation none remain, so the retry is bounded.
+		cached := make([]bool, len(names))
+		for i, name := range names {
+			entry := c.symbols[name]
+			cached[i] = entry != nil && entry.Handle != 0
+		}
 		raw, entries, err := c.readValues(names)
 		for i, value := range raw {
 			if value == nil {
@@ -76,13 +84,15 @@ func (c *Client) readEngine(names []string, decode bool) ([]*TagValue, []any, er
 			}
 		}
 		stale := staleSymbolError(err)
-		for _, value := range raw {
-			if staleSymbolError(value.Error) {
+		for i, value := range raw {
+			// entries[i] is set only after lookup and handle acquisition succeeded,
+			// so its error comes from the value access through that handle.
+			if staleSymbolError(value.Error) || (cached[i] && entries[i] != nil && staleHandleNotFound(value.Error)) {
 				stale = true
 			}
 		}
 		if stale {
-			c.invalidateCaches()
+			c.invalidateLive()
 			if attempt == 0 {
 				continue
 			}

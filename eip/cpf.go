@@ -115,16 +115,17 @@ func ParseEipCommonPacket(raw []byte) (*EipCommonPacket, error) {
 		type_id := binary.LittleEndian.Uint16(raw[:2])
 		length := binary.LittleEndian.Uint16(raw[2:4])
 
-		need := int(4 + length)
+		// Compute in int: 4+length in uint16 wraps for length >= 0xFFFC.
+		need := 4 + int(length)
 		if len(raw) < need {
 			return nil, fmt.Errorf("ParseEipCommonPacket: insufficient data for item %d: need %d bytes, have %d", i, need, len(raw))
 		}
 
-		data := raw[4 : 4+length]
+		data := raw[4:need]
 		cp_items = append(cp_items, EipCommonPacketItem{TypeId: type_id, Length: length, Data: data})
 
 		// advance
-		raw = raw[4+length:]
+		raw = raw[need:]
 	}
 
 	return &EipCommonPacket{Items: cp_items}, nil

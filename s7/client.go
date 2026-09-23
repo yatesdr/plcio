@@ -1,10 +1,12 @@
 package s7
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +39,12 @@ type Client struct {
 	rack      int
 	slot      int
 	pduRef    uint16
+	timeout   time.Duration // configured connect/IO timeout, reused by Reconnect
+	epoch     uint64        // bumped by Close so an in-flight Reconnect is discarded
 	mu        sync.Mutex
+	// reconnectMu serializes Reconnect so concurrent callers cannot each dial
+	// a transport and leak all but the last one.
+	reconnectMu sync.Mutex
 }
 
 // options holds configuration options for Connect.
@@ -80,6 +87,9 @@ func Connect(address string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	if err := validateRackSlot(cfg.rack, cfg.slot); err != nil {
+		return nil, fmt.Errorf("Connect: %w", err)
+	}
 
 	t := newTransport()
 	t.timeout = cfg.timeout
@@ -94,6 +104,7 @@ func Connect(address string, opts ...Option) (*Client, error) {
 		rack:      cfg.rack,
 		slot:      cfg.slot,
 		pduRef:    0,
+		timeout:   cfg.timeout,
 	}, nil
 }
 
@@ -104,6 +115,7 @@ func (c *Client) Close() {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.epoch++
 	if c.transport != nil {
 		c.transport.close()
 	}
@@ -141,6 +153,9 @@ func (c *Client) Reconnect() error {
 		return fmt.Errorf("nil client")
 	}
 
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
 	c.mu.Lock()
 	if c.transport != nil && c.transport.isConnected() {
 		c.mu.Unlock()
@@ -155,20 +170,59 @@ func (c *Client) Reconnect() error {
 	address := c.address
 	rack := c.rack
 	slot := c.slot
+	epoch := c.epoch
+	timeout := c.timeout
 	c.mu.Unlock()
 
 	// Create new transport
 	t := newTransport()
-	t.timeout = 10 * time.Second
+	if timeout > 0 {
+		t.timeout = timeout
+	}
 
 	if err := t.connect(address, rack, slot); err != nil {
 		return fmt.Errorf("reconnect failed: %w", err)
 	}
 
 	c.mu.Lock()
+	if c.epoch != epoch {
+		// Close was called while we were dialing; don't resurrect the client.
+		c.mu.Unlock()
+		t.close()
+		return fmt.Errorf("reconnect failed: client closed during reconnect")
+	}
 	c.transport = t
 	c.mu.Unlock()
 
+	return nil
+}
+
+// Keepalive performs one cheap request/response round trip so a dead link is
+// detected (and the idle connection kept open) between polls. It reads SZL
+// 0x0424 index 0 (CPU mode/status, a single 20-byte record). Any well-formed
+// answer counts as alive, including a CPU refusing that SZL; transport
+// failures and mismatched responses mark the connection lost and return an
+// error matching ErrConnectionLost. Returns an error when not connected.
+func (c *Client) Keepalive() error {
+	if c == nil {
+		return fmt.Errorf("Keepalive: nil client")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transport == nil || !c.transport.isConnected() {
+		return fmt.Errorf("Keepalive: not connected: %w", ErrConnectionLost)
+	}
+	response, err := c.transport.sendReceive(buildSZLRequest(0x0424, 0x0000, c.nextPDURef()))
+	if err != nil {
+		if !c.transport.isConnected() && !errors.Is(err, ErrConnectionLost) {
+			return fmt.Errorf("Keepalive: %w: %w", err, ErrConnectionLost)
+		}
+		return fmt.Errorf("Keepalive: %w", err)
+	}
+	if _, err := parseSZLResponse(response); err != nil {
+		// The CPU answered, so the link is alive; only the SZL was refused.
+		logging.DebugLog("S7", "Keepalive: SZL 0x0424 not served (%v); link is alive", err)
+	}
 	return nil
 }
 
@@ -227,15 +281,18 @@ type parsedRequest struct {
 // Type hints are used for simple addresses (DB1.0) that don't specify the data type.
 // This implementation batches multiple small reads into single requests for efficiency.
 func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
-	if c == nil || c.transport == nil {
+	if c == nil {
+		return nil, fmt.Errorf("Read: nil client")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transport == nil {
 		return nil, fmt.Errorf("Read: nil client")
 	}
 	if len(requests) == 0 {
 		return nil, nil
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	// Parse all requests first
 	parsed := make([]parsedRequest, len(requests))
@@ -250,21 +307,19 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 			continue
 		}
 
-		// If address didn't specify type/size, use the type hint
-		if addr.Size == 0 && req.TypeHint != "" {
-			typeCode, ok := TypeCodeFromName(req.TypeHint)
-			if ok {
-				addr.DataType = typeCode
-				addr.Size = TypeSize(typeCode)
-				// Handle variable-length types
-				if addr.Size == 0 {
-					switch BaseType(typeCode) {
-					case TypeString:
-						addr.Size = 256
-					case TypeWString:
-						addr.Size = 512
-					}
-				}
+		// Offset-only addresses take their type from the hint; sized
+		// addresses take it only when the hint has the same width.
+		if err := applyTypeHint(addr, req.TypeHint, req.Address); err != nil {
+			parsed[i].err = err
+			continue
+		}
+		if addr.Size == 0 && addr.DataType != 0 {
+			// Variable-length types: default STRING[254] / WSTRING[254]
+			switch BaseType(addr.DataType) {
+			case TypeString:
+				addr.Size = 256
+			case TypeWString:
+				addr.Size = 512
 			}
 		}
 
@@ -291,6 +346,19 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 			DataType: addr.DataType,
 			Size:     totalSize,
 			Count:    addr.Count,
+		}
+		if isBoolArray(addr) {
+			// S7 packs BOOL arrays 8 per byte: read the covering bytes and
+			// unpack them after the read (see parsedRequest.tagValue).
+			rd := parsed[i].readAddr
+			rd.BitNum = -1
+			rd.DataType = TypeByte
+			rd.Size = (max(addr.BitNum, 0) + addr.Count + 7) / 8
+			rd.Count = rd.Size
+		}
+		if addr.Offset+parsed[i].readAddr.Size-1 > maxByteOffset {
+			parsed[i].err = fmt.Errorf("%s: read of %d bytes extends past max byte offset %d",
+				req.Address, parsed[i].readAddr.Size, maxByteOffset)
 		}
 	}
 
@@ -320,6 +388,9 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 		maxRequestItems = 1
 	}
 	maxResponsePayload := pduSize - 18 // Leave room for response headers
+	// Exact wire budget: 12-byte ack header + 2-byte parameter, then every
+	// item except the last is followed by a fill byte when its length is odd.
+	maxResponseWire := pduSize - 14
 
 	// Prepare results slice (indexed by original position)
 	results := make([]*TagValue, len(requests))
@@ -327,6 +398,7 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 	// Group requests into batches
 	var currentBatch []parsedRequest
 	var currentResponseSize int
+	var currentWireSize int // includes the fill byte of every odd item so far
 
 	flushBatch := func() {
 		if len(currentBatch) == 0 {
@@ -349,14 +421,7 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 				}
 			} else {
 				logging.DebugLog("S7", "Read %q success: got %d bytes", p.request.Address, len(data))
-				results[p.index] = &TagValue{
-					Name:     p.request.Address,
-					DataType: p.addr.DataType,
-					Bytes:    data,
-					BitNum:   p.addr.BitNum,
-					Count:    p.addr.Count,
-					Error:    nil,
-				}
+				results[p.index] = p.tagValue(data)
 			}
 		} else {
 			// Multi-item batch read
@@ -365,6 +430,7 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 
 		currentBatch = nil
 		currentResponseSize = 0
+		currentWireSize = 0
 	}
 
 	for i := range parsed {
@@ -416,34 +482,104 @@ func (c *Client) ReadWithTypes(requests []TagRequest) ([]*TagValue, error) {
 				}
 			} else {
 				logging.DebugLog("S7", "Read %q success: got %d bytes", p.request.Address, len(data))
-				results[p.index] = &TagValue{
-					Name:     p.request.Address,
-					DataType: p.addr.DataType,
-					Bytes:    data,
-					BitNum:   p.addr.BitNum,
-					Count:    p.addr.Count,
-					Error:    nil,
-				}
+				results[p.index] = p.tagValue(data)
 			}
 			continue
 		}
 
 		// Check if adding this item would exceed batch limits
 		// Must check both request item count AND response payload size
+		// The wire check only adds fill bytes on top of the legacy estimate,
+		// so batches that already fit are packed exactly as before.
 		newResponseSize := currentResponseSize + itemResponseSize
-		if newResponseSize > maxResponsePayload || len(currentBatch) >= maxRequestItems {
+		if newResponseSize > maxResponsePayload || currentWireSize+itemResponseSize > maxResponseWire ||
+			len(currentBatch) >= maxRequestItems {
 			flushBatch()
 		}
 
 		// Add to current batch
 		currentBatch = append(currentBatch, *p)
 		currentResponseSize += itemResponseSize
+		currentWireSize += itemResponseSize + p.readAddr.Size%2
 	}
 
 	// Flush remaining batch
 	flushBatch()
 
 	return results, c.connErrorIfDownLocked()
+}
+
+// applyTypeHint resolves addr's data type from a type hint (explicit or
+// configured). An offset-only address (DB1.4) has no size and takes the hint's
+// type. A sized address (DB1.DBD4, MW2, DB1.DBX0.0, T5, ...) takes the hint's
+// type only when it has exactly the address width, e.g. REAL/DINT/TIME on a
+// D address; any other hint is an error rather than being silently ignored.
+func applyTypeHint(addr *Address, hint, address string) error {
+	if hint == "" {
+		return nil
+	}
+	code, ok := TypeCodeFromName(hint)
+	if !ok {
+		return fmt.Errorf("unknown S7 data type %q for %s", hint, address)
+	}
+	if addr.DataType == 0 {
+		addr.DataType = code
+		addr.Size = TypeSize(code)
+		return nil
+	}
+	base := BaseType(code)
+	if addr.BitNum >= 0 {
+		if base != TypeBool {
+			return fmt.Errorf("type %s does not fit bit address %s (only BOOL)", TypeName(code), address)
+		}
+		return nil
+	}
+	if size := TypeSize(base); base == TypeBool || size != addr.Size {
+		return fmt.Errorf("type %s (%d bytes) does not match the %d-byte address %s; use an offset-only address (e.g. DB1.4) or a type of that width",
+			TypeName(code), size, addr.Size, address)
+	}
+	addr.DataType = base
+	return nil
+}
+
+// isBoolArray reports whether addr is a BOOL array (bits packed 8 per byte).
+func isBoolArray(addr *Address) bool {
+	return BaseType(addr.DataType) == TypeBool && addr.Count > 1
+}
+
+// tagValue builds the successful TagValue for p from the bytes read. BOOL
+// arrays are unpacked from the PLC's 8-per-byte layout (starting at the
+// address's bit offset) into one 0x00/0x01 byte per element.
+func (p *parsedRequest) tagValue(data []byte) *TagValue {
+	if isBoolArray(p.addr) {
+		data = unpackBools(data, max(p.addr.BitNum, 0), p.addr.Count)
+	}
+	if err := decodeCheck(p.addr.DataType, data); err != nil {
+		return &TagValue{Name: p.request.Address, DataType: p.addr.DataType, Bytes: data,
+			BitNum: p.addr.BitNum, Count: p.addr.Count, Error: err}
+	}
+	return &TagValue{
+		Name:     p.request.Address,
+		DataType: p.addr.DataType,
+		Bytes:    data,
+		BitNum:   p.addr.BitNum,
+		Count:    p.addr.Count,
+		Error:    nil,
+	}
+}
+
+// unpackBools expands count packed bits (LSB first, starting at bit) into one
+// byte per element.
+func unpackBools(packed []byte, bit, count int) []byte {
+	if avail := len(packed)*8 - bit; count > avail {
+		count = max(avail, 0)
+	}
+	out := make([]byte, count)
+	for i := range out {
+		n := bit + i
+		out[i] = (packed[n/8] >> (n % 8)) & 1
+	}
+	return out
 }
 
 // readBatch reads multiple addresses in a single S7 request.
@@ -519,14 +655,7 @@ func (c *Client) readBatch(batch []parsedRequest, results []*TagValue) {
 				dataBytes = []byte{} // Ensure non-nil for successful reads with no data
 			}
 			logging.DebugLog("S7", "Batch item %q success: got %d bytes", p.request.Address, len(dataBytes))
-			results[p.index] = &TagValue{
-				Name:     p.request.Address,
-				DataType: p.addr.DataType,
-				Bytes:    dataBytes,
-				BitNum:   p.addr.BitNum,
-				Count:    p.addr.Count,
-				Error:    nil,
-			}
+			results[p.index] = p.tagValue(dataBytes)
 		}
 	}
 
@@ -639,7 +768,7 @@ func (c *Client) Write(address string, value interface{}) error {
 // WriteWithType writes a value to an S7 address with an explicit type hint.
 // The typeHint should be a type name like "DINT", "REAL", "BOOL", etc.
 func (c *Client) WriteWithType(address string, value interface{}, typeHint string) error {
-	if c == nil || c.transport == nil {
+	if c == nil {
 		return fmt.Errorf("Write: nil client")
 	}
 
@@ -654,21 +783,29 @@ func (c *Client) WriteWithType(address string, value interface{}, typeHint strin
 	logging.DebugLog("S7", "Write: parsed addr area=%s db=%d offset=%d dataType=%s size=%d",
 		addr.Area, addr.DBNumber, addr.Offset, TypeName(addr.DataType), addr.Size)
 
-	// If address didn't specify a type (simple format like DB1.0),
-	// use the type hint from config
-	if addr.DataType == 0 && typeHint != "" {
-		if typeCode, ok := TypeCodeFromName(typeHint); ok {
-			addr.DataType = typeCode
-			addr.Size = TypeSize(typeCode)
-			logging.DebugLog("S7", "Write: using type hint: %s (0x%04X) size=%d", typeHint, typeCode, addr.Size)
-		}
+	if addr.DataType == 0 && typeHint == "" {
+		// Simple format like DB1.0: the address carries no size, so the type
+		// must come from the hint. Guessing from the Go value (int64/float64
+		// -> 8 bytes) would clobber neighbouring variables.
+		return fmt.Errorf("Write: address %q does not specify a data size; a data type is required "+
+			"(configure the tag's DataType, e.g. DINT/REAL/INT, or use WriteWithType)", address)
+	}
+	if err := applyTypeHint(addr, typeHint, address); err != nil {
+		return fmt.Errorf("Write: %w", err)
+	}
+	logging.DebugLog("S7", "Write: resolved type %s size=%d (hint %q)", TypeName(addr.DataType), addr.Size, typeHint)
+	if base := BaseType(addr.DataType); addr.BitNum < 0 && isFloatValue(value) && !isIntegralFloat(value) &&
+		base != TypeReal && base != TypeLReal {
+		// Integer-typed target (DBD/DBW/MD/... or an integer type hint) with a
+		// fractional float: the integer encoder would silently truncate.
+		// Integral floats (e.g. JSON numbers) keep their integer encoding.
+		return fmt.Errorf("Write: non-integral value %v for %s target %q; configure a REAL/LREAL data type",
+			value, TypeName(addr.DataType), address)
 	}
 
-	// If still no type, infer from the Go value
-	if addr.DataType == 0 {
-		addr.DataType = inferTypeFromValue(value)
-		addr.Size = TypeSize(addr.DataType)
-		logging.DebugLog("S7", "Write: inferred type from value: %s size=%d", TypeName(addr.DataType), addr.Size)
+	if BaseType(addr.DataType) == TypeBool && isSliceValue(value) {
+		return fmt.Errorf("Write: BOOL array writes are not supported for %s (S7 packs BOOLs 8 per byte); "+
+			"write each element by bit address instead", address)
 	}
 
 	// For BOOL type without bit number specified, default to bit 0
@@ -679,6 +816,9 @@ func (c *Client) WriteWithType(address string, value interface{}, typeHint strin
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.transport == nil {
+		return fmt.Errorf("Write: nil client")
+	}
 
 	data, err := c.encodeValue(addr, value)
 	if err != nil {
@@ -688,6 +828,10 @@ func (c *Client) WriteWithType(address string, value interface{}, typeHint strin
 
 	logging.DebugLog("S7", "Write: encoded %d bytes: %x", len(data), data)
 
+	if err := checkWriteSize(addr, value, data); err != nil {
+		return fmt.Errorf("Write %s: %w", address, err)
+	}
+
 	err = c.writeAddress(addr, data)
 	if err != nil {
 		logging.DebugLog("S7", "Write: writeAddress failed: %v", err)
@@ -695,6 +839,65 @@ func (c *Client) WriteWithType(address string, value interface{}, typeHint strin
 	}
 
 	logging.DebugLog("S7", "Write: success")
+	return nil
+}
+
+// isFloatValue reports whether value is a Go floating-point scalar or slice.
+func isFloatValue(value interface{}) bool {
+	switch value.(type) {
+	case float32, float64, []float32, []float64:
+		return true
+	}
+	return false
+}
+
+// isIntegralFloat reports whether every float in value is a finite whole number.
+func isIntegralFloat(value interface{}) bool {
+	whole := func(f float64) bool { return !math.IsInf(f, 0) && f == math.Trunc(f) }
+	switch v := value.(type) {
+	case float32:
+		return whole(float64(v))
+	case float64:
+		return whole(v)
+	case []float32:
+		for _, f := range v {
+			if !whole(float64(f)) {
+				return false
+			}
+		}
+		return true
+	case []float64:
+		for _, f := range v {
+			if !whole(f) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// checkWriteSize rejects writes whose encoded length exceeds the target's
+// declared size (element size x count), so an oversized value cannot be
+// chunked into neighbouring data.
+func checkWriteSize(addr *Address, value interface{}, data []byte) error {
+	count := max(addr.Count, 1)
+	switch base := BaseType(addr.DataType); {
+	case addr.BitNum >= 0:
+		// Single bit write
+	case base == TypeString || base == TypeWString:
+		// Each element is encoded at exactly the size its DB header declares
+		if v, ok := value.([]string); ok && len(v) > count {
+			return fmt.Errorf("%d strings exceed the %d-element target", len(v), count)
+		}
+	default:
+		if limit := TypeSize(addr.DataType) * count; len(data) > limit {
+			return fmt.Errorf("encoded value is %d bytes but the %s target holds %d", len(data), TypeName(addr.DataType), limit)
+		}
+	}
+	if addr.Offset+len(data)-1 > maxByteOffset {
+		return fmt.Errorf("write of %d bytes extends past max byte offset %d", len(data), maxByteOffset)
+	}
 	return nil
 }
 
@@ -754,7 +957,13 @@ func (c *Client) writeAddress(addr *Address, data []byte) error {
 
 		err := c.writeAddressSingle(chunkAddr, chunkData)
 		if err != nil {
-			return fmt.Errorf("chunk write at offset %d failed: %w", offset, err)
+			// Multi-PDU writes are not atomic: earlier chunks stay written.
+			if dataPos == 0 {
+				return fmt.Errorf("chunk write at offset %d failed; 0 of %d bytes were written: %w", offset, totalSize, err)
+			}
+			return fmt.Errorf("chunk write at offset %d failed after %d of %d bytes were already written "+
+				"(multi-PDU writes are not atomic; bytes %d..%d keep their new values): %w",
+				offset, dataPos, totalSize, addr.Offset, addr.Offset+dataPos-1, err)
 		}
 
 		offset += chunkSize
@@ -820,8 +1029,30 @@ func (c *Client) encodeValue(addr *Address, value interface{}) ([]byte, error) {
 	case TypeWString:
 		return c.encodeWStringWithRead(addr, value)
 	default:
+		if enc := timeEncoder(baseType); enc != nil {
+			return enc(value)
+		}
 		return nil, fmt.Errorf("unsupported data type: %s", TypeName(addr.DataType))
 	}
+}
+
+// timeEncoder returns the strict encoder for the S7 date/time types.
+func timeEncoder(baseType uint16) func(interface{}) ([]byte, error) {
+	switch baseType {
+	case TypeTime:
+		return encodeTime
+	case TypeTimeOfDay:
+		return encodeTimeOfDay
+	case TypeDate:
+		return encodeDate
+	case TypeS5Time:
+		return encodeS5Time
+	case TypeDateAndTime:
+		return encodeDateAndTime
+	case TypeDTL:
+		return encodeDTL
+	}
+	return nil
 }
 
 // isSliceValue returns true if the value is a slice type.
@@ -858,7 +1089,11 @@ func (c *Client) encodeArrayValue(addr *Address, value interface{}) ([]byte, err
 			case TypeDInt:
 				encoded, err = encodeDInt(elem)
 			default:
-				return nil, fmt.Errorf("cannot encode []int32 as %s", TypeName(addr.DataType))
+				enc := timeEncoder(baseType)
+				if enc == nil || baseType == TypeDateAndTime || baseType == TypeDTL {
+					return nil, fmt.Errorf("cannot encode []int32 as %s", TypeName(addr.DataType))
+				}
+				encoded, err = enc(elem)
 			}
 			if err != nil {
 				return nil, err
@@ -875,9 +1110,16 @@ func (c *Client) encodeArrayValue(addr *Address, value interface{}) ([]byte, err
 			case TypeULInt:
 				encoded, err = encodeULInt(uint64(elem))
 			case TypeDInt:
+				if elem < math.MinInt32 || elem > math.MaxInt32 {
+					return nil, fmt.Errorf("value %d out of DINT range", elem)
+				}
 				encoded, err = encodeDInt(int32(elem))
 			default:
-				return nil, fmt.Errorf("cannot encode []int64 as %s", TypeName(addr.DataType))
+				enc := timeEncoder(baseType)
+				if enc == nil || baseType == TypeDateAndTime || baseType == TypeDTL {
+					return nil, fmt.Errorf("cannot encode []int64 as %s", TypeName(addr.DataType))
+				}
+				encoded, err = enc(elem)
 			}
 			if err != nil {
 				return nil, err
@@ -951,6 +1193,9 @@ func (c *Client) encodeArrayValue(addr *Address, value interface{}) ([]byte, err
 			}
 			maxLen = int(headerData[0])
 		}
+		if err := checkStringMaxLen(baseType, maxLen); err != nil {
+			return nil, err
+		}
 
 		logging.DebugLog("S7", "encodeStringArray: %d elements, maxLen=%d per element", len(v), maxLen)
 
@@ -997,28 +1242,48 @@ func (c *Client) encodeStringWithRead(addr *Address, value interface{}) ([]byte,
 		Size:     2, // Just read the header to get max length
 	}
 
+	// The header decides how many bytes get written, so never guess it.
 	currentData, err := c.readAddress(readAddr)
 	if err != nil {
-		logging.DebugLog("S7", "encodeString: failed to read current string header: %v, using default maxLen=254", err)
-		// Fall back to default max length
-		return encodeStringWithMaxLen(s, 254)
+		return nil, fmt.Errorf("failed to read STRING header: %w", err)
 	}
 
 	if len(currentData) < 2 {
-		logging.DebugLog("S7", "encodeString: current data too short (%d bytes), using default maxLen=254", len(currentData))
-		return encodeStringWithMaxLen(s, 254)
+		return nil, fmt.Errorf("STRING header too short (%d bytes)", len(currentData))
 	}
 
 	maxLen := int(currentData[0])
 	logging.DebugLog("S7", "encodeString: read maxLen=%d from DB", maxLen)
+	if err := checkStringMaxLen(TypeString, maxLen); err != nil {
+		return nil, err
+	}
 
 	return encodeStringWithMaxLen(s, maxLen)
+}
+
+// Largest max lengths an S7 STRING / WSTRING header can legitimately declare.
+const (
+	maxStringLen  = 254
+	maxWStringLen = 16382
+)
+
+// checkStringMaxLen rejects implausible max lengths read from a DB header
+// (e.g. 0xFFFF from a misconfigured offset) before they size a write.
+func checkStringMaxLen(baseType uint16, maxLen int) error {
+	if baseType == TypeWString {
+		if maxLen > maxWStringLen {
+			return fmt.Errorf("WSTRING header declares max length %d (> %d); check the address", maxLen, maxWStringLen)
+		}
+	} else if maxLen > maxStringLen {
+		return fmt.Errorf("STRING header declares max length %d (> %d); check the address", maxLen, maxStringLen)
+	}
+	return nil
 }
 
 // encodeStringWithMaxLen encodes a string with the specified max length.
 func encodeStringWithMaxLen(s string, maxLen int) ([]byte, error) {
 	if len(s) > maxLen {
-		s = s[:maxLen]
+		return nil, fmt.Errorf("string of %d characters exceeds the STRING's maximum length %d (from its DB header)", len(s), maxLen)
 	}
 
 	// S7 STRING format: [maxLen][actualLen][chars padded to maxLen]
@@ -1058,46 +1323,23 @@ func (c *Client) encodeWStringWithRead(addr *Address, value interface{}) ([]byte
 		Size:     4, // Just read the header to get max length
 	}
 
+	// The header decides how many bytes get written, so never guess it.
 	currentData, err := c.readAddress(readAddr)
 	if err != nil {
-		logging.DebugLog("S7", "encodeWString: failed to read current wstring header: %v, using default maxLen=254", err)
-		return encodeWStringWithMaxLen(s, 254)
+		return nil, fmt.Errorf("failed to read WSTRING header: %w", err)
 	}
 
 	if len(currentData) < 4 {
-		logging.DebugLog("S7", "encodeWString: current data too short (%d bytes), using default maxLen=254", len(currentData))
-		return encodeWStringWithMaxLen(s, 254)
+		return nil, fmt.Errorf("WSTRING header too short (%d bytes)", len(currentData))
 	}
 
 	maxLen := int(binary.BigEndian.Uint16(currentData[0:2]))
 	logging.DebugLog("S7", "encodeWString: read maxLen=%d from DB", maxLen)
+	if err := checkStringMaxLen(TypeWString, maxLen); err != nil {
+		return nil, err
+	}
 
 	return encodeWStringWithMaxLen(s, maxLen)
-}
-
-// encodeWStringWithMaxLen encodes a wide string with the specified max length.
-func encodeWStringWithMaxLen(s string, maxLen int) ([]byte, error) {
-	runes := []rune(s)
-	if len(runes) > maxLen {
-		runes = runes[:maxLen]
-	}
-
-	// S7 WSTRING format: [maxLen(2)][actualLen(2)][UTF-16BE chars padded to maxLen]
-	// Must write the full buffer size (4 + maxLen*2 bytes)
-	totalSize := 4 + maxLen*2
-	logging.DebugLog("S7", "encodeWString: maxLen=%d, actualLen=%d, totalSize=%d", maxLen, len(runes), totalSize)
-
-	result := make([]byte, totalSize)
-	binary.BigEndian.PutUint16(result[0:2], uint16(maxLen))
-	binary.BigEndian.PutUint16(result[2:4], uint16(len(runes)))
-
-	// UTF-16BE encoded characters
-	for i, r := range runes {
-		binary.BigEndian.PutUint16(result[4+i*2:], uint16(r))
-	}
-	// Remaining bytes are zero-padded by make()
-
-	return result, nil
 }
 
 // encodeBitValue encodes a bit value for S7 bit writes.
@@ -1303,58 +1545,122 @@ func encodeULInt(value interface{}) ([]byte, error) {
 	return buf, nil
 }
 
-// inferTypeFromValue infers the S7 data type from a Go value.
-func inferTypeFromValue(value interface{}) uint16 {
-	switch value.(type) {
-	case bool:
-		return TypeBool
-	case int8, uint8:
-		return TypeByte
-	case int16:
-		return TypeInt
-	case uint16:
-		return TypeWord
-	case int32, int:
-		return TypeDInt
-	case uint32:
-		return TypeDWord
-	case int64:
-		return TypeLInt
-	case uint64:
-		return TypeULInt
-	case float32:
-		return TypeReal
-	case float64:
-		return TypeLReal
-	default:
-		// Default to DINT for unknown types
-		return TypeDInt
-	}
-}
-
-// GetCPUInfo returns information about the connected CPU.
-// Note: CPU info retrieval is not yet implemented in native protocol.
+// GetCPUInfo returns information about the connected CPU, read from the
+// system status lists (SZL) the way Snap7's GetCpuInfo/GetOrderCode do:
+// SZL 0x0011 (module identification: order number, firmware) and SZL 0x001C
+// (component identification: names, serial number). CPUs serve different
+// subsets (an S7-1200 answers 0x0011 but refuses 0x001C), so each list is
+// optional; an error is returned only when neither can be read.
 func (c *Client) GetCPUInfo() (*CPUInfo, error) {
-	if c == nil || c.transport == nil {
+	if c == nil {
 		return nil, fmt.Errorf("GetCPUInfo: nil client")
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transport == nil || !c.transport.isConnected() {
+		return nil, fmt.Errorf("GetCPUInfo: not connected: %w", ErrConnectionLost)
+	}
+	info := &CPUInfo{}
+	var errs []error
+	if recs, err := c.readSZLRecordsLocked(0x0011); err != nil {
+		errs = append(errs, fmt.Errorf("SZL 0x0011: %w", err))
+	} else {
+		for _, r := range recs {
+			// Record: index(2) MLFB(20) BGTyp(2) Ausbg(2) Ausbe(2).
+			if len(r.data) < 26 {
+				continue
+			}
+			switch r.index {
+			case 0x0001:
+				info.OrderCode = szlText(r.data[0:20])
+			case 0x0007:
+				if r.data[22] == 'V' {
+					info.FirmwareVersion = fmt.Sprintf("V%d.%d.%d", r.data[23], r.data[24], r.data[25])
+				}
+			}
+		}
+	}
+	if recs, err := c.readSZLRecordsLocked(0x001C); err != nil {
+		errs = append(errs, fmt.Errorf("SZL 0x001C: %w", err))
+	} else {
+		for _, r := range recs {
+			text := szlText(r.data)
+			switch r.index {
+			case 0x0001:
+				info.ASName = text
+			case 0x0002:
+				info.ModuleName = text
+			case 0x0004:
+				info.Copyright = text
+			case 0x0005:
+				info.SerialNumber = text
+			case 0x0007:
+				info.ModuleTypeName = text
+			}
+		}
+	}
+	if len(errs) == 2 {
+		return nil, fmt.Errorf("GetCPUInfo: %w; %w", errs[0], errs[1])
+	}
+	if info.ModuleTypeName == "" {
+		info.ModuleTypeName = "S7 PLC"
+	}
+	return info, nil
+}
 
-	// CPU info retrieval requires UserData PDU type which is more complex
-	// Return a placeholder for now
-	return &CPUInfo{
-		ModuleTypeName: "S7 PLC",
-		SerialNumber:   "",
-		ASName:         "",
-		Copyright:      "",
-		ModuleName:     "",
-	}, nil
+type szlRecord struct {
+	index uint16
+	data  []byte // record contents after the 2-byte index
+}
+
+// readSZLRecordsLocked reads SZL id (index 0) and splits it into records.
+// c.mu must be held.
+func (c *Client) readSZLRecordsLocked(id uint16) ([]szlRecord, error) {
+	resp, err := c.transport.sendReceive(buildSZLRequest(id, 0x0000, c.nextPDURef()))
+	if err != nil {
+		return nil, err
+	}
+	d, err := parseSZLResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	return parseSZLRecords(id, d)
+}
+
+// parseSZLRecords splits SZL data (SZL-ID(2) index(2) LENTHDR(2) N_DR(2)
+// records) into records.
+func parseSZLRecords(id uint16, d []byte) ([]szlRecord, error) {
+	if len(d) < 8 || binary.BigEndian.Uint16(d[0:2]) != id {
+		return nil, fmt.Errorf("SZL 0x%04X: unexpected header", id)
+	}
+	recLen := int(binary.BigEndian.Uint16(d[4:6]))
+	count := int(binary.BigEndian.Uint16(d[6:8]))
+	if recLen < 2 {
+		return nil, fmt.Errorf("SZL 0x%04X: invalid record length %d", id, recLen)
+	}
+	var recs []szlRecord
+	for i, off := 0, 8; i < count && off+recLen <= len(d); i, off = i+1, off+recLen {
+		rec := d[off : off+recLen]
+		recs = append(recs, szlRecord{index: binary.BigEndian.Uint16(rec[0:2]), data: rec[2:]})
+	}
+	return recs, nil
+}
+
+// szlText trims the NUL/space padding of an SZL text field.
+func szlText(b []byte) string {
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		b = b[:i]
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // CPUInfo contains information about the S7 CPU.
 type CPUInfo struct {
-	ModuleTypeName string
-	SerialNumber   string
-	ASName         string
-	Copyright      string
-	ModuleName     string
+	ModuleTypeName  string
+	SerialNumber    string
+	ASName          string
+	Copyright       string
+	ModuleName      string
+	OrderCode       string // e.g. "6ES7 214-1AG40-0XB0" (SZL 0x0011)
+	FirmwareVersion string // e.g. "V4.4.1" (SZL 0x0011)
 }

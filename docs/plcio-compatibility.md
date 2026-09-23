@@ -1,5 +1,31 @@
 # Compatibility contract
 
+## v0.3.3 production-hardening corrections
+
+Nothing was removed and no exported signature changed; `driver.PLCConfig`, and
+the result and configuration layouts, are unchanged. The additions are
+additive:
+- `driver.ErrConnectionLost`, `driver.IsConnectionLost` and
+  `driver.DiscoverAllWithReport`.
+- `ads.Client.ReadState` and `ads.DiscoverWithReport`.
+- `s7.CPUInfo.OrderCode` and `.FirmwareVersion`.
+- `pccc.ParseAddressFor`.
+- eipadapter connection events, limits and `Assembly.RunIdle`.
+
+Values that were silently wrong now read correctly, and inputs that were
+silently truncated, wrapped or redirected now return errors. The
+[CHANGELOG](../CHANGELOG.md) lists each case. Callers most likely to notice:
+- Omron FINS DINT/REAL/LREAL word order (remove any application-side word
+  swap).
+- Omron bare `C`/`T` prefixes (use `CIO`/`CNT` or `TK`/`TIM`).
+- S7 reads use the configured tag data type when the request has no hint.
+- Logix `Driver.Read` returns one result per request, in request order.
+- `Keepalive` returns an error when not connected, and performs a real
+  request on S7 and ADS.
+
+Hardware evidence and the remaining lab checklist are in
+[hardware-verification.md](hardware-verification.md).
+
 ## v0.3.2 EtherNet/IP adapter corrections
 
 Public APIs and existing scanner/tag-access paths are unchanged. Cyclic Class 1

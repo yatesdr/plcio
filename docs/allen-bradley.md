@@ -10,7 +10,7 @@ plcio supports Allen-Bradley ControlLogix, CompactLogix, and Micro800 series PLC
 |---|---|---|---|
 | ControlLogix | L7, L8 | EtherNet/IP (CIP) | Connected (Forward Open) or Unconnected |
 | CompactLogix | L3x | EtherNet/IP (CIP) | Connected (Forward Open) or Unconnected |
-| Micro800 | Micro820 | EtherNet/IP (CIP) | Unconnected only |
+| Micro800 | Micro820 | EtherNet/IP (CIP) | Connected (Forward Open, no backplane route) or Unconnected |
 
 **Default port:** TCP 44818
 
@@ -53,7 +53,7 @@ cfg := &driver.PLCConfig{
 }
 ```
 
-Micro800 uses unconnected messaging only (no Forward Open). Batch reads are not supported; each tag is read individually.
+Micro800 has no backplane, so no slot/port segment is used: the Forward Open connection path is just the Message Router (`20 02 24 01`), as in pylogix and pycomm3. If the controller refuses the Forward Open, the client falls back to unconnected messaging. Batch reads are not supported; each tag is read individually.
 
 ## Reading Tags
 
@@ -93,7 +93,8 @@ results, err = drv.Read([]driver.TagRequest{
 | ULINT | 0x00C9 | `uint64` | 8 bytes |
 | REAL | 0x00CA | `float32` | 4 bytes |
 | LREAL | 0x00CB | `float64` | 8 bytes |
-| STRING | 0x00D0 | `string` | 82 bytes |
+| STRING (Logix) | structure (e.g. 0x8FCE) | `string` | 88 bytes (LEN DINT + DATA SINT[82]) |
+| STRING (Micro800) | 0x00DA | `string` | 1-byte length + characters |
 | DWORD | 0x00D3 | `uint32` | 4 bytes |
 
 ### Reading Structures (UDTs)
@@ -152,6 +153,14 @@ err = drv.Write("StartCommand", true)
 err = drv.Write("MessageTag", "Hello PLC")
 ```
 
+**Strings:** a string written to a Logix STRING (or a custom string type: `LEN` DINT + `DATA` SINT[n]) is sent as the whole structure, typed `0x02A0` + the template's structure handle, with DATA zero-padded to the structure size. A Micro800 STRING (0x00DA) is sent as a one-byte length followed by the characters. Strings longer than the type's capacity (82 for STRING, n for custom strings, 255 for Micro800) are rejected, never truncated. `Tag.LEN` and `Tag.DATA[i]` members can still be written directly.
+
+A `[]string` written to a string array (or starting at an element, e.g. `Names[4]`) uses the same layouts with the element count set to the number of strings: Logix sends N full structures, using Write Tag Fragmented (0x53) split on element boundaries when they do not fit one request (a fragmented write is not atomic); Micro800 sends the length-prefixed strings packed back to back in one request (as pylogix does) and rejects arrays too large for one request. Every element is checked against the capacity before anything is sent.
+
+**Bits of integers:** `MyDint.5` addresses bit 5 of a SINT/INT/DINT/LINT (or unsigned) tag or member. Reads return a `bool`. Writes accept `true`/`false` or 0/1 and use the CIP Read Modify Write Tag service (0x4E), which the controller applies atomically (ControlLogix/CompactLogix v16+). There is no read-then-write fallback: controllers that reject the service return an error. BOOL arrays (`MyBoolArr[37]`) are unaffected.
+
+**Type resolution:** the tag's type is looked up in the symbol table once per connection and cached; the cached entry is discarded if the controller later reports the tag does not exist. This cache is used only to resolve types; it never changes how reads are sized (a bare array name reads element 0 unless dimensions were supplied with `SetTags`).
+
 **Write limitations:**
 - Writes are single-tag, single-value operations
 - Not optimized for high-throughput writing
@@ -200,7 +209,9 @@ On ControlLogix/CompactLogix, plcio uses CIP Multiple Service Packet requests to
 - **Connected messaging (Forward Open):** Preferred mode. Supports larger payloads (up to 4002 bytes) and CIP batching.
 - **Unconnected messaging:** Fallback mode if Forward Open fails. Smaller payload limit (504 bytes).
 
-Micro800 does **not** support Forward Open or batch reads.
+Micro800 does **not** support batch reads. Its Forward Open uses no backplane route; if it is refused, unconnected messaging is used.
+
+Each client uses a random Forward Open originator serial number, so several clients on one host can hold connections to the same controller.
 
 ## Connection Keep-alive
 

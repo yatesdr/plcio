@@ -2,21 +2,21 @@
 
 A pure Go library for communicating with industrial PLCs (Programmable Logic Controllers) across multiple vendors and protocols. plcio provides a unified `Driver` interface for reading tags, writing values, discovering devices, and browsing symbol tables across Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Siemens, Beckhoff, and Omron PLCs.
 
-> **BETA** &mdash; Allen-Bradley Logix and Siemens support is well-tested. v0.3.1 fixes indexed Logix UDT/STRING reads and buffer-dependent batching/fragmentation, building on v0.3.0 Beckhoff record/array support. See the [read validation report](docs/plcio-v0.3.1-validation.md) for tested paths and remaining hardware limits. SLC 500, MicroLogix, and Omron FINS are moderately tested. PLC-5 and Omron EIP are untested/experimental.
+> **BETA** &mdash; Hardware-tested reads and writes: Allen-Bradley ControlLogix L7 and Micro820, Siemens S7-1200, and Beckhoff TwinCAT 3 on a CX. SLC 500 and MicroLogix are implemented, pending lab verification of this release. PLC-5, Omron FINS, Omron EIP, and the EtherNet/IP adapter are implemented, pending lab verification. See the [hardware verification log](docs/hardware-verification.md) for tested paths and the remaining lab checklist.
 
 ## Supported PLC Families
 
 | Family | Models | Protocol | Tag Discovery | Tested On |
 |---|---|---|---|---|
-| **Allen-Bradley Logix** | ControlLogix, CompactLogix | EtherNet/IP (CIP) | Automatic | L7, L8 |
+| **Allen-Bradley Logix** | ControlLogix, CompactLogix | EtherNet/IP (CIP) | Automatic | ControlLogix L7 |
 | **Allen-Bradley Micro800** | Micro820, Micro850 | EtherNet/IP (CIP) | Automatic | Micro820 |
-| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Automatic (file directory) | SLC 5/05 |
-| **Allen-Bradley PLC-5** | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Manual (address-based) | Untested |
-| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Automatic (file directory) | MicroLogix 1400 |
+| **Allen-Bradley SLC 500** | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Automatic (file directory) | Pending lab verification |
+| **Allen-Bradley PLC-5** | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Manual (address-based) | Pending lab verification |
+| **Allen-Bradley MicroLogix** | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Automatic (file directory) | Pending lab verification |
 | **Siemens S7** | S7-300, S7-400, S7-1200, S7-1500 | S7comm (port 102) | Manual (address-based) | S7-1200 |
-| **Beckhoff TwinCAT** | CX series, TwinCAT 2/3 | ADS (port 48898) | Automatic | CX9020 |
-| **Omron (FINS)** | CS1, CJ1/2, CP1, CV | FINS TCP/UDP (port 9600) | Manual (address-based) | CP1 |
-| **Omron (EIP)** | NJ, NX Series | EtherNet/IP (CIP) | Automatic (no UDT members) | **Experimental** |
+| **Beckhoff TwinCAT** | CX series, TwinCAT 2/3 | ADS (port 48898) | Automatic | CX, TwinCAT 3 |
+| **Omron (FINS)** | CS1, CJ1/2, CP1, CV | FINS TCP/UDP (port 9600) | Manual (address-based) | Pending lab verification |
+| **Omron (EIP)** | NJ, NX Series | EtherNet/IP (CIP) | Automatic (no UDT members) | Pending lab verification |
 
 ## Installation
 
@@ -234,7 +234,7 @@ results, _ := drv.Read([]driver.TagRequest{
 })
 ```
 
-### Omron (EIP) &mdash; Experimental
+### Omron (EIP) &mdash; pending lab verification
 
 ```go
 cfg := &driver.PLCConfig{
@@ -277,21 +277,28 @@ for _, dev := range devices {
 }
 ```
 
+`driver.DiscoverAllWithReport` takes the same arguments and also returns per-protocol
+failures (for example a refused broadcast or an invalid CIDR) instead of dropping them.
+
 ## Key Features
 
 - **Unified interface** &mdash; One `Driver` interface works across all PLC families
 - **Zero dependencies** &mdash; Pure Go standard library, no CGO
 - **Tag discovery** &mdash; Browse and enumerate tags on supported PLCs
-- **Network discovery** &mdash; Find PLCs on your network via EIP broadcast, S7 port scan, ADS broadcast, and FINS scan
+- **Network discovery** &mdash; Find PLCs on your network via EIP broadcast, S7 port scan, TwinCAT UDP Get Info (reports the real AMS NetID), and FINS scan
 - **Batch reads** &mdash; Efficient multi-tag reads with automatic protocol-level batching
 - **Structure decoding** &mdash; Automatic UDT/struct member unpacking (Logix, ADS)
 - **Per-tag errors** &mdash; Individual tag failures don't fail the entire batch
-- **Connection detection** &mdash; Built-in heuristics to detect connection loss
+- **Connection detection** &mdash; `driver.IsConnectionLost` / `IsLikelyConnectionError` classify connection loss by error identity
 - **Keep-alive** &mdash; Automatic connection maintenance for protocols that need it
+
+## Concurrency
+
+`Driver` implementations are safe for concurrent use from multiple goroutines. Operations on a single driver are serialized; use separate drivers for parallel I/O.
 
 ## Adapter Mode
 
-In addition to the scanner-side drivers above, plcio includes an **adapter-side** package (`plcio/eipadapter`) that lets your Go program be scanned by a PLC over EtherNet/IP. Typical use: smart sensors, vision systems, or bench fixtures that feed data into a PLC's I/O scan.
+In addition to the scanner-side drivers above, plcio includes an **adapter-side** package (`plcio/eipadapter`, implemented, pending lab verification) that lets your Go program be scanned by a PLC over EtherNet/IP. Typical use: smart sensors, vision systems, or bench fixtures that feed data into a PLC's I/O scan.
 
 ```go
 import "github.com/yatesdr/plcio/eipadapter"
@@ -326,17 +333,19 @@ Detailed documentation for each PLC family and feature:
 
 ## Support Status
 
+**Tested** = verified on hardware (ControlLogix L7, Micro820, S7-1200, Beckhoff CX with TwinCAT 3). **Implemented** = implemented and covered by protocol-level tests, pending lab verification.
+
 | Feature | Logix | Micro800 | SLC 500 | PLC-5 | MicroLogix | S7 | Beckhoff | Omron FINS | Omron EIP |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| Connect/Disconnect | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
-| Read Tags | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
-| Write Tags | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
-| Tag Discovery | Stable | Stable | Tested | N/A | Tested | N/A | Stable | N/A | Experimental |
-| Network Discovery | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable | Stable |
-| Batch Reads | Stable | N/A | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
-| UDT/Struct Decode | Stable | Stable | N/A | N/A | N/A | N/A | Published layouts | N/A | No |
-| Device Info | Stable | Stable | Tested | Untested | Tested | Stable | Stable | Stable | Experimental |
-| Keep-alive | Stable | Stable | Tested | Untested | Tested | N/A | N/A | Stable | Experimental |
+| Connect / Read / Write | Tested | Tested | Implemented | Implemented | Implemented | Tested | Tested | Implemented | Implemented |
+| Batch Reads | Tested | N/A | Implemented | Implemented | Implemented | Tested | Tested | Implemented | Implemented |
+| Tag Discovery | Tested | Tested | Implemented | N/A | Implemented | N/A | Tested | N/A | Implemented |
+| UDT/Struct Decode | Tested | Tested | N/A | N/A | N/A | N/A | Tested (published layouts) | N/A | No |
+| Device Info | Tested | Tested | Implemented | Implemented | Implemented | Tested | Tested | Implemented | Implemented |
+| Keep-alive | Tested | Tested | Implemented | Implemented | Implemented | Tested | Tested | Implemented | Implemented |
+| Network Discovery | Tested | Tested | Implemented | Implemented | Implemented | Tested | Tested | Implemented | Implemented |
+
+The EtherNet/IP adapter (`eipadapter`) is implemented, pending lab verification.
 
 ## Acknowledgements
 

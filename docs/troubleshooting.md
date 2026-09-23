@@ -64,6 +64,10 @@ if err != nil && drv.IsConnectionError(err) {
 ```
 
 - For Logix PLCs, call `Keepalive()` periodically if the connection is idle
+- For Beckhoff, `Keepalive()` performs one ADS ReadState on the configured AMS
+  port; an error that satisfies `driver.IsConnectionLost` means reconnect, while an
+  `*ads.AdsError` (for example no runtime on port 851) means the link is up but the
+  runtime/port is not answering
 
 ---
 
@@ -182,12 +186,22 @@ The S7 and Omron adapters look up the `DataType` from the tag configuration to d
 
 3. **Firewall rules:** Industrial firewalls may block discovery ports
    - EIP: UDP 44818
-   - ADS: UDP + TCP 48898
+   - ADS: UDP 48899 (Get Info) + TCP 48898
    - S7: TCP 102
    - FINS: TCP 9600
 
-4. **PLCs on different VLAN:** Discovery doesn't cross VLAN boundaries
+4. **PLCs on different VLAN:** Broadcast discovery doesn't cross VLAN boundaries
    - Configure routing or discover within each VLAN separately
+   - Beckhoff: pass the remote subnet as the scan CIDR; ADS sends a unicast UDP
+     Get Info to every address, which is routed
+
+5. **Discovery could not run:** Use `DiscoverAllWithReport` to see per-protocol
+   failures (invalid CIDR, no broadcast permission, socket errors) that
+   `DiscoverAll` drops
+
+6. **Beckhoff found by UDP but connect fails:** Use the reported
+   `Extra["amsNetId"]` as `PLCConfig.AmsNetId` (it is often not the IP plus
+   `.1.1`) and make sure the PLC has an ADS route for this host
 
 ### Duplicate Devices in Results
 
@@ -232,12 +246,13 @@ This shouldn't happen &mdash; plcio deduplicates by IP address. If you see dupli
 
 ## Connection Error Detection
 
-plcio provides `IsLikelyConnectionError()` to help distinguish transient errors from connection loss. Errors classified as connection errors:
+plcio provides `IsLikelyConnectionError()` to help distinguish transient errors from connection loss, and `IsConnectionLost()` for the strict check against the package `ErrConnectionLost` sentinels (logix, s7, omron, pccc, ads and `driver.ErrConnectionLost`). Errors classified as connection errors:
 
-- `io.EOF` (connection closed by remote)
-- Any `net.Error` (network-level errors)
-- `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ECONNABORTED`
-- Messages containing: "connection refused", "broken pipe", "i/o timeout", "no route to host", "forcibly closed", etc.
+- Any package `ErrConnectionLost` sentinel (`driver.IsConnectionLost`)
+- `io.EOF`, `io.ErrUnexpectedEOF`, `net.ErrClosed`
+- Any `net.Error` (network-level errors, including timeouts)
+- `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `ECONNABORTED`, `ENETUNREACH`, `EHOSTUNREACH`, `ETIMEDOUT`
+- As a last resort, messages containing whole-word phrases such as "connection refused", "broken pipe", "i/o timeout", "eof" or "forcibly closed" (a tag named `Geofence` does not match)
 
 Use this for reconnection logic:
 

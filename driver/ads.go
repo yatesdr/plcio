@@ -41,11 +41,19 @@ func (a *ADSAdapter) currentClient() *ads.Client {
 	return a.client
 }
 
-// Connect establishes connection to the TwinCAT PLC.
+// Connect establishes connection to the TwinCAT PLC. A previous client is closed
+// (releasing its handles) before dialing: the TwinCAT router may treat a second
+// TCP connection from the same AMS Net ID as conflicting. A Close during the dial
+// still prevents publication of the new client.
 func (a *ADSAdapter) Connect() error {
-	a.mu.RLock()
+	a.mu.Lock()
 	epoch := a.epoch
-	a.mu.RUnlock()
+	previous := a.client
+	a.client = nil
+	a.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 	opts := []ads.Option{}
 
 	if a.config.Timeout > 0 {
@@ -70,7 +78,7 @@ func (a *ADSAdapter) Connect() error {
 		client.Close()
 		return fmt.Errorf("ADS connect superseded by Close")
 	}
-	previous := a.client
+	previous = a.client // published by a concurrent Connect
 	a.client = client
 	a.mu.Unlock()
 	if previous != nil {
@@ -231,12 +239,29 @@ func (a *ADSAdapter) Write(tag string, value interface{}) error {
 	return client.Write(tag, value)
 }
 
-// Keepalive is a no-op for ADS (TCP keepalive handles connection maintenance).
+// Keepalive performs one ADS ReadState (command 4) on the target AMS port, a
+// cheap read-only exchange bounded by the operation timeout. It returns an
+// error when not connected. A transport failure matches both
+// errors.Is(err, ads.ErrConnectionLost) and errors.Is(err, ErrConnectionLost);
+// an ADS device rejection (for example a stopped runtime port) is returned as
+// *ads.AdsError and does not by itself indicate a lost connection.
 func (a *ADSAdapter) Keepalive() error {
+	client := a.currentClient()
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("ads keepalive: not connected: %w", ErrConnectionLost)
+	}
+	if _, _, err := client.ReadState(); err != nil {
+		if IsConnectionLost(err) {
+			return fmt.Errorf("ads keepalive: %w: %w", ErrConnectionLost, err)
+		}
+		return fmt.Errorf("ads keepalive: %w", err)
+	}
 	return nil
 }
 
 // IsConnectionError returns true if the error indicates a connection problem.
+// ADS device rejections (*ads.AdsError) are answers from a live stream and are
+// classified by IsLikelyConnectionError only when they wrap a lost link.
 func (a *ADSAdapter) IsConnectionError(err error) bool {
 	return IsLikelyConnectionError(err)
 }

@@ -133,6 +133,13 @@ func (c *adsConnection) fail(err error) error {
 }
 
 func (c *adsConnection) sendRequestUntil(targetNetId AmsNetId, targetPort uint16, cmdId uint16, data []byte, deadline time.Time) ([]byte, error) {
+	return c.sendRequestLimit(targetNetId, targetPort, cmdId, data, deadline, c.maxPayload)
+}
+
+// sendRequestLimit validates the response frame against responseLimit rather
+// than the per-command payload budget. Only callers that learned and bounded the
+// exact response size before sending (metadata uploads) pass a larger limit.
+func (c *adsConnection) sendRequestLimit(targetNetId AmsNetId, targetPort uint16, cmdId uint16, data []byte, deadline time.Time, responseLimit uint32) ([]byte, error) {
 	if c.dead.Load() {
 		return nil, fmt.Errorf("%w: %w", ErrConnectionLost, net.ErrClosed)
 	}
@@ -175,7 +182,7 @@ func (c *adsConnection) sendRequestUntil(targetNetId AmsNetId, targetPort uint16
 	if _, err := io.ReadFull(c.conn, tcpBuf); err != nil {
 		return nil, c.fail(fmt.Errorf("read TCP header: %w", err))
 	}
-	length, err := validateTCPHeader(tcpBuf, c.maxPayload)
+	length, err := validateTCPHeader(tcpBuf, responseLimit)
 	if err != nil {
 		return nil, c.fail(err)
 	}

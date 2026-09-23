@@ -191,7 +191,7 @@ func TestNativeArrayTextTimeAndRecordFixtures(t *testing.T) {
 		{s7.MakeArrayType(s7.TypeInt), []byte{0, 1}, 1, []int64{1}},
 		{s7.TypeBool, []byte{1, 0, 1}, 3, []bool{true, false, true}},
 		{s7.TypeString, []byte{4, 2, 'A', 'B', 0, 0}, 1, "AB"},
-		{s7.TypeTime, []byte{255, 255, 255, 255}, 1, int64(4294967295)},
+		{s7.TypeTime, []byte{255, 255, 255, 255}, 1, int64(-1)},
 		{s7.TypeDate, []byte{0, 1}, 1, int64(1)},
 	} {
 		value := normalizeDecoded((&s7.TagValue{DataType: tc.code, Bytes: tc.data, Count: tc.count, BitNum: -1}).GoValue())

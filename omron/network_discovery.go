@@ -1,6 +1,8 @@
 package omron
 
 import (
+	"encoding/binary"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -170,8 +172,11 @@ func probeFINSUDP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 
 // probeFINSTCP attempts to connect via FINS/TCP.
 func probeFINSTCP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
-	addr := net.JoinHostPort(ip.String(), strconv.Itoa(defaultFINSPort))
+	return probeFINSTCPAddr(ip, net.JoinHostPort(ip.String(), strconv.Itoa(defaultFINSPort)), timeout)
+}
 
+// probeFINSTCPAddr performs the FINS/TCP node address handshake against addr.
+func probeFINSTCPAddr(ip net.IP, addr string, timeout time.Duration) *NetworkDeviceInfo {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil
@@ -194,10 +199,16 @@ func probeFINSTCP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 		return nil
 	}
 
-	// Read response
+	// Read response: FINS(4) Length(4) Command(4) Error(4) ClientNode(4)
+	// ServerNode(4). TCP may deliver it in pieces, so read it in full.
 	resp := make([]byte, 24)
-	n, err := conn.Read(resp)
-	if err != nil || n < 24 {
+	if _, err := io.ReadFull(conn, resp[:16]); err != nil {
+		return nil
+	}
+	if string(resp[0:4]) != "FINS" || binary.BigEndian.Uint32(resp[12:16]) != 0 {
+		return nil
+	}
+	if _, err := io.ReadFull(conn, resp[16:]); err != nil {
 		return nil
 	}
 
@@ -212,8 +223,9 @@ func probeFINSTCP(ip net.IP, timeout time.Duration) *NetworkDeviceInfo {
 		return nil
 	}
 
-	// Parse server node from response
-	serverNode := resp[19]
+	// Parse server node (the PLC's node) from response; resp[16:20] is the
+	// node assigned to us, the client.
+	serverNode := resp[23]
 
 	return &NetworkDeviceInfo{
 		IP:          ip,

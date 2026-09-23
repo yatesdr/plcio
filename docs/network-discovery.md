@@ -10,7 +10,7 @@ plcio runs four discovery methods in parallel:
 |---|---|---|---|
 | EIP Broadcast | EtherNet/IP | Allen-Bradley (Logix, SLC 500, PLC-5, MicroLogix), Omron NJ/NX | UDP broadcast on port 44818 |
 | S7 Port Scan | S7comm | Siemens S7-* | TCP protocol probe on port 102 |
-| ADS Broadcast + Scan | ADS | Beckhoff TwinCAT | UDP broadcast + TCP scan on port 48898 |
+| ADS Get Info + Scan | ADS | Beckhoff TwinCAT | UDP Get Info (port 48899) unicast to every scanned address and broadcast; TCP 48898 probe only for addresses that do not answer |
 | FINS Scan | FINS | Omron CS/CJ/CP | Network scan on port 9600 |
 
 ## Discover All PLCs
@@ -42,6 +42,27 @@ func main() {
     }
 }
 ```
+
+## Discovery Errors
+
+`DiscoverAll` drops per-protocol failures. `DiscoverAllWithReport` takes the same
+arguments and returns them as well:
+
+```go
+devices, errs := driver.DiscoverAllWithReport("255.255.255.255", "192.168.1.0/24", 500*time.Millisecond, 20)
+for _, err := range errs {
+    log.Printf("discovery: %v", err) // e.g. "ADS discovery: ADS UDP discovery send to 255.255.255.255:48899: permission denied"
+}
+```
+
+Each error names its protocol (EIP, S7, ADS, FINS). Typical entries: an invalid or
+oversized scan CIDR (reported once; the S7, ADS and FINS scans are then skipped), a
+UDP socket that cannot be opened, a broadcast the OS refuses (no broadcast
+permission, no route), unsent unicast probes (summarized as a count plus the first
+error) and scan errors. Devices from other protocols or destinations are still
+returned, so an empty device list with errors means "could not look", not "nothing
+there". Error order is unspecified. For ADS alone, `ads.DiscoverWithReport(ips,
+broadcastAddrs, timeout, concurrency)` gives the same report.
 
 ## EIP-Only Discovery
 
@@ -81,7 +102,7 @@ type DiscoveredDevice struct {
 - `slot` &mdash; Detected slot number
 
 **ADS (Beckhoff):**
-- `amsNetId` &mdash; AMS Net ID
+- `amsNetId` &mdash; AMS Net ID reported by the device over UDP Get Info (use it as `PLCConfig.AmsNetId`; it is often not the IP plus `.1.1`). For a device found only by the TCP fallback it is the IP plus `.1.1` guess that the device accepted
 - `hostname` &mdash; Device hostname
 - `tcVersion` &mdash; TwinCAT version
 - `hasRoute` &mdash; Whether a working ADS device-info exchange verified a route; false means unverified
@@ -155,10 +176,10 @@ When multiple discovery methods find the same device (e.g., an Omron NJ responds
 |---|---|---|---|
 | EIP | 44818 | Outbound UDP broadcast | Broadcast |
 | S7 | 102 | Outbound TCP | Unicast scan |
-| ADS | 48898 | Outbound UDP broadcast + TCP | Both |
+| ADS | 48899 (UDP), 48898 (TCP) | Outbound UDP unicast + broadcast; TCP fallback | Both |
 | FINS | 9600 | Outbound TCP | Unicast scan |
 
-Firewalls and VLANs may block discovery. UDP broadcasts do not cross router boundaries unless explicitly forwarded.
+Firewalls and VLANs may block discovery. UDP broadcasts do not cross router boundaries unless explicitly forwarded. ADS unicast Get Info to each scanned address does cross routers, so pass the remote subnet as the scan CIDR.
 
 ## Scan and ADS identity limits
 
@@ -168,8 +189,18 @@ are bounded at 128 and by the number of hosts. /31 and /32 retain usable boundar
 addresses; network/broadcast exclusions use the actual mask rather than the last
 octet. Invalid explicit scan IP lists are also rejected before I/O.
 
+ADS discovery sends the TwinCAT UDP Get Info request (magic `0x71146603`, service
+1, zero source NetID, AMS port 10000, no tags; the request pyads
+`adsGetNetIdForPLC` and Beckhoff's `AdsTool <ip> netid` use) to UDP 48899 of every
+scanned address and every local broadcast address from one socket, then collects
+replies until the timeout (or until every scanned address answered when no
+broadcast is sent). The reply's header (magic, invoke ID, service `0x80000001`,
+non-zero NetID) is validated strictly; its tags (`0x0005` hostname, `0x0003`
+TwinCAT version, others ignored) are parsed defensively, and a truncated tag drops
+only that value. Addresses that answer are not probed over TCP; the rest get the
+TCP 48898 device-info probe, which must guess the NetID as IP + `.1.1`.
+
 ADS UDP replies validate advertised identity and do not prove an ADS route.
 `HasRoute` is true only after a valid TCP ADS device-info exchange; a reachable
 TCP port with an invalid, truncated or ADS-error response does not create a device.
-The broadcast operation shares one deadline across broadcast destinations. Route
-installation is outside discovery. See [Beckhoff ADS](beckhoff.md).
+Route installation is outside discovery. See [Beckhoff ADS](beckhoff.md).

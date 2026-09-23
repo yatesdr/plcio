@@ -22,6 +22,64 @@ const (
 	FINSEndOK uint16 = 0x0000
 )
 
+// FINS end code status flags (W342 section 5-1-3 "End Codes"; W227 has the
+// same layout). Bits 6 and 7 are CPU Unit status flags, not part of the
+// main/sub response code, and are masked off before deciding whether a
+// command succeeded (W342: "if a battery error occurs ... the end code of a
+// sent command that is completed normally is 0040"). Bit 15 reports a
+// network relay error: the command failed in a relay node and the response
+// carries an extra word (error network address, error node address) in front
+// of any data, so it is always an error.
+const (
+	finsEndRelayErrorFlag  uint16 = 0x8000 // bit 15: network relay error
+	finsEndFatalCPUFlag    uint16 = 0x0080 // bit 7: fatal CPU Unit error
+	finsEndNonFatalCPUFlag uint16 = 0x0040 // bit 6: non-fatal CPU Unit error
+	finsEndFlagMask               = finsEndRelayErrorFlag | finsEndFatalCPUFlag | finsEndNonFatalCPUFlag
+)
+
+// FINSEndCodeFlags reports the status flags carried in a FINS end code:
+// network relay error (bit 15), fatal CPU Unit error (bit 7) and non-fatal
+// CPU Unit error (bit 6). The CPU flags are diagnostic only; they do not make
+// a command fail.
+func FINSEndCodeFlags(endCode uint16) (relayError, fatalCPUError, nonFatalCPUError bool) {
+	return endCode&finsEndRelayErrorFlag != 0, endCode&finsEndFatalCPUFlag != 0, endCode&finsEndNonFatalCPUFlag != 0
+}
+
+// FINSEndError is the error returned for a FINS response whose masked end
+// code is not normal completion, or whose network relay error flag is set.
+type FINSEndError struct {
+	EndCode    uint16 // raw end code as received
+	Code       uint16 // main/sub response code with the status flags masked off
+	RelayError bool   // network relay error flag (bit 15) was set
+	// RelayNetwork/RelayNode locate the relay error (W342 5-1-3 "Handling
+	// Network Relay Errors"); valid when HasRelayAddress is true.
+	RelayNetwork    byte
+	RelayNode       byte
+	HasRelayAddress bool
+	msg             string
+}
+
+func (e *FINSEndError) Error() string {
+	if e.RelayError {
+		where := ""
+		if e.HasRelayAddress {
+			where = fmt.Sprintf(" at network %d node %d", e.RelayNetwork, e.RelayNode)
+		}
+		return fmt.Sprintf("FINS network relay error 0x%04X%s: %s", e.Code, where, e.msg)
+	}
+	return fmt.Sprintf("FINS error 0x%04X: %s", e.Code, e.msg)
+}
+
+// finsResponseError is FINSEndCodeError plus, for a relay error, the error
+// network/node word that precedes the response data.
+func finsResponseError(endCode uint16, data []byte) error {
+	err := FINSEndCodeError(endCode)
+	if fe, ok := err.(*FINSEndError); ok && fe.RelayError && len(data) >= 2 {
+		fe.RelayNetwork, fe.RelayNode, fe.HasRelayAddress = data[0], data[1], true
+	}
+	return err
+}
+
 // FINSHeader represents a FINS command/response header.
 type FINSHeader struct {
 	ICF byte   // Information Control Field
@@ -166,26 +224,34 @@ func BuildMemoryWriteRequest(area byte, address uint16, bitOffset byte, values [
 }
 
 // FINSEndCodeError returns a human-readable error for a FINS end code.
-// Error codes are defined in the FINS Commands Reference Manual (W227-E1-2), Section 8.
+// Main/sub codes are from W342-E1-18 section 5-1-3 "End Codes" (CS/CJ/CP).
+// The CPU Unit error flags (0x0080, 0x0040) are masked off: a masked code of
+// 0x0000 is normal completion and returns nil. The network relay error flag
+// (0x8000) always yields an error. A non-nil result is a *FINSEndError.
 func FINSEndCodeError(endCode uint16) error {
-	if endCode == FINSEndOK {
+	relay, fatal, nonFatal := FINSEndCodeFlags(endCode)
+	if fatal || nonFatal {
+		logging.DebugLog("FINS", "EndCode 0x%04X: CPU Unit error flags set (fatal=%v non-fatal=%v)", endCode, fatal, nonFatal)
+	}
+	code := endCode &^ finsEndFlagMask
+	if code == FINSEndOK && !relay {
 		return nil
 	}
 
-	mainCode := endCode >> 8
-	subCode := endCode & 0xFF
-	logging.DebugLog("FINS", "EndCode error: 0x%04X (main=0x%02X sub=0x%02X)", endCode, mainCode, subCode)
+	mainCode := code >> 8
+	subCode := code & 0xFF
+	logging.DebugLog("FINS", "EndCode error: 0x%04X (main=0x%02X sub=0x%02X relay=%v)", endCode, mainCode, subCode, relay)
 
 	var msg string
 	switch mainCode {
 	case 0x00:
 		switch subCode {
 		case 0x00:
-			msg = "Normal completion"
+			msg = "Network relay error"
 		case 0x01:
-			msg = "Normal completion with warning: service canceled"
+			msg = "Service canceled"
 		default:
-			msg = "Normal completion"
+			msg = "Unknown normal-completion sub-code"
 		}
 	case 0x01:
 		switch subCode {
@@ -235,24 +301,24 @@ func FINSEndCodeError(endCode uint16) error {
 	case 0x04:
 		switch subCode {
 		case 0x01:
-			msg = "Not executable: undefined command"
+			msg = "Service unsupported: undefined command"
 		case 0x02:
-			msg = "Not executable: not supported by model/version"
+			msg = "Service unsupported: not supported by model/version"
 		default:
-			msg = "Not executable"
+			msg = "Service unsupported"
 		}
 	case 0x05:
 		switch subCode {
 		case 0x01:
-			msg = "Routing error: destination address not in routing tables"
+			msg = "Routing table error: destination address setting error"
 		case 0x02:
-			msg = "Routing error: no routing tables"
+			msg = "Routing table error: no routing tables"
 		case 0x03:
-			msg = "Routing error: routing table error"
+			msg = "Routing table error: routing table error"
 		case 0x04:
-			msg = "Routing error: too many relays"
+			msg = "Routing table error: too many relays"
 		default:
-			msg = "Routing error"
+			msg = "Routing table error"
 		}
 	case 0x10:
 		switch subCode {
@@ -314,7 +380,7 @@ func FINSEndCodeError(endCode uint16) error {
 		case 0x01:
 			msg = "Write not possible: read-only"
 		case 0x02:
-			msg = "Write not possible: protected (cannot write to protected area during operation)"
+			msg = "Write not possible: protected (program area protected, or data link table cannot be written)"
 		case 0x03:
 			msg = "Write not possible: cannot register"
 		case 0x05:
@@ -422,26 +488,22 @@ func FINSEndCodeError(endCode uint16) error {
 	case 0x30:
 		switch subCode {
 		case 0x01:
-			msg = "Abort: no memory card"
-		case 0x02:
-			msg = "Abort: memory card type error"
-		case 0x03:
-			msg = "Abort: I/O point overflow"
+			msg = "Access right error: no access right (held by another device)"
 		default:
-			msg = "Abort"
+			msg = "Access right error"
 		}
 	case 0x40:
 		switch subCode {
 		case 0x01:
-			msg = "Fatal error: transmission failure"
+			msg = "Abort: service aborted with ABORT command"
 		default:
-			msg = "Fatal error: communications error"
+			msg = "Abort"
 		}
 	default:
 		msg = "Unknown error"
 	}
 
-	return fmt.Errorf("FINS error 0x%04X: %s", endCode, msg)
+	return &FINSEndError{EndCode: endCode, Code: code, RelayError: relay, msg: msg}
 }
 
 // CPUStatus represents the CPU operating status.

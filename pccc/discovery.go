@@ -2,20 +2,29 @@ package pccc
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 )
 
-// Sys0Info describes the binary layout of the file directory (system file 0)
-// for a specific processor family. Different processors store the directory
-// in different formats.
+// Sys0Info describes how to read and parse the file directory held in system
+// file 0 for a processor family. The fields and values follow pycomm3's
+// SLCDriver (_get_sys0_info, _get_file_directory_size,
+// _read_whole_file_directory and _parse_file0); the pycomm3 key is given for
+// each field.
 type Sys0Info struct {
-	FileType     byte // Offset within a row for the file type byte
-	SizeElement  byte // Offset within a row for the element size/count byte
-	FilePosition int  // Byte offset where file directory entries begin
-	RowSize      int  // Size of each directory entry row in bytes
-	SizeConst    int  // Constant subtracted from the raw size value (MicroLogix 1100+ only)
+	FileType     byte // File type code used to address system file 0 in FNC 0xA1 reads ("file_type")
+	SizeElement  byte // Element (word) number in file 0 that holds the directory size in bytes ("size_element")
+	FilePosition int  // Byte offset in file 0 of the first data-file row ("file_position")
+	RowSize      int  // Size of each directory row in bytes ("row_size")
+	SizeConst    int  // Constant subtracted from the raw size value (MicroLogix 1100+ only) ("size_const")
+	SizeLen      byte // Byte count requested when reading the directory size ("size_len")
 }
+
+// ErrDiscoveryNotSupported is returned by GetFileDirectory for processors
+// whose file directory layout is not established by a reference, rather than
+// guessing and returning wrong data.
+var ErrDiscoveryNotSupported = errors.New("pccc: file directory discovery not supported for this processor")
 
 // FileDirectoryEntry describes a single data file discovered from the file directory.
 type FileDirectoryEntry struct {
@@ -53,11 +62,9 @@ func (p *PLC) getProcessorTypeFromDiagnosticStatus() (string, error) {
 
 	tns := p.nextTNS()
 
-	// CMD 0x06 has no FNC byte — the header is just [CMD] [STS] [TNS lo] [TNS hi]
-	pcccCmd := make([]byte, 0, 4)
-	pcccCmd = append(pcccCmd, CmdDiagnosticStatus)
-	pcccCmd = append(pcccCmd, 0x00) // STS = 0 in request
-	pcccCmd = binary.LittleEndian.AppendUint16(pcccCmd, tns)
+	// Diagnostic Status is CMD 0x06, FNC 0x03 (DF1 manual 1770-6.5.16;
+	// pycomm3 get_processor_type): [CMD] [STS] [TNS lo] [TNS hi] [FNC]
+	pcccCmd := buildPCCCHeader(CmdDiagnosticStatus, tns, FncDiagnosticStatus)
 
 	cipReq, err := wrapInCipExecutePCCC(pcccCmd, p.vendorID, p.serialNum)
 	if err != nil {
@@ -85,20 +92,30 @@ func (p *PLC) getProcessorTypeFromDiagnosticStatus() (string, error) {
 	if cmd != CmdDiagnosticReply {
 		return "", fmt.Errorf("unexpected reply command 0x%02X", cmd)
 	}
+	if err := checkReplyTNS(pcccResp, tns); err != nil {
+		return "", err
+	}
 	if sts != StsSuccess {
-		return "", PCCCStatusError(sts, 0)
+		var extSts byte
+		if sts&0xF0 == 0xF0 && len(pcccResp) >= 5 {
+			extSts = pcccResp[4]
+		}
+		return "", PCCCStatusError(sts, extSts)
 	}
 
-	// The catalog string is in the data portion after the 4-byte header.
-	// It's typically a null-terminated ASCII string starting at a known offset.
-	// For SLC/MicroLogix, the catalog string is at bytes 12-21 (0-indexed from data start).
+	// The catalog number is 11 ASCII bytes at offset 5 of the reply data
+	// (after the 4-byte header): mode/status, type extender, extended
+	// interface type, extended processor type, series/revision, then the
+	// catalog number. pycomm3 get_processor_type reads the same [5:16].
 	data := pcccResp[4:]
-	if len(data) < 22 {
+	if len(data) < 16 {
 		return "", fmt.Errorf("diagnostic data too short: %d bytes", len(data))
 	}
 
-	// Extract catalog: starts at byte 12, up to 10 chars, null/space terminated
-	catalog := extractCatalog(data[12:22])
+	catalog := extractCatalog(data[5:16])
+	if catalog == "" {
+		return "", fmt.Errorf("diagnostic status reply has no catalog number")
+	}
 	debugLog("GetProcessorType: catalog=%q", catalog)
 	return catalog, nil
 }
@@ -164,18 +181,23 @@ func extractCatalogPrefix(catalog string) string {
 	return catalog[:4]
 }
 
-// readSection reads a chunk of data from a data file using the
-// Protected Typed Logical Read (CMD 0x0F, FNC 0xA1) command.
-// This is used to read the system file directory (file 0).
-func (p *PLC) readSection(fileNum uint16, fileType byte, offset uint16, size uint16) ([]byte, error) {
+// readSection reads size bytes of system/data file fileNum starting at word
+// element using Protected Typed Logical Read with 2 address fields
+// (CMD 0x0F, FNC 0xA1):
+//
+//	[CMD] [STS] [TNS:2 LE] [FNC=0xA1] [ByteSize] [FileNumber] [FileType] [Element]
+//
+// There is no sub-element field in the 2-address-field form; this matches the
+// requests pycomm3 builds in _get_file_directory_size and
+// _read_whole_file_directory ("function code, from RSLinx capture").
+func (p *PLC) readSection(fileNum uint16, fileType byte, element uint16, size uint16) ([]byte, error) {
 	tns := p.nextTNS()
 
 	pcccCmd := buildPCCCHeader(CmdTypedCommand, tns, FncReadSection)
 	pcccCmd = appendCompactValue(pcccCmd, size)
 	pcccCmd = appendCompactValue(pcccCmd, fileNum)
 	pcccCmd = append(pcccCmd, fileType)
-	pcccCmd = appendCompactValue(pcccCmd, offset)
-	pcccCmd = appendCompactValue(pcccCmd, 0) // sub-element
+	pcccCmd = appendCompactValue(pcccCmd, element)
 
 	cipReq, err := wrapInCipExecutePCCC(pcccCmd, p.vendorID, p.serialNum)
 	if err != nil {
@@ -184,24 +206,35 @@ func (p *PLC) readSection(fileNum uint16, fileType byte, offset uint16, size uin
 
 	cipResp, err := p.sendCipRequest(cipReq)
 	if err != nil {
-		return nil, fmt.Errorf("readSection file %d offset %d: %w", fileNum, offset, err)
+		return nil, fmt.Errorf("readSection file %d element %d: %w", fileNum, element, err)
 	}
 
 	pcccResp, err := parseCipExecutePCCCResponse(cipResp)
 	if err != nil {
-		return nil, fmt.Errorf("readSection file %d offset %d: %w", fileNum, offset, err)
+		return nil, fmt.Errorf("readSection file %d element %d: %w", fileNum, element, err)
 	}
 
-	data, err := parsePCCCReadResponse(pcccResp)
+	data, err := parsePCCCReadResponse(pcccResp, tns)
 	if err != nil {
-		return nil, fmt.Errorf("readSection file %d offset %d: %w", fileNum, offset, err)
+		return nil, fmt.Errorf("readSection file %d element %d: %w", fileNum, element, err)
 	}
 
 	return data, nil
 }
 
-// GetFileDirectory discovers all data files by reading the file directory (system file 0).
-// This works for SLC 500 and MicroLogix processors (not PLC-5).
+// fileDirectoryChunk is the byte count per FNC 0xA1 read of file 0 (pycomm3
+// reads 0x50 bytes at a time).
+const fileDirectoryChunk = 0x50
+
+// GetFileDirectory discovers all data files by reading the file directory
+// (system file 0). It works for SLC 5/03, 5/04, 5/05 and MicroLogix 1100 and
+// 1400; other processors return ErrDiscoveryNotSupported (PLC-5 has no such
+// directory).
+//
+// The procedure follows pycomm3's SLCDriver.get_file_directory: read the
+// directory size from word SizeElement of file 0 (addressed with file type
+// FileType), read all of file 0 from element 0 in 0x50-byte chunks (element =
+// words already read), then parse the rows starting at FilePosition.
 func (p *PLC) GetFileDirectory() ([]FileDirectoryEntry, error) {
 	// Step 1: Get processor type
 	catalog, err := p.GetProcessorType()
@@ -210,17 +243,15 @@ func (p *PLC) GetFileDirectory() ([]FileDirectoryEntry, error) {
 	}
 
 	// Step 2: Lookup sys0 layout for this processor
-	prefix := extractCatalogPrefix(catalog)
-	sys0, err := lookupSys0Info(prefix)
+	sys0, err := sys0InfoForCatalog(catalog)
 	if err != nil {
 		return nil, fmt.Errorf("GetFileDirectory: %w", err)
 	}
 
-	debugLog("GetFileDirectory: catalog=%q prefix=%q sys0=%+v", catalog, prefix, *sys0)
+	debugLog("GetFileDirectory: catalog=%q sys0=%+v", catalog, *sys0)
 
-	// Step 3: Read the size of the file directory from the system file header.
-	// The first 2 bytes at offset 0 of sys file 0 give the total size in bytes.
-	sizeData, err := p.readSection(0, FileTypeStatus, 0, 2)
+	// Step 3: Read the size in bytes of file 0.
+	sizeData, err := p.readSection(0, sys0.FileType, uint16(sys0.SizeElement), uint16(sys0.SizeLen))
 	if err != nil {
 		return nil, fmt.Errorf("GetFileDirectory: read directory size: %w", err)
 	}
@@ -234,19 +265,25 @@ func (p *PLC) GetFileDirectory() ([]FileDirectoryEntry, error) {
 
 	debugLog("GetFileDirectory: totalSize=%d filePosition=%d", totalSize, sys0.FilePosition)
 
-	// Step 4: Read the file directory data in chunks
-	dirSize := totalSize - sys0.FilePosition
-	const maxChunk = 80
-	dirData := make([]byte, 0, dirSize)
-
-	for offset := 0; offset < dirSize; offset += maxChunk {
-		chunk := maxChunk
-		if offset+chunk > dirSize {
-			chunk = dirSize - offset
+	// Step 4: Read all of file 0. The element field is a word offset.
+	dirData := make([]byte, 0, totalSize)
+	for len(dirData) < totalSize {
+		if len(dirData)%2 != 0 {
+			return nil, fmt.Errorf("GetFileDirectory: odd-length reply at offset %d", len(dirData)-1)
 		}
-		data, err := p.readSection(0, FileTypeStatus, uint16(sys0.FilePosition+offset), uint16(chunk))
+		chunk := totalSize - len(dirData)
+		if chunk > fileDirectoryChunk {
+			chunk = fileDirectoryChunk
+		}
+		data, err := p.readSection(0, sys0.FileType, uint16(len(dirData)/2), uint16(chunk))
 		if err != nil {
-			return nil, fmt.Errorf("GetFileDirectory: read offset %d: %w", offset, err)
+			return nil, fmt.Errorf("GetFileDirectory: read offset %d: %w", len(dirData), err)
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("GetFileDirectory: empty reply at offset %d", len(dirData))
+		}
+		if len(data) > chunk {
+			data = data[:chunk]
 		}
 		dirData = append(dirData, data...)
 	}
@@ -261,7 +298,28 @@ func (p *PLC) GetFileDirectory() ([]FileDirectoryEntry, error) {
 	return entries, nil
 }
 
-// lookupSys0Info returns the file directory layout for the given catalog prefix.
+// sys0InfoForCatalog returns the file directory layout for a full catalog
+// number. SLC 500 (1747) support is limited to the Ethernet-capable modular
+// processors (5/03 L53x, 5/04 L54x, 5/05 L55x); fixed and 5/01, 5/02
+// processors share the 1747 prefix but not the layout.
+func sys0InfoForCatalog(catalog string) (*Sys0Info, error) {
+	prefix := extractCatalogPrefix(catalog)
+	if prefix == "1747" {
+		model := strings.ToUpper(catalog)
+		if !strings.HasPrefix(model, "1747-L53") && !strings.HasPrefix(model, "1747-L54") && !strings.HasPrefix(model, "1747-L55") {
+			return nil, fmt.Errorf("%w: %q", ErrDiscoveryNotSupported, catalog)
+		}
+	}
+	return lookupSys0Info(prefix)
+}
+
+// lookupSys0Info returns the file directory layout for the given catalog
+// prefix. Values are pycomm3's _get_sys0_info. Only layouts pycomm3 reports
+// as taken from real processors are enabled: SLC 5/05 (its default branch)
+// and MicroLogix 1100 / 1400 ("values from 1100 and 1400"). pycomm3 marks
+// MicroLogix 1000 ("Not sure if these are correct, never tested") and
+// 1200 / 1500 ("not tested on 1200/1500") as unverified, so those return
+// ErrDiscoveryNotSupported rather than risk wrong data.
 func lookupSys0Info(prefix string) (*Sys0Info, error) {
 	switch prefix {
 	case "1747": // SLC 5/03, 5/04, 5/05
@@ -271,22 +329,16 @@ func lookupSys0Info(prefix string) (*Sys0Info, error) {
 			FilePosition: 79,
 			RowSize:      10,
 			SizeConst:    0,
+			SizeLen:      0x04,
 		}, nil
-	case "1761": // MicroLogix 1000
-		return &Sys0Info{
-			FileType:     0x00,
-			SizeElement:  0x23,
-			FilePosition: 93,
-			RowSize:      8,
-			SizeConst:    0,
-		}, nil
-	case "1762", "1763", "1764": // MicroLogix 1100, 1200, 1500
+	case "1763": // MicroLogix 1100
 		return &Sys0Info{
 			FileType:     0x02,
 			SizeElement:  0x28,
 			FilePosition: 233,
 			RowSize:      10,
 			SizeConst:    19968,
+			SizeLen:      0x08,
 		}, nil
 	case "1766": // MicroLogix 1400
 		return &Sys0Info{
@@ -295,60 +347,52 @@ func lookupSys0Info(prefix string) (*Sys0Info, error) {
 			FilePosition: 233,
 			RowSize:      10,
 			SizeConst:    19968,
+			SizeLen:      0x08,
 		}, nil
+	case "1761", "1762", "1764": // MicroLogix 1000, 1200, 1500: layout unverified
+		return nil, fmt.Errorf("%w: catalog prefix %q (layout unverified)", ErrDiscoveryNotSupported, prefix)
 	default:
-		return nil, fmt.Errorf("unknown processor catalog prefix %q", prefix)
+		return nil, fmt.Errorf("%w: unknown processor catalog prefix %q", ErrDiscoveryNotSupported, prefix)
 	}
 }
 
-// parseFileDirectory walks the raw file directory data and extracts data file entries.
+// fileTypePLS is the programmable limit switch file type code. It is not
+// addressable through this package, but it occupies a file number.
+const fileTypePLS byte = 0x94
+
+// parseFileDirectory walks the rows of file 0 (the whole file, as read from
+// element 0) and extracts the data file entries, following pycomm3's
+// _parse_file0: rows start at FilePosition and are RowSize bytes apart; byte 0
+// of a row is the file type code and bytes 1-2 are the file size in bytes
+// (little-endian). The element count is size / element size. File numbers
+// start at 0 and advance for each recognised data file type and for 0x81
+// placeholder rows (skipped file numbers); other rows do not use a number.
 func parseFileDirectory(data []byte, sys0 *Sys0Info) ([]FileDirectoryEntry, error) {
+	if sys0 == nil || sys0.RowSize <= 0 || sys0.FilePosition < 0 {
+		return nil, fmt.Errorf("invalid file directory layout")
+	}
+
 	var entries []FileDirectoryEntry
 
 	fileNumber := 0
-	for offset := 0; offset+sys0.RowSize <= len(data); offset += sys0.RowSize {
-		row := data[offset : offset+sys0.RowSize]
-
-		// Extract file type from the row at the configured offset
-		if int(sys0.FileType) >= len(row) {
-			fileNumber++
-			continue
-		}
-		ft := row[sys0.FileType]
-
-		// Skip placeholder/deleted files
-		if ft == FileTypePlaceholder || ft == 0x00 {
-			fileNumber++
-			continue
-		}
-
-		// Extract element count from the row at the configured offset
-		var elemCount int
-		if int(sys0.SizeElement) < len(row) {
-			elemCount = int(row[sys0.SizeElement])
-		} else if int(sys0.SizeElement) < len(row)+1 {
-			// For some layouts, the size is a 16-bit value
-			elemCount = int(row[sys0.SizeElement])
-		}
-
-		// Handle 16-bit element count for larger layouts
-		sizeOffset := int(sys0.SizeElement)
-		if sizeOffset+1 < len(row) {
-			elemCount = int(binary.LittleEndian.Uint16(row[sizeOffset : sizeOffset+2]))
-		} else if sizeOffset < len(row) {
-			elemCount = int(row[sizeOffset])
-		}
-
+	for pos := sys0.FilePosition; pos+3 <= len(data); pos += sys0.RowSize {
+		ft := data[pos]
 		prefix := FileTypePrefix(ft)
-		entries = append(entries, FileDirectoryEntry{
-			FileNumber:   fileNumber,
-			FileType:     ft,
-			FileTypeName: FileTypeName(ft),
-			TypePrefix:   prefix,
-			ElementCount: elemCount,
-		})
 
-		fileNumber++
+		if prefix != "" {
+			size := int(binary.LittleEndian.Uint16(data[pos+1 : pos+3]))
+			entries = append(entries, FileDirectoryEntry{
+				FileNumber:   fileNumber,
+				FileType:     ft,
+				FileTypeName: FileTypeName(ft),
+				TypePrefix:   prefix,
+				ElementCount: size / ElementSize(ft),
+			})
+		}
+
+		if prefix != "" || ft == fileTypePLS || ft == FileTypePlaceholder {
+			fileNumber++
+		}
 	}
 
 	return entries, nil

@@ -3,6 +3,7 @@ package logix
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/yatesdr/plcio/cip"
@@ -22,10 +23,27 @@ type PLC struct {
 	// - non-empty: route via Connection Manager through specified path
 	RoutePath []byte
 
-	// CIP connection state (for connected messaging)
+	// micro800 omits the backplane port segment from the Forward Open
+	// connection path when no RoutePath is set (Micro800 has no backplane).
+	micro800 bool
+
+	// CIP connection state (for connected messaging), guarded by mu so that
+	// CloseConnection can run concurrently with requests and keepalives.
+	mu       sync.Mutex
 	cipConn  *cip.Connection // Active CIP connection (nil if not connected)
 	connPath []byte          // Connection path used for Forward Open/Close
 	connSize uint16          // Negotiated connection size
+
+	origSerial uint32 // Random Forward Open originator serial (see originatorSerial)
+}
+
+// activeConn returns a consistent snapshot of the CIP connection state.
+// The returned connection stays usable even if CloseConnection runs
+// concurrently; requests on a closed connection fail instead of panicking.
+func (p *PLC) activeConn() (*cip.Connection, uint16) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cipConn, p.connSize
 }
 
 // Tag holds the raw data read from a PLC tag.
@@ -73,10 +91,8 @@ func (p *PLC) Close() {
 	if p == nil || p.Connection == nil {
 		return
 	}
-	// Close CIP connection if open
-	if p.cipConn != nil {
-		_ = p.CloseConnection()
-	}
+	// Close CIP connection if open (no-op otherwise)
+	_ = p.CloseConnection()
 	_ = p.Connection.Disconnect()
 }
 
@@ -167,9 +183,18 @@ func (p *PLC) readTagCountInternal(tagName string, count uint16) (*Tag, bool, er
 
 // readTagChunked reads a large array in chunks using array index syntax.
 // This is more reliable for structure arrays than byte-offset fragmented reads.
+// Any failure returns an error; a partially read value is never reported as
+// complete.
 func (p *PLC) readTagChunked(tagName string, totalCount uint16, initialTag *Tag) (*Tag, error) {
 	if initialTag == nil || len(initialTag.Bytes) == 0 {
 		return nil, fmt.Errorf("readTagChunked: no initial data to determine element size")
+	}
+
+	// Structure replies prefix every chunk with a structure handle, so index
+	// based reassembly would interleave handles with member data. Byte-offset
+	// fragmented reads strip the per-fragment handle and reassemble exactly.
+	if IsCIPStructResponse(initialTag.DataType) {
+		return p.readTagFragmentedInternal(tagName, totalCount, 0)
 	}
 
 	// Calculate element size from initial read
@@ -179,38 +204,31 @@ func (p *PLC) readTagChunked(tagName string, totalCount uint16, initialTag *Tag)
 	// Estimate elements per chunk based on connection size
 	// Leave room for CIP overhead (header, type code, etc.)
 	maxPayload := 480 // Conservative default for unconnected messaging
-	if p.connSize > 0 {
-		maxPayload = int(p.connSize) - 100 // Leave room for protocol overhead
+	if conn, size := p.activeConn(); conn != nil && size > 0 {
+		maxPayload = int(size) - 100 // Leave room for protocol overhead
 	}
 
-	// We need to figure out how many complete elements we got
-	// For the first chunk, we'll use the partial data and continue from there
-	allBytes := make([]byte, 0, initialBytes*int(totalCount)/10+initialBytes)
-	allBytes = append(allBytes, initialTag.Bytes...)
-
-	// Calculate elements read so far
 	// We need to determine element size - try reading a single element to get the size
 	singleTag, _, err := p.readTagCountInternal(tagName+"[0]", 1)
 	if err != nil {
-		// Can't determine element size, return what we have
-		return &Tag{
-			Name:     tagName,
-			DataType: initialTag.DataType,
-			Bytes:    allBytes,
-		}, nil
+		// Not indexable (for example an already-indexed element path): read
+		// the whole value by byte offset instead of returning a prefix.
+		debugLogVerbose("readTagChunked %q: element probe failed (%v), using fragmented read", tagName, err)
+		return p.readTagFragmentedInternal(tagName, totalCount, 0)
 	}
 
 	elemSize := len(singleTag.Bytes)
 	if elemSize == 0 {
-		return &Tag{
-			Name:     tagName,
-			DataType: initialTag.DataType,
-			Bytes:    allBytes,
-		}, nil
+		return nil, fmt.Errorf("readTagChunked %q: cannot determine element size", tagName)
 	}
 
-	// Calculate how many elements we already have
+	// Keep only the complete elements from the initial partial reply.
 	elementsRead := initialBytes / elemSize
+	if elementsRead > int(totalCount) {
+		elementsRead = int(totalCount)
+	}
+	allBytes := make([]byte, 0, elemSize*int(totalCount))
+	allBytes = append(allBytes, initialTag.Bytes[:elementsRead*elemSize]...)
 
 	// Calculate optimal chunk size
 	elemsPerChunk := maxPayload / elemSize
@@ -231,26 +249,21 @@ func (p *PLC) readTagChunked(tagName string, totalCount uint16, initialTag *Tag)
 
 		// Read chunk starting at current index
 		chunkTagName := fmt.Sprintf("%s[%d]", tagName, elementsRead)
-		chunkTag, partial, err := p.readTagCountInternal(chunkTagName, uint16(chunkSize))
+		chunkTag, _, err := p.readTagCountInternal(chunkTagName, uint16(chunkSize))
 		if err != nil {
-			// Return what we have so far
-			break
+			return nil, fmt.Errorf("readTagChunked %q: element %d: %w", tagName, elementsRead, err)
 		}
 
-		allBytes = append(allBytes, chunkTag.Bytes...)
-		elementsRead += len(chunkTag.Bytes) / elemSize
-
-		// If no partial transfer, we got all requested elements
-		if !partial {
-			// Move to next chunk
-			continue
-		}
-
-		// Partial transfer within chunk - add what we got and continue
+		// A partial chunk contributes only its complete elements.
 		actualElems := len(chunkTag.Bytes) / elemSize
-		if actualElems == 0 {
-			break // No progress, stop to avoid infinite loop
+		if actualElems > chunkSize {
+			actualElems = chunkSize
 		}
+		if actualElems == 0 {
+			return nil, fmt.Errorf("readTagChunked %q: no progress at element %d", tagName, elementsRead)
+		}
+		allBytes = append(allBytes, chunkTag.Bytes[:actualElems*elemSize]...)
+		elementsRead += actualElems
 	}
 
 	return &Tag{
@@ -268,11 +281,29 @@ func (p *PLC) ReadTagFragmented(tagName string, expectedSize uint32) (*Tag, erro
 }
 
 func (p *PLC) readTagFragmentedCount(tagName string, count uint16, expectedSize uint32) (*Tag, error) {
+	if count == 0 || expectedSize == 0 {
+		return nil, fmt.Errorf("ReadTagFragmented: count and expected size must be positive")
+	}
+	return p.readTagFragmentedInternal(tagName, count, expectedSize)
+}
+
+// maxUnsizedFragmentedRead bounds a fragmented read whose size is not known in
+// advance so a misbehaving peer cannot grow the reassembly without limit.
+const maxUnsizedFragmentedRead = 16 << 20
+
+// readTagFragmentedInternal performs the fragmented read. An expectedSize of
+// zero means the size is unknown: fragments are read until the controller
+// reports the final one.
+func (p *PLC) readTagFragmentedInternal(tagName string, count uint16, expectedSize uint32) (*Tag, error) {
 	if p == nil || p.Connection == nil {
 		return nil, fmt.Errorf("ReadTagFragmented: nil plc or connection")
 	}
-	if count == 0 || expectedSize == 0 {
-		return nil, fmt.Errorf("ReadTagFragmented: count and expected size must be positive")
+	if count == 0 {
+		return nil, fmt.Errorf("ReadTagFragmented: count must be positive")
+	}
+	known := expectedSize > 0
+	if !known {
+		expectedSize = maxUnsizedFragmentedRead
 	}
 
 	// Build the symbolic EPath for the tag name
@@ -338,7 +369,7 @@ func (p *PLC) readTagFragmentedCount(tagName string, count uint16, expectedSize 
 
 		// If no partial transfer, we're done
 		if !partial {
-			if offset != expectedSize {
+			if known && offset != expectedSize {
 				return nil, fmt.Errorf("ReadTagFragmented: incomplete data (%d/%d bytes)", offset, expectedSize)
 			}
 			break
@@ -368,6 +399,18 @@ func (p *PLC) WriteTagCount(tagName string, dataType uint16, value []byte, count
 
 	logging.DebugLog("logix", "WriteTagCount %s: dataType=0x%04X (%s), count=%d, data=%X",
 		tagName, dataType, TypeName(dataType), count, value)
+	return p.writeTagTyped(tagName, binary.LittleEndian.AppendUint16(nil, dataType), count, value)
+}
+
+// writeTagTyped sends Write Tag with an encoded data type: two bytes for an
+// atomic type, or 0x02A0 followed by the structure handle for a structure.
+func (p *PLC) writeTagTyped(tagName string, typeBytes []byte, count uint16, value []byte) error {
+	if p == nil || p.Connection == nil {
+		return fmt.Errorf("WriteTag: nil plc or connection")
+	}
+	if tagName == "" {
+		return fmt.Errorf("WriteTag: empty tag name")
+	}
 
 	// Build the symbolic EPath for the tag name.
 	path, err := cip.EPath().Symbol(tagName).Build()
@@ -377,13 +420,13 @@ func (p *PLC) WriteTagCount(tagName string, dataType uint16, value []byte, count
 
 	// Build the CIP request:
 	// [Service 1 byte] [PathSize 1 byte] [Path n bytes] [DataType 2 bytes] [Count 2 bytes] [Data n bytes]
-	reqData := make([]byte, 0, 2+len(path)+4+len(value))
-	reqData = append(reqData, SvcWriteTag)                        // Service code
-	reqData = append(reqData, path.WordLen())                     // Path size in words
-	reqData = append(reqData, path...)                            // Path bytes
-	reqData = binary.LittleEndian.AppendUint16(reqData, dataType) // Data type
-	reqData = binary.LittleEndian.AppendUint16(reqData, count)    // Element count
-	reqData = append(reqData, value...)                           // Tag data
+	reqData := make([]byte, 0, 2+len(path)+len(typeBytes)+2+len(value))
+	reqData = append(reqData, SvcWriteTag)                     // Service code
+	reqData = append(reqData, path.WordLen())                  // Path size in words
+	reqData = append(reqData, path...)                         // Path bytes
+	reqData = append(reqData, typeBytes...)                    // Data type
+	reqData = binary.LittleEndian.AppendUint16(reqData, count) // Element count
+	reqData = append(reqData, value...)                        // Tag data
 
 	logging.DebugLog("logix", "WriteTagCount %s: CIP request=%X", tagName, reqData)
 
@@ -459,24 +502,12 @@ func buildDirectCpf(cipRequest []byte) *eip.EipCommonPacket {
 func (p *PLC) sendCipRequest(reqData []byte) ([]byte, error) {
 	debugLogVerbose("sendCipRequest: svc=0x%02X, %d bytes", reqData[0], len(reqData))
 
-	if p.cipConn != nil {
+	if conn, _ := p.activeConn(); conn != nil {
 		// Use connected messaging
-		connData := p.cipConn.WrapConnected(reqData)
-		cpf := p.buildConnectedCpf(connData)
-
-		resp, err := p.Connection.SendUnitDataTransaction(*cpf)
+		cipResp, err := p.sendConnected(conn, reqData)
 		if err != nil {
-			debugLog("sendCipRequest: SendUnitDataTransaction error: %v", err)
-			return nil, fmt.Errorf("SendUnitDataTransaction: %w", err)
-		}
-
-		if len(resp.Items) < 2 {
-			return nil, fmt.Errorf("expected 2 CPF items, got %d", len(resp.Items))
-		}
-
-		_, cipResp, err := p.cipConn.UnwrapConnected(resp.Items[1].Data)
-		if err != nil {
-			return nil, fmt.Errorf("UnwrapConnected: %w", err)
+			debugLog("sendCipRequest: connected request error: %v", err)
+			return nil, err
 		}
 
 		debugLogVerbose("sendCipRequest: response %d bytes", len(cipResp))
@@ -662,6 +693,16 @@ func parseWriteTagResponse(data []byte) error {
 	return nil
 }
 
+// cipStatusError is a non-success general status returned by the device, as
+// opposed to a transport or parsing failure on this side.
+type cipStatusError struct {
+	status    byte
+	extStatus uint16
+	msg       string
+}
+
+func (e *cipStatusError) Error() string { return e.msg }
+
 // parseCipError constructs an error from CIP status codes.
 func parseCipError(status byte, addlSize byte, addlData []byte) error {
 	statusName := cipStatusName(status)
@@ -671,11 +712,12 @@ func parseCipError(status byte, addlSize byte, addlData []byte) error {
 		extStatus := binary.LittleEndian.Uint16(addlData[:2])
 		if extStatus != 0 {
 			extName := cipExtStatusName(extStatus)
-			return fmt.Errorf("CIP error: %s (0x%02X), extended: %s (0x%04X)", statusName, status, extName, extStatus)
+			return &cipStatusError{status: status, extStatus: extStatus,
+				msg: fmt.Sprintf("CIP error: %s (0x%02X), extended: %s (0x%04X)", statusName, status, extName, extStatus)}
 		}
 	}
 
-	return fmt.Errorf("CIP error: %s (0x%02X)", statusName, status)
+	return &cipStatusError{status: status, msg: fmt.Sprintf("CIP error: %s (0x%02X)", statusName, status)}
 }
 
 func cipStatusName(status byte) string {

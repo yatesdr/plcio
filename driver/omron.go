@@ -3,6 +3,7 @@ package driver
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/yatesdr/plcio/omron"
 )
@@ -11,29 +12,58 @@ import (
 type OmronAdapter struct {
 	client   *omron.Client
 	config   *PLCConfig
-	protocol string // "fins" or "eip"
+	protocol string // "fins", "fins-tcp", "fins-udp" or "eip" (normalized)
+	mu       sync.RWMutex
+	epoch    uint64 // bumped by Close so an in-flight Connect cannot resurrect the client
 }
 
 // NewOmronAdapter creates a new OmronAdapter from configuration.
 // The connection is not established until Connect() is called.
+// An unrecognized protocol is an error rather than a silent FINS fallback.
 func NewOmronAdapter(cfg *PLCConfig) (*OmronAdapter, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")
 	}
+	protocol, err := omronProtocol(cfg.Protocol)
+	if err != nil {
+		return nil, err
+	}
 	return &OmronAdapter{
 		config:   cfg,
-		protocol: strings.ToLower(cfg.Protocol),
+		protocol: protocol,
 	}, nil
 }
 
+// omronProtocol normalizes an Omron protocol setting (case-insensitive,
+// surrounding spaces ignored). "" and "fins" select FINS with TCP-then-UDP
+// fallback; "fins-tcp" and "fins-udp" force one FINS transport; "eip" selects
+// EtherNet/IP (NJ/NX).
+func omronProtocol(p string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(p)); v {
+	case "", "fins":
+		return "fins", nil
+	case "fins-tcp", "fins-udp", "eip":
+		return v, nil
+	default:
+		return "", fmt.Errorf("omron: unsupported protocol %q (want \"fins\" (default), \"fins-tcp\", \"fins-udp\" or \"eip\")", p)
+	}
+}
+
+func (a *OmronAdapter) currentClient() *omron.Client {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.client
+}
+
 // Connect establishes connection to the Omron PLC.
+// Any previously connected client is closed once the new one is installed.
 func (a *OmronAdapter) Connect() error {
+	a.mu.RLock()
+	epoch := a.epoch
+	a.mu.RUnlock()
 	opts := []omron.Option{}
 
 	protocol := a.protocol
-	if protocol == "" {
-		protocol = "fins" // Default to FINS
-	}
 
 	if a.config.Timeout > 0 {
 		opts = append(opts, omron.WithTimeout(a.config.Timeout))
@@ -42,8 +72,9 @@ func (a *OmronAdapter) Connect() error {
 	if protocol == "eip" {
 		opts = append(opts, omron.WithTransport(omron.TransportEIP))
 	} else {
-		// FINS transport
-		opts = append(opts, omron.WithTransport(omron.TransportFINS))
+		// FINS transport: "fins" tries TCP then UDP; "fins-tcp"/"fins-udp"
+		// force one.
+		opts = append(opts, omron.WithTransport(omron.Transport(protocol)))
 
 		if a.config.FinsPort > 0 {
 			opts = append(opts, omron.WithPort(a.config.FinsPort))
@@ -60,23 +91,38 @@ func (a *OmronAdapter) Connect() error {
 		return fmt.Errorf("omron connect: %w", err)
 	}
 
+	a.mu.Lock()
+	if a.epoch != epoch {
+		a.mu.Unlock()
+		client.Close()
+		return fmt.Errorf("omron connect superseded by Close")
+	}
+	previous := a.client
 	a.client = client
+	a.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 	return nil
 }
 
 // Close releases the connection.
 func (a *OmronAdapter) Close() error {
-	if a.client != nil {
-		err := a.client.Close()
-		a.client = nil
-		return err
+	a.mu.Lock()
+	client := a.client
+	a.client = nil
+	a.epoch++
+	a.mu.Unlock()
+	if client != nil {
+		return client.Close()
 	}
 	return nil
 }
 
 // IsConnected returns true if connected to the PLC.
 func (a *OmronAdapter) IsConnected() bool {
-	return a.client != nil && a.client.IsConnected()
+	client := a.currentClient()
+	return client != nil && client.IsConnected()
 }
 
 // Family returns the PLC family.
@@ -86,19 +132,21 @@ func (a *OmronAdapter) Family() PLCFamily {
 
 // ConnectionMode returns a description of the connection mode.
 func (a *OmronAdapter) ConnectionMode() string {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return "Not connected"
 	}
-	return a.client.ConnectionMode()
+	return client.ConnectionMode()
 }
 
 // GetDeviceInfo returns information about the connected PLC.
 func (a *OmronAdapter) GetDeviceInfo() (*DeviceInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	info, err := a.client.GetDeviceInfo()
+	info, err := client.GetDeviceInfo()
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +168,8 @@ func (a *OmronAdapter) SupportsDiscovery() bool {
 
 // AllTags returns all tags (EIP only).
 func (a *OmronAdapter) AllTags() ([]TagInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
@@ -128,7 +177,7 @@ func (a *OmronAdapter) AllTags() ([]TagInfo, error) {
 		return nil, nil // FINS doesn't support discovery
 	}
 
-	tags, err := a.client.AllTags()
+	tags, err := client.AllTags()
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +208,8 @@ func (a *OmronAdapter) Programs() ([]string, error) {
 
 // Read reads tag values from the PLC.
 func (a *OmronAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
@@ -172,7 +222,7 @@ func (a *OmronAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		}
 	}
 
-	values, err := a.client.ReadWithTypes(omronRequests)
+	values, err := client.ReadWithTypes(omronRequests)
 	if err != nil && len(values) == 0 {
 		return nil, err
 	}
@@ -210,7 +260,8 @@ func (a *OmronAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 
 // Write writes a value to a tag.
 func (a *OmronAdapter) Write(tag string, value interface{}) error {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return fmt.Errorf("not connected")
 	}
 
@@ -228,7 +279,7 @@ func (a *OmronAdapter) Write(tag string, value interface{}) error {
 	if canonicalNumeric(value) {
 		var code uint16
 		if a.protocol == "eip" {
-			values, err := a.client.Read(tag)
+			values, err := client.Read(tag)
 			if err != nil {
 				return err
 			}
@@ -246,19 +297,25 @@ func (a *OmronAdapter) Write(tag string, value interface{}) error {
 			}
 			code = parsed.TypeCode
 		}
-		var err error
-		value, err = omronCanonical(code, value)
+		canonical, err := omronCanonical(code, value)
 		if err != nil {
 			return err
 		}
+		switch value.(type) {
+		case uint64, []uint64:
+			// Range-checked above; omron encodes unsigned values natively
+			// (and itself rejects a negative int64 for an unsigned type).
+		default:
+			value = canonical
+		}
 	}
-	return a.client.WriteWithType(tag, value, typeHint)
+	return client.WriteWithType(tag, value, typeHint)
 }
 
 // Keepalive sends a keepalive to maintain the CIP connection.
 func (a *OmronAdapter) Keepalive() error {
-	if a.client != nil {
-		return a.client.Keepalive()
+	if client := a.currentClient(); client != nil {
+		return client.Keepalive()
 	}
 	return nil
 }
@@ -270,7 +327,7 @@ func (a *OmronAdapter) IsConnectionError(err error) bool {
 
 // Client returns the underlying omron.Client for advanced operations.
 func (a *OmronAdapter) Client() *omron.Client {
-	return a.client
+	return a.currentClient()
 }
 
 // Match categories actually decoded by Omron, rather than guessing from a width.
@@ -281,7 +338,9 @@ func omronPrimitive(code uint16) bool {
 		omron.TypeInt16, omron.TypeCIPINT, omron.TypeDWord, omron.TypeCIPUDINT,
 		omron.TypeInt32, omron.TypeCIPDINT, omron.TypeLWord, omron.TypeCIPULINT,
 		omron.TypeInt64, omron.TypeCIPLINT, omron.TypeReal, omron.TypeCIPREAL,
-		omron.TypeLReal, omron.TypeCIPLREAL, omron.TypeString, omron.TypeCIPSTRING:
+		omron.TypeLReal, omron.TypeCIPLREAL, omron.TypeString, omron.TypeCIPSTRING,
+		omron.TypeOmronByte, omron.TypeOmronWord, omron.TypeOmronDWord, omron.TypeOmronLWord,
+		omron.TypeOmronTime, omron.TypeOmronTimeNSec, omron.TypeOmronTOD, omron.TypeOmronEnum:
 		return true
 	}
 	return false

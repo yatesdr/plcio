@@ -82,7 +82,10 @@ func (b *PathBuilder) Symbol(tag string) *PathBuilder {
 	// The colon (:) is NOT a separator - "Program:MainProgram" stays as one segment.
 	// Also handle array indices like "MyArray[5]" by adding member segments.
 
-	parts := splitTagPath(tag)
+	parts, err := splitTagPath(tag)
+	if err != nil {
+		return b.add(nil, fmt.Errorf("Symbol: %w", err))
+	}
 	for _, part := range parts {
 		if part.isIndex {
 			// Array index - add as member segment
@@ -183,8 +186,9 @@ type tagPart struct {
 	isIndex bool
 }
 
-// splitTagPath parses a tag path like "Program.Tag[5].Member" into components.
-func splitTagPath(tag string) []tagPart {
+// splitTagPath parses a tag path like "Program.Tag[5].Member" or "Arr[1,2]"
+// into components. Returns an error for malformed or unclosed array indexes.
+func splitTagPath(tag string) ([]tagPart, error) {
 	var parts []tagPart
 	current := ""
 
@@ -208,13 +212,15 @@ func splitTagPath(tag string) []tagPart {
 			for j < len(tag) && tag[j] != ']' {
 				j++
 			}
-			if j > i+1 {
-				indexStr := tag[i+1 : j]
-				var idx uint32
-				for _, c := range indexStr {
-					if c >= '0' && c <= '9' {
-						idx = idx*10 + uint32(c-'0')
-					}
+			if j >= len(tag) {
+				return nil, fmt.Errorf("tag path %q: unclosed '[' at offset %d", tag, i)
+			}
+			// Comma-separated indexes address multi-dimensional arrays; each
+			// becomes its own successive element segment.
+			for _, indexStr := range strings.Split(tag[i+1:j], ",") {
+				idx, err := parseTagIndex(indexStr)
+				if err != nil {
+					return nil, fmt.Errorf("tag path %q: %w", tag, err)
 				}
 				parts = append(parts, tagPart{index: idx, isIndex: true})
 			}
@@ -231,7 +237,26 @@ func splitTagPath(tag string) []tagPart {
 		parts = append(parts, tagPart{name: current})
 	}
 
-	return parts
+	return parts, nil
+}
+
+// parseTagIndex parses one decimal array index. Surrounding spaces are
+// allowed; empty, signed, non-decimal, or > uint32 values are rejected.
+func parseTagIndex(s string) (uint32, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty array index")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("invalid array index %q: must be a non-negative decimal integer", s)
+		}
+	}
+	idx, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("array index %q out of range (max %d)", s, uint32(0xFFFFFFFF))
+	}
+	return uint32(idx), nil
 }
 
 // memberSegment creates a member/element segment for array indexing

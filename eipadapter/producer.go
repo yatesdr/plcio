@@ -3,15 +3,36 @@ package eipadapter
 import (
 	"encoding/binary"
 	"net"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
 	"github.com/yatesdr/plcio/logging"
 )
 
-// runProducer pushes the produce assembly's current contents to the scanner
-// at the negotiated T->O RPI. It exits when the connection is closed or the
-// timeout multiplier expires without any inbound O->T traffic.
+// startConnection runs c's goroutine (watchdog + producer), tracked by the
+// adapter's WaitGroup so Serve waits for it on shutdown. A panic inside it
+// is recovered and logged, and only this connection is dropped.
+func (a *Adapter) startConnection(c *Connection) {
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				logging.DebugLog("eipadapter", "recovered panic in connection 0x%08X: %v\n%s", c.OTConnID, r, debug.Stack())
+				a.connMgr.remove(c, 0)
+			}
+		}()
+		a.runProducer(c)
+	}()
+}
+
+// runProducer is the per-connection goroutine. It enforces the O->T
+// receive watchdog for every connection — from Forward_Open time, so a
+// connection that never receives traffic still times out — and, when the
+// connection has a produce assembly, pushes its current contents to the
+// scanner at the negotiated T->O RPI. It exits when the connection is
+// closed, the adapter stops, or the connection times out.
 //
 // Sent format per packet:
 //
@@ -19,25 +40,35 @@ import (
 //	  Sequenced Address Item (0x8002, len=8): T->O connID + 32-bit network seq
 //	  Connected Data Item    (0xB1, len=2+N): 16-bit data seq + N data bytes
 //
-// We don't attempt multicast — the producer unicasts to the peer's address
-// negotiated through Forward_Open or learned from inbound traffic.
+// We don't attempt multicast — the producer unicasts to the originator's
+// address fixed at Forward_Open.
 func (a *Adapter) runProducer(c *Connection) {
-	if c.Produce == nil {
-		return
-	}
-
-	rpi := time.Duration(c.TORPI) * time.Microsecond
-	if rpi < time.Millisecond {
-		rpi = 10 * time.Millisecond
-	}
 	timeout := connectionTimeout(c.OTRPI, c.TimeoutMultiplier)
+	check := timeout / 4
+	if check < time.Millisecond {
+		check = time.Millisecond
+	}
+	watchdog := time.NewTicker(check)
+	defer watchdog.Stop()
+
+	var produce <-chan time.Time
+	var rpi time.Duration
+	if c.Produce != nil {
+		rpi = time.Duration(c.TORPI) * time.Microsecond
+		if rpi < minRPI*time.Microsecond {
+			// Forward_Open rejects smaller RPIs; guard hand-built
+			// connections (and NewTicker) anyway.
+			rpi = minRPI * time.Microsecond
+		}
+		tick := time.NewTicker(rpi)
+		defer tick.Stop()
+		produce = tick.C
+	}
 
 	logging.DebugLog("eipadapter", "producer start conn 0x%08X RPI=%v timeout=%v", c.TOConnID, rpi, timeout)
 
-	tick := time.NewTicker(rpi)
-	defer tick.Stop()
-
 	var dataSeq atomic.Uint32
+	sendNow := c.Produce != nil
 	for {
 		c.mu.RLock()
 		closed := c.closed
@@ -59,29 +90,26 @@ func (a *Adapter) runProducer(c *Connection) {
 			return
 		}
 
-		// If we don't yet have a peer address (no inbound, no hint), skip
-		// this tick. Standard scanners send their first O->T packet very
-		// shortly after Forward_Open.
-		if peer.port == 0 {
-			select {
-			case <-tick.C:
-			case <-a.stopCh:
-				return
+		// Without an originator address (only possible for hand-built
+		// connections) there is nowhere to send.
+		if sendNow && peer.port != 0 {
+			seq := dataSeq.Add(1)
+			packet := buildProducerPacket(c.TOConnID, c.nextSeq(), uint16(seq), c.Produce.Bytes())
+
+			dst := &net.UDPAddr{IP: net.IPv4(peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3]), Port: int(peer.port)}
+			_ = a.udpIO.SetWriteDeadline(time.Now().Add(rpi))
+			if _, err := a.udpIO.WriteToUDP(packet, dst); err != nil {
+				logging.DebugError("eipadapter", "producer write", err)
 			}
-			continue
 		}
-
-		seq := dataSeq.Add(1)
-		packet := buildProducerPacket(c.TOConnID, c.nextSeq(), uint16(seq), c.Produce.Bytes())
-
-		dst := &net.UDPAddr{IP: net.IPv4(peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3]), Port: int(peer.port)}
-		_ = a.udpIO.SetWriteDeadline(time.Now().Add(rpi))
-		if _, err := a.udpIO.WriteToUDP(packet, dst); err != nil {
-			logging.DebugError("eipadapter", "producer write", err)
-		}
+		sendNow = false
 
 		select {
-		case <-tick.C:
+		case <-produce:
+			sendNow = true
+		case <-watchdog.C:
+		case <-c.done:
+			return
 		case <-a.stopCh:
 			return
 		}
@@ -125,12 +153,9 @@ func connectionTimeout(rpiUS uint32, mult byte) time.Duration {
 	return time.Duration(rpiUS) * time.Duration(powers[mult]) * time.Microsecond
 }
 
+// expire removes a connection whose watchdog fired. Only the map entries
+// that still point at c are deleted, so a stale watchdog can't remove a
+// newer connection that reuses the same IDs.
 func (m *ConnectionManager) expire(c *Connection) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	c.mu.Lock()
-	c.closed = true
-	c.mu.Unlock()
-	delete(m.byOT, c.OTConnID)
-	delete(m.byTO, c.TOConnID)
+	m.remove(c, ConnectionTimedOut)
 }

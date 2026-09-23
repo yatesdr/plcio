@@ -185,7 +185,7 @@ func (c *Client) Read(addresses ...string) ([]*TagValue, error) {
 	results := make([]*TagValue, 0, len(addresses))
 
 	for _, addrStr := range addresses {
-		addr, err := ParseAddress(addrStr)
+		addr, err := c.ParseAddress(addrStr)
 		if err != nil {
 			results = append(results, &TagValue{
 				Name:  addrStr,
@@ -217,6 +217,16 @@ func (c *Client) Read(addresses ...string) ([]*TagValue, error) {
 	return results, c.connErrorIfDown()
 }
 
+// ParseAddress parses addr using this client's processor family (PLC-5 I/O
+// addresses are octal; see ParseAddressFor).
+func (c *Client) ParseAddress(addr string) (*FileAddress, error) {
+	plcType := TypeSLC500
+	if c != nil && c.plc != nil {
+		plcType = c.plc.PLCType
+	}
+	return ParseAddressFor(addr, plcType)
+}
+
 // Write writes a Go value to a data table address.
 // The value is automatically converted to the appropriate wire format.
 //
@@ -230,7 +240,7 @@ func (c *Client) Write(address string, value interface{}) error {
 		return fmt.Errorf("Write: nil client")
 	}
 
-	addr, err := ParseAddress(address)
+	addr, err := c.ParseAddress(address)
 	if err != nil {
 		return fmt.Errorf("Write: invalid address %q: %w", address, err)
 	}
@@ -249,7 +259,22 @@ func (c *Client) Write(address string, value interface{}) error {
 	return c.plc.WriteAddress(addr, data)
 }
 
-// writeBit performs a read-modify-write to set/clear a single bit.
+// writeBit sets or clears a single bit of a 16-bit word. The processor
+// changes only that bit; nothing is read first, so bits the processor or
+// another client changes concurrently (counter CU/CD, one-shot storage, ...)
+// are never reverted by this write.
+//
+// SLC 500 and MicroLogix: Protected Typed Logical Write with Mask (FNC 0xAB)
+// with a one-bit mask (pycomm3 writeable_value; libplctag
+// slc_tag_write_bit_start).
+//
+// PLC-5: Read-Modify-Write (FNC 0x26) with AND mask ~bit (clear) or 0xFFFF
+// and OR mask bit (set) or 0 (1770-6.5.16 p. 7-20; libplctag
+// plc5_tag_write_bit_start), applied by the processor to the word.
+//
+// Both are 16 bits wide (libplctag: "the mask is only 16 bits"), so bit
+// writes are only accepted for word files (O, I, S, B, N, A) and T/C/R
+// control words; L (long), F (float) and other files are rejected.
 func (c *Client) writeBit(addr *FileAddress, value interface{}) error {
 	// Determine the target bit value
 	var bitVal bool
@@ -274,36 +299,52 @@ func (c *Client) writeBit(addr *FileAddress, value interface{}) error {
 		return fmt.Errorf("cannot convert %T to bit value", value)
 	}
 
-	// Read the current word
-	readAddr := &FileAddress{
+	switch addr.FileType {
+	case FileTypeOutput, FileTypeInput, FileTypeStatus, FileTypeBinary, FileTypeInteger, FileTypeASCII,
+		FileTypeTimer, FileTypeCounter, FileTypeControl:
+	case FileTypeLong:
+		return fmt.Errorf("bit write to %s: bit writes to L (long) files are not supported (masked write is 16 bits wide); write the whole element instead", addr.RawAddress)
+	case FileTypeFloat:
+		return fmt.Errorf("bit write to %s: bit writes to F (float) files are not supported", addr.RawAddress)
+	default:
+		return fmt.Errorf("bit write to %s: bit writes to %s files are not supported", addr.RawAddress, FileTypeName(addr.FileType))
+	}
+	if addr.BitNumber > 15 {
+		return fmt.Errorf("bit write to %s: bit number %d out of range (0-15)", addr.RawAddress, addr.BitNumber)
+	}
+
+	// The whole 16-bit word (or T/C/R control word) that holds the bit.
+	wordAddr := &FileAddress{
 		FileType:   addr.FileType,
 		FileNumber: addr.FileNumber,
 		Element:    addr.Element,
 		SubElement: addr.SubElement,
-		BitNumber:  -1, // Read the full word
+		BitNumber:  -1,
+		TypeLetter: addr.TypeLetter,
 		RawAddress: addr.RawAddress,
+		// T/C/R bits live in a sub-element word (the control word): keep
+		// the sub-element level so a PLC-5 address points at that word.
+		HasSubElement: addr.HasSubElement || IsComplexType(addr.FileType),
+	}
+	mask := uint16(1) << uint(addr.BitNumber)
+
+	if c.plc.PLCType == TypePLC5 {
+		andMask, orMask := uint16(0xFFFF), uint16(0)
+		if bitVal {
+			orMask = mask
+		} else {
+			andMask = ^mask
+		}
+		return c.plc.readModifyWrite(wordAddr, andMask, orMask)
 	}
 
-	tag, err := c.plc.ReadAddress(readAddr)
-	if err != nil {
-		return fmt.Errorf("bit write read-back failed: %w", err)
-	}
-
-	if len(tag.Bytes) < 2 {
-		return fmt.Errorf("bit write: read returned %d bytes, need 2", len(tag.Bytes))
-	}
-
-	// Modify the bit
-	word := binary.LittleEndian.Uint16(tag.Bytes[:2])
+	var word uint16
 	if bitVal {
-		word |= 1 << uint(addr.BitNumber)
-	} else {
-		word &^= 1 << uint(addr.BitNumber)
+		word = mask
 	}
-
-	// Write back
-	data := binary.LittleEndian.AppendUint16(nil, word)
-	return c.plc.WriteAddress(readAddr, data)
+	return c.plc.writeMasked(wordAddr,
+		binary.LittleEndian.AppendUint16(nil, mask),
+		binary.LittleEndian.AppendUint16(nil, word))
 }
 
 // DecodeValue converts raw PLC bytes to a Go value based on the address type.
@@ -357,18 +398,20 @@ func decodeValue(addr *FileAddress, data []byte) interface{} {
 		return decodeComplexElement(addr.FileType, data)
 
 	case FileTypeString:
-		// SLC string: 2-byte length + up to 82 chars
+		// SLC string: 2-byte LEN + 82 chars stored byte-swapped within
+		// each 16-bit word (see swapStringBytes).
 		if len(data) < 2 {
 			return data
 		}
+		chars := swapStringBytes(data[2:])
 		strLen := int(binary.LittleEndian.Uint16(data[:2]))
-		if strLen > len(data)-2 {
-			strLen = len(data) - 2
+		if strLen > maxStringLen {
+			strLen = maxStringLen
 		}
-		if strLen > 82 {
-			strLen = 82
+		if strLen > len(chars) {
+			strLen = len(chars)
 		}
-		return string(data[2 : 2+strLen])
+		return string(chars[:strLen])
 
 	default:
 		return data
@@ -444,7 +487,7 @@ func encodeValue(addr *FileAddress, value interface{}) ([]byte, error) {
 	case FileTypeTimer, FileTypeCounter, FileTypeControl:
 		// For complex types with sub-element, write a 16-bit word
 		if addr.SubElement > 0 {
-			return encodeInt16(value)
+			return encodeSubElement(addr, value)
 		}
 		return nil, fmt.Errorf("cannot write full Timer/Counter/Control element; specify a sub-element (e.g., .PRE, .ACC)")
 
@@ -456,37 +499,96 @@ func encodeValue(addr *FileAddress, value interface{}) ([]byte, error) {
 	}
 }
 
-func encodeInt16(value interface{}) ([]byte, error) {
-	var intVal int16
-	switch v := value.(type) {
-	case int16:
-		intVal = v
-	case int:
-		intVal = int16(v)
-	case int32:
-		intVal = int16(v)
-	case int64:
-		intVal = int16(v)
-	case int8:
-		intVal = int16(v)
-	case uint8:
-		intVal = int16(v)
-	case uint16:
-		intVal = int16(v)
-	case float32:
-		intVal = int16(v)
-	case float64:
-		intVal = int16(v)
-	case bool:
-		if v {
-			intVal = 1
-		}
+// encodeSubElement encodes a T/C/R sub-element word. Timer PRE/ACC must be
+// 0..32767: SLC processors major-fault on a negative timer preset or
+// accumulator. Counter PRE/ACC and Control LEN/POS are signed 16-bit values.
+// Other (numeric) sub-elements are treated as plain 16-bit words.
+func encodeSubElement(addr *FileAddress, value interface{}) ([]byte, error) {
+	switch {
+	case addr.FileType == FileTypeTimer && (addr.SubElement == uint16(TimerPRE) || addr.SubElement == uint16(TimerACC)):
+		return encodeInt16Range(value, 0, math.MaxInt16, "timer PRE/ACC")
+	case addr.SubElement == 1 || addr.SubElement == 2:
+		return encodeInt16Range(value, math.MinInt16, math.MaxInt16, "INT (int16)")
 	default:
-		return nil, fmt.Errorf("cannot convert %T to INT (int16)", value)
+		return encodeInt16(value)
 	}
-	return binary.LittleEndian.AppendUint16(nil, uint16(intVal)), nil
 }
 
+// encodeInt16 encodes a 16-bit data-table word (N, B, S, A, O, I). It accepts
+// -32768..65535: values 32768..65535 are stored as their two's-complement bit
+// pattern, so 0xFFFF can be written to a B or S word. Anything outside that
+// range is an error rather than being silently truncated.
+func encodeInt16(value interface{}) ([]byte, error) {
+	return encodeInt16Range(value, math.MinInt16, math.MaxUint16, "16-bit word")
+}
+
+func encodeInt16Range(value interface{}, min, max int64, what string) ([]byte, error) {
+	var n int64
+	if b, ok := value.(bool); ok {
+		if b {
+			n = 1
+		}
+	} else {
+		var err error
+		if n, err = integerValue(value, "INT (int16)"); err != nil {
+			return nil, err
+		}
+	}
+	if n < min || n > max {
+		return nil, fmt.Errorf("value %d out of range for %s (%d..%d)", n, what, min, max)
+	}
+	return binary.LittleEndian.AppendUint16(nil, uint16(n)), nil
+}
+
+// integerValue converts a Go integer or an integral, finite float to int64.
+func integerValue(value interface{}, target string) (int64, error) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case uint:
+		if uint64(v) > math.MaxInt64 {
+			return 0, fmt.Errorf("value %d out of range for %s", v, target)
+		}
+		return int64(v), nil
+	case uint8:
+		return int64(v), nil
+	case uint16:
+		return int64(v), nil
+	case uint32:
+		return int64(v), nil
+	case uint64:
+		if v > math.MaxInt64 {
+			return 0, fmt.Errorf("value %d out of range for %s", v, target)
+		}
+		return int64(v), nil
+	case float32:
+		return floatToInteger(float64(v), target)
+	case float64:
+		return floatToInteger(v, target)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to %s", value, target)
+	}
+}
+
+func floatToInteger(f float64, target string) (int64, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < math.MinInt64 || f >= math.MaxInt64 {
+		return 0, fmt.Errorf("value %v is not an integral value in range for %s", f, target)
+	}
+	return int64(f), nil
+}
+
+// encodeFloat32 encodes an F element. A finite float64 outside the float32
+// range used to become +/-Inf, and an integer above 2^24 was silently rounded
+// (16777217 was written as 16777216); both are now errors, matching the
+// driver layer's canonicalStorage overflow check.
 func encodeFloat32(value interface{}) ([]byte, error) {
 	var floatVal float32
 	switch v := value.(type) {
@@ -494,49 +596,60 @@ func encodeFloat32(value interface{}) ([]byte, error) {
 		floatVal = v
 	case float64:
 		floatVal = float32(v)
-	case int:
-		floatVal = float32(v)
-	case int16:
-		floatVal = float32(v)
-	case int32:
-		floatVal = float32(v)
-	case int64:
-		floatVal = float32(v)
+		if math.IsInf(float64(floatVal), 0) && !math.IsInf(v, 0) {
+			return nil, fmt.Errorf("value %v out of range for REAL (float32)", v)
+		}
+	case int, int16, int32, int64:
+		n, _ := integerValue(v, "REAL (float32)")
+		floatVal = float32(n)
+		if int64(floatVal) != n {
+			return nil, fmt.Errorf("value %d is not exactly representable as REAL (float32)", n)
+		}
 	default:
 		return nil, fmt.Errorf("cannot convert %T to REAL (float32)", value)
 	}
 	return binary.LittleEndian.AppendUint32(nil, math.Float32bits(floatVal)), nil
 }
 
+// encodeInt32 encodes an L (long) element. Values must fit int32; a uint32
+// argument is stored as its bit pattern, as before.
 func encodeInt32(value interface{}) ([]byte, error) {
-	var intVal int32
-	switch v := value.(type) {
-	case int32:
-		intVal = v
-	case int:
-		intVal = int32(v)
-	case int16:
-		intVal = int32(v)
-	case int64:
-		intVal = int32(v)
-	case int8:
-		intVal = int32(v)
-	case uint8:
-		intVal = int32(v)
-	case uint16:
-		intVal = int32(v)
-	case uint32:
-		intVal = int32(v)
-	case float32:
-		intVal = int32(v)
-	case float64:
-		intVal = int32(v)
-	default:
-		return nil, fmt.Errorf("cannot convert %T to LONG (int32)", value)
+	if v, ok := value.(uint32); ok {
+		return binary.LittleEndian.AppendUint32(nil, v), nil
 	}
-	return binary.LittleEndian.AppendUint32(nil, uint32(intVal)), nil
+	n, err := integerValue(value, "LONG (int32)")
+	if err != nil {
+		return nil, err
+	}
+	if n < math.MinInt32 || n > math.MaxInt32 {
+		return nil, fmt.Errorf("value %d out of range for LONG (int32) (%d..%d)", n, math.MinInt32, math.MaxInt32)
+	}
+	return binary.LittleEndian.AppendUint32(nil, uint32(int32(n))), nil
 }
 
+// maxStringLen is the character capacity of an SLC ST element.
+const maxStringLen = 82
+
+// swapStringBytes returns a copy of b with the two bytes of every 16-bit word
+// exchanged, padding an odd length with a zero byte first. SLC/MicroLogix ST
+// elements store characters as 16-bit words with the first character in the
+// high byte, so "HELLO" is stored as "EH" "LL" "\x00O". This matches
+// pycomm3's PCCCStringType._slc_string_swap.
+func swapStringBytes(b []byte) []byte {
+	out := make([]byte, len(b), len(b)+1)
+	copy(out, b)
+	if len(out)%2 != 0 {
+		out = append(out, 0)
+	}
+	for i := 0; i+1 < len(out); i += 2 {
+		out[i], out[i+1] = out[i+1], out[i]
+	}
+	return out
+}
+
+// encodeString builds a full 84-byte ST element: LEN (LE) followed by the
+// characters byte-swapped per word and zero-filled to 82 bytes, so no stale
+// characters from a previous, longer value remain in the element.
 func encodeString(value interface{}) ([]byte, error) {
 	var str string
 	switch v := value.(type) {
@@ -549,13 +662,13 @@ func encodeString(value interface{}) ([]byte, error) {
 	}
 
 	strBytes := []byte(str)
-	if len(strBytes) > 82 {
-		strBytes = strBytes[:82]
+	if len(strBytes) > maxStringLen {
+		return nil, fmt.Errorf("string length %d exceeds ST element capacity of %d characters", len(strBytes), maxStringLen)
 	}
 
-	// SLC string format: 2-byte length (LE) + character data
-	data := binary.LittleEndian.AppendUint16(nil, uint16(len(strBytes)))
-	data = append(data, strBytes...)
+	data := make([]byte, ElementSizeString)
+	binary.LittleEndian.PutUint16(data[:2], uint16(len(strBytes)))
+	copy(data[2:], swapStringBytes(strBytes))
 	return data, nil
 }
 

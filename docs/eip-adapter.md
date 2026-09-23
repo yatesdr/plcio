@@ -87,7 +87,7 @@ Identity{
 }
 ```
 
-`IP` and `Port` are auto-populated at `Serve` time from your machine's outbound IPv4. If you need to override (multi-homed hosts), set them on the Identity before calling `New`.
+`IP` and `Port` are auto-populated by `New`. When `Config.BindAddr` is a specific IPv4 address (e.g. the OT-network NIC on a multi-homed PC) that address is advertised; otherwise the machine's default-route IPv4 is used. Set them on the Identity before calling `New` to override. The TCP/IP Interface object (Class 0xF5) reports the same IP with its interface's real netmask (0.0.0.0 if unknown) and `os.Hostname()` as the host name, all captured once at startup. Per CIP Vol 2 (TCP/IP Interface object), attribute 5 encodes the addresses as little-endian UDINTs and the (empty) domain name as a STRING (2-byte length, padded to even length); attribute 6 (host name, truncated to 64 characters) is a STRING too. Attribute 2 (Configuration Capability) is 0: the IP configuration belongs to the host OS and cannot be changed over CIP.
 
 ## Assemblies
 
@@ -130,6 +130,28 @@ output.OnChange(func(old, new []byte) {
 
 The callback runs in the same goroutine that handled the scanner write. Don't block — copy the data and post to a channel if you need significant work.
 
+While a Class 1 connection owns an output assembly, explicit `Set_Attribute_Single` writes to it are rejected with status `0x0C` (Object State Conflict), and a second connection trying to consume it is rejected with extended status `0x0106` (ownership conflict). Zero-size assemblies (heartbeat connection points) are never owned.
+
+### Connection loss and Run/Idle
+
+The adapter does **not** clear or otherwise change an output assembly when its connection closes, times out, or the scanner switches to Idle — the last received bytes stay in place. Your application decides what "safe" means. To learn about these transitions, set `Config.OnConnectionEvent`:
+
+```go
+Config{
+    // ...
+    OnConnectionEvent: func(e eipadapter.ConnectionEvent) {
+        switch e.Type {
+        case eipadapter.ConnectionTimedOut, eipadapter.ConnectionClosed, eipadapter.ConnectionIdle:
+            outputsToSafeState(e.ConsumeInstance)
+        }
+    },
+}
+```
+
+Event types are `ConnectionOpened`, `ConnectionClosed` (Forward_Close or adapter shutdown), `ConnectionTimedOut` (no O→T packet within RPI × timeout multiplier, counted from the Forward_Open), and `ConnectionRun` / `ConnectionIdle` (the O→T 32-bit Run/Idle header's Run bit; reported for the first header and on every change). The callback runs synchronously on an adapter goroutine — don't block in it.
+
+`output.RunIdle()` returns the current Run/Idle state `(run, ok)` for an output assembly; `ok` is false when no connection owns it or the owning connection hasn't delivered a Run/Idle header. Data in Idle packets is still written to the assembly, as before.
+
 ## Forward_Open behaviour
 
 By default, the adapter accepts any well-formed Forward_Open whose connection path references existing assemblies. If you need to gate connections (e.g., reject when not ready), supply an `OnForwardOpen` callback:
@@ -149,6 +171,28 @@ Config{
 ```
 
 Returning an error rejects the connection with status `0x01` (Connection Failure). The PLC will see this as a connection fault.
+
+Before the callback runs, the adapter validates the request and rejects it with general status `0x01` and one of these extended statuses (CIP Vol 1, Connection Manager error codes):
+
+| Extended status | Reason |
+|---|---|
+| `0x0100` | Duplicate Forward_Open (same connection serial + vendor ID + originator serial as an open connection) |
+| `0x0103` | Transport class other than Class 1 |
+| `0x0106` | Output assembly already owned by another connection |
+| `0x0108` | O→T not point-to-point, or null T→O when the connection produces data |
+| `0x0109` | Connection size doesn't match the assembly: T→O = size + 2 (sequence count); O→T = size + 2 (modeless) or size + 6 (with 32-bit Run/Idle header) |
+| `0x0111` | RPI below 1 ms |
+| `0x0113` | `Config.MaxConnections` (default 32) I/O connections already open |
+| `0x0117` | Consume point is not an `AssemblyOutput`, or produce point is not an `AssemblyInput` |
+| `0x0315` | Connection path unparseable or references an unknown assembly |
+
+Connection IDs follow CIP Vol 1 3-5.4.1 (the consumer of a point-to-point connection chooses its ID; the producer of a multicast one): the reply keeps the originator's proposed O→T ID unless another connection already uses it, in which case the adapter picks a fresh one (the scanner must use the ID in the reply); a point-to-point T→O uses the originator's proposed T→O ID; a multicast T→O request (served unicast) gets an adapter-chosen T→O ID.
+
+Accepted connections report the requested RPIs as the actual packet intervals — they are what the adapter uses. T→O data is sent to the IP address of the TCP peer that sent the Forward_Open, at UDP port 2222 (or the port from a T→O sockaddr item in the request). O→T packets are only accepted from that IP, and only if their 32-bit sequence number is newer than the last accepted one. Each connection's timeout watchdog starts at Forward_Open, so a connection that never receives O→T traffic times out.
+
+A Forward_Close closes the connection with the same connection serial + vendor ID + originator serial. If there is none — including a Forward_Close naming another originator's connection — it is rejected with general status `0x01`, extended status `0x0107` (target connection not found). A matching Forward_Close from a different IP than the one that opened the connection is rejected with general status `0x0F` (privilege violation), as OpENer does.
+
+Other limits: at most `Config.MaxTCPConnections` (default 64) concurrent TCP connections (extra connections are closed on accept), and one registered session per TCP connection (a second RegisterSession gets encapsulation status `0x0001`). `Close()` or cancelling the `Serve` context closes the listener, all TCP connections and UDP sockets and stops all I/O connections; `Serve` returns once everything has exited. A panic in a connection handler — including one in your callbacks — is recovered and logged (with stack) via `plcio/logging`, and only that connection is dropped.
 
 ### Connection paths
 
@@ -202,10 +246,10 @@ Watch for:
 
 ## Limitations
 
-- **Class 0 (broadcast) connections** are not implemented. Class 1 (cyclic) and Class 3 (server) are.
-- **Multicast T→O** is not implemented; the producer unicasts to the peer learned from the first O→T packet. This is the common case for AB-style point-to-point connections.
-- **Listen-only connections** are not specifically optimised but should work as a degenerate Class 1.
+- **Only Class 1 (cyclic) I/O connections** are implemented. Forward_Open must target the Assembly class (0x04) with transport class 1; Class 0 and Class 3 (connected explicit messaging) Forward_Opens are rejected. Explicit messaging works unconnected (SendRRData, including Unconnected_Send).
+- **Multicast T→O** is not implemented. A Forward_Open requesting it is accepted and served unicast to the originator (see above), as in earlier releases. Point-to-point is the common case for AB-style connections.
+- **Input-only / listen-only connections** name a heartbeat connection point for O→T (commonly 198 for input-only, 199 for listen-only). The adapter only accepts them if you register a zero-size `AssemblyOutput` at that instance (e.g. `NewAssembly(198, eipadapter.AssemblyOutput, 0)`); otherwise the Forward_Open is rejected with `0x0315`. Listen-only connections that ask for a multicast T→O are accepted and served unicast.
 - **CIP Safety** is not implemented and is out of scope.
 - **EDS files** are not generated. Most modern scanners do not require an EDS for generic device modules.
-- **Run/Idle headers** on T→O are not added; the assembly bytes are sent as-is. O→T Run/Idle headers (4 bytes prefix) are auto-detected on inbound packets and stripped.
+- **Run/Idle headers** on T→O are not added; the assembly bytes are sent as-is. O→T Run/Idle headers (4 bytes prefix) are expected when the O→T connection size is assembly size + 6, auto-detected for variable-size connections, and reported via `OnConnectionEvent` / `Assembly.RunIdle`.
 - **Single-host binding** — the adapter binds one TCP and two UDP sockets. Run multiple instances on different ports if you need to simulate multiple devices.

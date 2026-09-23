@@ -42,6 +42,60 @@ type Assembly struct {
 	bytes    []byte
 	updates  atomic.Uint64
 	onChange func(old, new []byte)
+
+	// owner is the exclusive-owner Class 1 connection consuming this
+	// (output) assembly, if any; run/runKnown mirror its Run/Idle header.
+	owner    *Connection
+	run      bool
+	runKnown bool
+}
+
+// RunIdle reports the scanner's Run/Idle state for an output assembly, as
+// carried in the 32-bit Run/Idle header of the O->T data of the Class 1
+// connection that currently owns it. ok is false when no connection owns
+// the assembly or the owning connection has not delivered a Run/Idle header
+// yet (e.g. a modeless connection). The assembly's bytes are not changed
+// when the scanner goes Idle or the connection is lost.
+func (a *Assembly) RunIdle() (run, ok bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.run, a.runKnown
+}
+
+// claimOwner makes c the exclusive owner of the assembly. It fails if
+// another connection already owns it. Zero-size assemblies (heartbeat
+// connection points for input-only / listen-only connections) are shared
+// and never owned.
+func (a *Assembly) claimOwner(c *Connection) bool {
+	if a.Size == 0 {
+		return true
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.owner != nil && a.owner != c {
+		return false
+	}
+	a.owner = c
+	return true
+}
+
+// releaseOwner drops c's ownership (and the Run/Idle state it reported).
+func (a *Assembly) releaseOwner(c *Connection) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.owner == c {
+		a.owner = nil
+		a.run, a.runKnown = false, false
+	}
+}
+
+// setRunIdle records the Run/Idle state reported by the owning connection.
+func (a *Assembly) setRunIdle(c *Connection, run bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.owner == c {
+		a.run, a.runKnown = run, true
+	}
 }
 
 // NewAssembly builds a fixed-size assembly at the given instance/direction.
@@ -128,10 +182,16 @@ func (a *Assembly) OnChange(fn func(old, new []byte)) {
 func (a *Assembly) Updates() uint64 { return a.updates.Load() }
 
 // receiveFromScanner is the internal write path used when a scanner writes
-// to an output assembly via explicit messaging or Class 1 O->T. It bypasses
-// the read lock and triggers OnChange with the old/new snapshots.
-func (a *Assembly) receiveFromScanner(data []byte) {
+// to an output assembly via explicit messaging (from == nil) or Class 1
+// O->T (from = the connection). It triggers OnChange with the old/new
+// snapshots. It refuses (returns false) a write from anyone other than the
+// owning connection while the assembly is owned.
+func (a *Assembly) receiveFromScanner(data []byte, from *Connection) bool {
 	a.mu.Lock()
+	if a.owner != nil && a.owner != from {
+		a.mu.Unlock()
+		return false
+	}
 	old := make([]byte, len(a.bytes))
 	copy(old, a.bytes)
 	n := copy(a.bytes, data)
@@ -144,6 +204,7 @@ func (a *Assembly) receiveFromScanner(data []byte) {
 	if cb != nil {
 		cb(old, newBuf)
 	}
+	return true
 }
 
 // CIP service handlers.
@@ -178,7 +239,13 @@ func (a *Assembly) Handle(req *ObjectRequest) ObjectResponse {
 		if len(req.Data) > a.Size {
 			return ObjectResponse{Status: cip.StatusTooMuchData}
 		}
-		a.receiveFromScanner(req.Data)
+		if !a.receiveFromScanner(req.Data, nil) {
+			// An exclusive-owner Class 1 connection owns this output
+			// assembly: explicit writes would race the cyclic data.
+			// 0x0C Object State Conflict (CIP Vol 1, Appendix B; OpENer
+			// uses 0x0E Attribute Not Settable for the same case).
+			return ObjectResponse{Status: cip.StatusObjectStateConflict}
+		}
 		return ObjectResponse{Status: cip.StatusSuccess}
 	default:
 		return ObjectResponse{Status: cip.StatusServiceNotSupported}

@@ -1,6 +1,9 @@
 package driver
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // PLCFamily represents the type/protocol family of a PLC.
 type PLCFamily string
@@ -78,21 +81,23 @@ type PLCConfig struct {
 
 // GetFamily returns the PLC family, defaulting to logix if not set.
 func (p *PLCConfig) GetFamily() PLCFamily {
-	if p.Family == "" {
-		return FamilyLogix
-	}
-	return p.Family
+	return normalizeFamily(p.Family)
 }
 
 // GetProtocol returns the protocol for Omron PLCs ("fins" or "eip").
+// Matching is case-insensitive, as in the Omron adapter.
 func (p *PLCConfig) GetProtocol() string {
 	if p.GetFamily() != FamilyOmron {
 		return ""
 	}
-	if p.Protocol == "" || p.Protocol == "fins" {
+	protocol := strings.ToLower(strings.TrimSpace(p.Protocol))
+	switch protocol {
+	case "", "fins", "fins-tcp", "fins-udp":
+		// All FINS transports are the "fins" protocol; the adapter picks the
+		// transport from the configured value itself.
 		return "fins"
 	}
-	return p.Protocol
+	return protocol
 }
 
 // IsOmronEIP returns true if this is an Omron PLC using EtherNet/IP protocol.

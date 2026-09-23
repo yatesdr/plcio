@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yatesdr/plcio/logging"
@@ -32,13 +33,39 @@ func (c *Client) connErrorIfDown() error {
 
 // Client is a high-level wrapper that manages connection lifecycle
 // and provides simplified methods for common PLC operations.
+// A Client is safe for concurrent use by multiple goroutines. Requests are
+// serialized on the underlying EtherNet/IP session.
 type Client struct {
-	plc             *PLC                 // Low-level access preserved
-	micro800        bool                 // True for Micro800 series (no batch reads)
+	plc      *PLC // Low-level access preserved
+	micro800 bool // True for Micro800 series (no batch reads)
+
+	// mu guards the maps below. It is held only for map access, never across
+	// network I/O, so internal calls between public methods cannot deadlock.
+	mu              sync.RWMutex
 	tagInfo         map[string]TagInfo   // Discovered tags for element count lookup
 	templateSizes   map[uint16]uint32    // Cache of template ID -> size in bytes
 	templates       map[uint16]*Template // Cache of template ID -> full template definition
 	failedTemplates map[uint16]bool      // Cache of template IDs that failed to fetch
+	// resolvedTypes caches root tags found by symbol lookup for type
+	// resolution (writes, ResolveTagType, bit detection). It is kept apart
+	// from tagInfo so it never changes how reads size or batch requests.
+	resolvedTypes map[string]TagInfo
+}
+
+// lookupTagInfo returns the discovered entry for an exact tag name.
+func (c *Client) lookupTagInfo(name string) (TagInfo, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	info, ok := c.tagInfo[name]
+	return info, ok
+}
+
+// cachedTemplate returns a template from the success cache.
+func (c *Client) cachedTemplate(templateID uint16) (*Template, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tmpl, ok := c.templates[templateID]
+	return tmpl, ok
 }
 
 // options holds configuration options for Connect.
@@ -79,12 +106,14 @@ func WithoutConnection() Option {
 }
 
 // WithMicro800 configures options appropriate for Micro800 series PLCs.
-// Micro800 PLCs don't use backplane routing (empty route path) and
-// don't support Forward Open, so this uses unconnected messaging only.
+// Micro800 PLCs have no backplane, so both unconnected requests and the
+// Forward Open connection path carry no port segment (the Forward Open path
+// is just the Message Router, as in pylogix and pycomm3). If the Forward Open
+// is refused the client falls back to unconnected messaging; combine with
+// WithoutConnection to skip the attempt.
 func WithMicro800() Option {
 	return func(o *options) {
 		o.micro800 = true
-		o.skipForwardOpen = true
 		o.routePath = []byte{} // Empty route - no backplane routing for Micro800
 	}
 }
@@ -115,6 +144,8 @@ func Connect(address string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("Connect: %w", err)
 	}
 
+	plc.micro800 = cfg.micro800
+
 	// Configure routing
 	if cfg.routePath != nil {
 		plc.SetRoutePath(cfg.routePath)
@@ -127,6 +158,13 @@ func Connect(address string, opts ...Option) (*Client, error) {
 		err = plc.OpenConnection()
 		if err != nil {
 			debugLog("Warning: Forward Open failed, using unconnected messaging: %v", err)
+			// A Forward Open that timed out or broke the stream drops the
+			// transport; unconnected messaging needs a fresh session.
+			if !plc.IsConnected() {
+				if err := plc.Connect(); err != nil {
+					return nil, fmt.Errorf("Connect: reconnect after failed Forward Open: %w", err)
+				}
+			}
 		}
 	}
 
@@ -155,10 +193,14 @@ func (c *Client) IsConnected() bool {
 // Returns connected (CIP connection active), size (negotiated connection size in bytes).
 // If not using connected messaging, size is 0.
 func (c *Client) ConnectionInfo() (connected bool, size uint16) {
-	if c == nil || c.plc == nil || !c.plc.IsConnected() || c.plc.cipConn == nil {
+	if c == nil || c.plc == nil || !c.plc.IsConnected() {
 		return false, 0
 	}
-	return true, c.plc.connSize
+	conn, connSize := c.plc.activeConn()
+	if conn == nil {
+		return false, 0
+	}
+	return true, connSize
 }
 
 // ConnectionMode returns a human-readable string describing the connection mode.
@@ -166,8 +208,8 @@ func (c *Client) ConnectionMode() string {
 	if c == nil || c.plc == nil || !c.plc.IsConnected() {
 		return "Not connected"
 	}
-	if c.plc.cipConn != nil {
-		if c.plc.connSize == ConnectionSizeLarge {
+	if conn, connSize := c.plc.activeConn(); conn != nil {
+		if connSize == ConnectionSizeLarge {
 			return "Connected (Large Forward Open, 4002 bytes)"
 		}
 		return "Connected (Standard Forward Open, 504 bytes)"
@@ -193,7 +235,7 @@ func (c *Client) SetTags(tags []TagInfo) []TagInfo {
 	if c == nil {
 		return tags
 	}
-	c.tagInfo = make(map[string]TagInfo, len(tags))
+	tagInfo := make(map[string]TagInfo, len(tags))
 
 	// Make a copy to avoid modifying the original slice
 	result := make([]TagInfo, len(tags))
@@ -207,8 +249,13 @@ func (c *Client) SetTags(tags []TagInfo) []TagInfo {
 				result[i].Dimensions = dims
 			}
 		}
-		c.tagInfo[result[i].Name] = result[i]
+		tagInfo[result[i].Name] = result[i]
 	}
+
+	c.mu.Lock()
+	c.tagInfo = tagInfo
+	c.resolvedTypes = nil
+	c.mu.Unlock()
 
 	return result
 }
@@ -216,7 +263,7 @@ func (c *Client) SetTags(tags []TagInfo) []TagInfo {
 // getElementCount returns the element count to request for a tag.
 // Returns the product of dimensions for arrays, 1 for scalars or unknown tags.
 func (c *Client) getElementCount(tagName string) uint16 {
-	if c == nil || c.tagInfo == nil {
+	if c == nil {
 		return 1
 	}
 	if info, ok := c.resolveTagInfo(tagName); ok {
@@ -233,7 +280,7 @@ func (c *Client) getElementCount(tagName string) uint16 {
 
 // isArrayTag returns true if the tag is known to be an array with dimensions.
 func (c *Client) isArrayTag(tagName string) bool {
-	if c == nil || c.tagInfo == nil {
+	if c == nil {
 		return false
 	}
 	if info, ok := c.resolveTagInfo(tagName); ok {
@@ -244,7 +291,7 @@ func (c *Client) isArrayTag(tagName string) bool {
 
 // isStructTag returns true if the tag is known to be a structure/UDT type.
 func (c *Client) isStructTag(tagName string) bool {
-	if c == nil || c.tagInfo == nil {
+	if c == nil {
 		return false
 	}
 	if info, ok := c.resolveTagInfo(tagName); ok {
@@ -257,7 +304,7 @@ func (c *Client) isStructTag(tagName string) bool {
 // The instance ID enables Symbol Instance Addressing which is more reliable
 // for reading structures on some PLC configurations.
 func (c *Client) getInstanceID(tagName string) uint32 {
-	if c == nil || c.tagInfo == nil {
+	if c == nil {
 		return 0
 	}
 	if info, ok := c.resolveTagInfo(tagName); ok {
@@ -270,10 +317,10 @@ func (c *Client) getInstanceID(tagName string) uint32 {
 // Returns (tagInfo, true) if found, (TagInfo{}, false) if not.
 // Used for debugging to verify tag info is stored correctly.
 func (c *Client) GetTagInfo(tagName string) (TagInfo, bool) {
-	if c == nil || c.tagInfo == nil {
+	if c == nil {
 		return TagInfo{}, false
 	}
-	info, ok := c.tagInfo[tagName]
+	info, ok := c.lookupTagInfo(tagName)
 	return info, ok
 }
 
@@ -281,28 +328,21 @@ func (c *Client) GetTagInfo(tagName string) (TagInfo, bool) {
 // symbol table TypeCode (with structure flag + template ID for structures).
 // This is useful in manual mode where the CIP Read Tag response DataType (0x02A0)
 // doesn't contain the template ID needed for structure expansion.
+// A bit of an integer tag (e.g. "MyDint.5") resolves to BOOL.
+// The root tag's symbol entry is cached per client, so repeated calls do not
+// page through the symbol table again.
 // Returns (typeCode, true) if found, (0, false) if not found or on error.
 func (c *Client) ResolveTagType(tagName string) (uint16, bool) {
 	if c == nil || c.plc == nil {
 		return 0, false
 	}
-	if info, ok := c.resolveTagInfo(tagName); ok {
+	if info, ok := c.resolveWithLookup(tagName); ok {
 		return info.TypeCode, true
 	}
-	root := rootTagName(tagName)
-	if _, known := c.tagInfo[root]; known {
-		return 0, false // Invalid/unresolved member; retain the discovered root.
+	if _, _, _, ok := c.bitReference(tagName); ok {
+		return TypeBOOL, true
 	}
-	info, err := c.plc.FindSymbolByName(root)
-	if err != nil || info == nil {
-		return 0, false
-	}
-	if c.tagInfo == nil {
-		c.tagInfo = make(map[string]TagInfo)
-	}
-	c.tagInfo[root] = *info
-	resolved, ok := c.resolveTagInfo(tagName)
-	return resolved.TypeCode, ok
+	return 0, false
 }
 
 // GetElementCount returns the element count that would be used when reading a tag.
@@ -331,13 +371,14 @@ func (c *Client) GetElementSize(typeCode uint16) uint32 {
 		}
 
 		// Check cache first
-		if tmpl, ok := c.templates[templateID]; ok && tmpl.Size > 0 {
+		if tmpl, ok := c.cachedTemplate(templateID); ok && tmpl.Size > 0 {
 			return tmpl.Size
 		}
-		if c.templateSizes != nil {
-			if size, ok := c.templateSizes[templateID]; ok {
-				return size
-			}
+		c.mu.RLock()
+		size, ok := c.templateSizes[templateID]
+		c.mu.RUnlock()
+		if ok {
+			return size
 		}
 
 		// Query from PLC
@@ -345,10 +386,12 @@ func (c *Client) GetElementSize(typeCode uint16) uint32 {
 			size, err := c.plc.GetTemplateSize(typeCode)
 			if err == nil && size > 0 {
 				// Cache the result
+				c.mu.Lock()
 				if c.templateSizes == nil {
 					c.templateSizes = make(map[uint16]uint32)
 				}
 				c.templateSizes[templateID] = size
+				c.mu.Unlock()
 				return size
 			}
 		}
@@ -460,20 +503,23 @@ func (c *Client) Read(tagNames ...string) ([]*TagValue, error) {
 		return c.readIndividual(tagNames)
 	}
 
+	results := make([]*TagValue, 0, len(tagNames))
+
 	// Separate complex types from simple scalars for proper handling
 	// Arrays and structures need individual reads (large data, potential fragmented reads)
 	// Simple scalars can be batched efficiently
+	// Bits of integers ("MyDint.5") are read through their parent integer.
 	var scalars []string
 	var individual []string
 	for _, name := range tagNames {
-		if c.isArrayTag(name) || c.isStructTag(name) {
+		if parent, bit, _, ok := c.bitReference(name); ok {
+			results = append(results, c.readBitValue(name, parent, bit))
+		} else if c.isArrayTag(name) || c.isStructTag(name) {
 			individual = append(individual, name)
 		} else {
 			scalars = append(scalars, name)
 		}
 	}
-
-	results := make([]*TagValue, 0, len(tagNames))
 
 	// Read complex values with resolved element/member metadata.
 	for _, name := range individual {
@@ -558,6 +604,10 @@ func (c *Client) readIndividual(tagNames []string) ([]*TagValue, error) {
 	results := make([]*TagValue, 0, len(tagNames))
 
 	for _, name := range tagNames {
+		if parent, bit, _, ok := c.bitReference(name); ok {
+			results = append(results, c.readBitValue(name, parent, bit))
+			continue
+		}
 		value, err := c.readTagWithMetadata(name, c.getElementCount(name))
 		if err != nil {
 			value = &TagValue{Name: name, Error: err}
@@ -718,7 +768,7 @@ func (c *Client) expandMemberPaths(basePath string, tmpl *Template, maxDepth int
 // This is useful for expanding a UDT into its readable members for display.
 // Returns paths like ["TagName.Member1", "TagName.Member2", ...].
 func (c *Client) GetStructMembers(tagName string) ([]string, error) {
-	info, ok := c.tagInfo[tagName]
+	info, ok := c.lookupTagInfo(tagName)
 	if !ok {
 		return nil, fmt.Errorf("no tag info for %q", tagName)
 	}
@@ -807,7 +857,7 @@ func (c *Client) getMemberTypeFromTemplate(tagName string) uint16 {
 		memberPath := tagName[dotIdx+1:] // Everything after this dot
 
 		// Check if basePath is a known UDT
-		baseInfo, ok := c.tagInfo[basePath]
+		baseInfo, ok := c.lookupTagInfo(basePath)
 		if ok && IsStructure(baseInfo.TypeCode) {
 			// Found a UDT, get its template
 			tmpl, err := c.GetTemplate(baseInfo.TypeCode)
@@ -883,9 +933,35 @@ func (c *Client) findMemberType(tmpl *Template, memberPath string) uint16 {
 
 // Write writes a value to a tag. If the tag's type is known from discovery,
 // the value is converted to match. Otherwise, the type is inferred from the Go value type.
+//
+// A string written to a STRING-typed tag (Logix STRING or custom string
+// structure, or Micro800 STRING) is encoded in the tag's native layout and
+// rejected if longer than its capacity; a []string writes consecutive
+// elements of a string array the same way. "Tag.N" addressing bit N of a
+// SINT/INT/DINT/LINT (or unsigned) tag is written atomically with the Read
+// Modify Write Tag service and accepts a bool or 0/1.
 func (c *Client) Write(tagName string, value interface{}) error {
 	if c == nil || c.plc == nil {
 		return fmt.Errorf("Write: nil client")
+	}
+	err := c.write(tagName, value)
+	c.forgetTagOnMissing(tagName, err)
+	return err
+}
+
+func (c *Client) write(tagName string, value interface{}) error {
+	if parent, bit, typeCode, ok := c.bitReference(tagName); ok {
+		return c.writeBit(tagName, parent, bit, typeCode, value)
+	}
+	if text, ok := value.(string); ok {
+		if handled, err := c.writeString(tagName, text); handled {
+			return err
+		}
+	}
+	if texts, ok := value.([]string); ok {
+		if handled, err := c.writeStrings(tagName, texts); handled {
+			return err
+		}
 	}
 
 	// For UDT member access (path contains dot after base tag), look up type from template
@@ -897,10 +973,19 @@ func (c *Client) Write(tagName string, value interface{}) error {
 	}
 
 	// Look up the tag's actual type from discovery
-	if info, ok := c.tagInfo[tagName]; ok && info.TypeCode != 0 {
+	if info, ok := c.lookupTagInfo(tagName); ok && info.TypeCode != 0 {
 		logging.DebugLog("logix", "Write %s: found type info, TypeCode=0x%04X (%s), value=%v (%T)",
 			tagName, info.TypeCode, TypeName(info.TypeCode), value, value)
 		return c.writeTyped(tagName, value, info.TypeCode)
+	}
+
+	// Otherwise resolve the type from the controller (cached per client) so
+	// the value is encoded as the tag's real type rather than one guessed
+	// from the Go value (e.g. a Go int sent as DINT to an INT tag).
+	if code, ok := c.ResolveTagType(tagName); ok && code != 0 && !IsStructure(code) {
+		logging.DebugLog("logix", "Write %s: resolved type 0x%04X (%s), value=%v (%T)",
+			tagName, code, TypeName(code), value, value)
+		return c.writeTyped(tagName, value, code)
 	}
 
 	// Fall back to inferring type from value
@@ -1443,16 +1528,38 @@ func (c *Client) WriteFloat(tagName string, val float64) error {
 	return c.plc.WriteTag(tagName, TypeREAL, data)
 }
 
-// WriteString writes a string value to a tag.
-// Writes as Logix STRING (4-byte length prefix + character data).
+// WriteString writes a string value to a tag. When the tag's type resolves
+// to a Logix STRING/custom string structure or a Micro800 STRING it is
+// written in that native layout; otherwise it is sent as atomic STRING
+// (0xD0: 4-byte length prefix + character data).
 func (c *Client) WriteString(tagName string, val string) error {
 	if c == nil || c.plc == nil {
 		return fmt.Errorf("WriteString: nil client")
+	}
+	if handled, err := c.writeString(tagName, val); handled {
+		c.forgetTagOnMissing(tagName, err)
+		return err
 	}
 	strBytes := []byte(val)
 	data := binary.LittleEndian.AppendUint32(nil, uint32(len(strBytes)))
 	data = append(data, strBytes...)
 	return c.plc.WriteTag(tagName, TypeSTRING, data)
+}
+
+// isPermanentTemplateError reports whether a template fetch failed because the
+// controller rejected the request with a CIP status that will not change on
+// retry. Connection-level statuses (connection failure, resource unavailable,
+// connection lost, state conflicts) are treated as transient.
+func isPermanentTemplateError(err error) bool {
+	var cipErr *cipStatusError
+	if !errors.As(err, &cipErr) {
+		return false
+	}
+	switch cipErr.status {
+	case 0x01, 0x02, 0x07, StatusObjectStateConfl, StatusDeviceStateConfl:
+		return false
+	}
+	return true
 }
 
 // GetTemplate returns the template for a structure type, fetching from PLC if not cached.
@@ -1471,46 +1578,46 @@ func (c *Client) GetTemplate(typeCode uint16) (*Template, error) {
 	}
 
 	// Check success cache first
-	if c.templates != nil {
-		if tmpl, ok := c.templates[templateID]; ok {
-			return tmpl, nil
-		}
+	if tmpl, ok := c.cachedTemplate(templateID); ok {
+		return tmpl, nil
 	}
 
 	// Check failure cache - don't retry templates that already failed
-	if c.failedTemplates != nil {
-		if c.failedTemplates[templateID] {
-			return nil, fmt.Errorf("template %d previously failed to fetch", templateID)
-		}
+	c.mu.RLock()
+	failed := c.failedTemplates[templateID]
+	c.mu.RUnlock()
+	if failed {
+		return nil, fmt.Errorf("template %d previously failed to fetch", templateID)
 	}
 
 	// Fetch from PLC
 	tmpl, err := c.plc.GetTemplate(templateID)
 	if err != nil {
-		// Only cache permanent failures, not transient network errors
-		// Timeouts and connection errors should be retried on next attempt
-		errStr := err.Error()
-		isTransient := strings.Contains(errStr, "timeout") ||
-			strings.Contains(errStr, "connection reset") ||
-			strings.Contains(errStr, "connection refused") ||
-			strings.Contains(errStr, "i/o timeout") ||
-			strings.Contains(errStr, "broken pipe")
-
-		if !isTransient {
-			// Cache only permanent failures (e.g., template doesn't exist)
+		// Cache only rejections reported by the controller (e.g. the template
+		// does not exist). Transport, timeout, and parsing failures are retried
+		// on the next attempt.
+		if isPermanentTemplateError(err) {
+			c.mu.Lock()
 			if c.failedTemplates == nil {
 				c.failedTemplates = make(map[uint16]bool)
 			}
 			c.failedTemplates[templateID] = true
+			c.mu.Unlock()
 		}
 		return nil, err
 	}
 
-	// Cache success
+	// Cache success; keep the first template if a concurrent fetch won.
+	c.mu.Lock()
 	if c.templates == nil {
 		c.templates = make(map[uint16]*Template)
 	}
-	c.templates[templateID] = tmpl
+	if existing, ok := c.templates[templateID]; ok {
+		tmpl = existing
+	} else {
+		c.templates[templateID] = tmpl
+	}
+	c.mu.Unlock()
 
 	debugLogVerbose("Cached template %q (ID: %d) with %d total members (%d visible)",
 		tmpl.Name, tmpl.ID, len(tmpl.Members), len(tmpl.MemberMap))
@@ -1585,9 +1692,11 @@ func (c *Client) ClearTemplateCache() {
 	if c == nil {
 		return
 	}
+	c.mu.Lock()
 	c.templates = nil
 	c.templateSizes = nil
 	c.failedTemplates = nil
+	c.mu.Unlock()
 	debugLogVerbose("Template cache cleared")
 }
 
@@ -1596,12 +1705,20 @@ func (c *Client) ClearTemplateCache() {
 // Use this only if you want to pre-warm the cache (not recommended for slow connections).
 // Note: Built-in AB types (modules, etc.) don't have fetchable templates - this is expected.
 func (c *Client) FetchTemplatesForTags() {
-	if c == nil || c.tagInfo == nil {
+	if c == nil {
 		return
 	}
 
-	var fetched, failed int
+	// Snapshot the catalog; template fetches run without holding the lock.
+	c.mu.RLock()
+	tags := make([]TagInfo, 0, len(c.tagInfo))
 	for _, tag := range c.tagInfo {
+		tags = append(tags, tag)
+	}
+	c.mu.RUnlock()
+
+	var fetched, failed int
+	for _, tag := range tags {
 		if IsStructure(tag.TypeCode) {
 			tmpl, err := c.GetTemplate(tag.TypeCode)
 			if err != nil {
@@ -1886,10 +2003,19 @@ func (c *Client) decodeArrayMember(member *TemplateMember, data []byte) (interfa
 	return results, nil
 }
 
-// GetCachedTemplates returns all cached templates.
+// GetCachedTemplates returns a snapshot of all cached templates.
 func (c *Client) GetCachedTemplates() map[uint16]*Template {
 	if c == nil {
 		return nil
 	}
-	return c.templates
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.templates == nil {
+		return nil
+	}
+	templates := make(map[uint16]*Template, len(c.templates))
+	for id, tmpl := range c.templates {
+		templates[id] = tmpl
+	}
+	return templates
 }

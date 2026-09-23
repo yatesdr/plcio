@@ -85,16 +85,31 @@ func TestBroadcastIdentityDoesNotVerifyRuntimeRoute(t *testing.T) {
 	if device == nil || len(device.Hostname) != 300 || !device.Connected || device.HasRoute || device.AmsNetId != "5.45.219.226.1.1" {
 		t.Fatalf("UDP identity/route/length: %+v", device)
 	}
+	// The fixed header is strict: service, echoed invoke ID and NetID.
 	for _, mutate := range []func([]byte) []byte{
 		func(b []byte) []byte { b[8] = 6; return b },
 		func(b []byte) []byte { b[4] = 1; return b },
 		func(b []byte) []byte { clear(b[12:18]); return b },
+		func(b []byte) []byte { b[0] = 4; return b },
+		func(b []byte) []byte { return b[:17] },
+	} {
+		if parseDiscoveryResponse(mutate(append([]byte(nil), data...)), net.IPv4(1, 2, 3, 4)) != nil {
+			t.Fatal("malformed UDP identity accepted")
+		}
+	}
+	// The tag section is parsed defensively: a truncated tag, an overstated
+	// count or trailing bytes keep the proven identity but no partial value.
+	for _, mutate := range []func([]byte) []byte{
 		func(b []byte) []byte { return b[:len(b)-1] },
 		func(b []byte) []byte { b[20] = 2; return b },
 		func(b []byte) []byte { return append(b, 0) },
 	} {
-		if parseDiscoveryResponse(mutate(append([]byte(nil), data...)), net.IPv4(1, 2, 3, 4)) != nil {
-			t.Fatal("malformed UDP identity accepted")
+		device := parseDiscoveryResponse(mutate(append([]byte(nil), data...)), net.IPv4(1, 2, 3, 4))
+		if device == nil || device.AmsNetId != "5.45.219.226.1.1" || device.HasRoute {
+			t.Fatalf("identity dropped: %+v", device)
+		}
+		if device.Hostname != "" && len(device.Hostname) != 300 {
+			t.Fatalf("partial hostname surfaced: %d", len(device.Hostname))
 		}
 	}
 }

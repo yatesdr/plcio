@@ -31,6 +31,9 @@ const (
 	TypeWChar   uint16 = 0x0013 // 16 bits wide character
 	TypeString  uint16 = 0x0014 // S7 String (max 254 chars)
 	TypeWString uint16 = 0x0015 // Wide string (S7-1500)
+	TypeS5Time  uint16 = 0x0016 // 16 bits: 3 BCD digits + 2-bit time base
+	TypeDateAndTime uint16 = 0x0017 // 8 bytes BCD (DATE_AND_TIME / DT, S7-300/400)
+	TypeDTL     uint16 = 0x0018 // 12 bytes (DTL, S7-1200/1500)
 
 	// Array flag - when set, indicates an array of the base type
 	TypeArrayFlag uint16 = 0x1000
@@ -47,12 +50,14 @@ func TypeSize(dataType uint16) int {
 		return 1 // Stored as 1 byte
 	case TypeByte, TypeChar, TypeSInt: // TypeUSInt == TypeByte
 		return 1
-	case TypeWord, TypeInt, TypeDate, TypeWChar: // TypeUInt == TypeWord
+	case TypeWord, TypeInt, TypeDate, TypeWChar, TypeS5Time: // TypeUInt == TypeWord
 		return 2
 	case TypeDWord, TypeDInt, TypeReal, TypeTime, TypeTimeOfDay: // TypeUDInt == TypeDWord
 		return 4
-	case TypeLWord, TypeLInt, TypeLReal: // TypeULInt == TypeLWord
+	case TypeLWord, TypeLInt, TypeLReal, TypeDateAndTime: // TypeULInt == TypeLWord
 		return 8
+	case TypeDTL:
+		return 12
 	case TypeString, TypeWString:
 		return 0 // Variable length
 	default:
@@ -118,6 +123,12 @@ func TypeName(dataType uint16) string {
 		name = "STRING"
 	case TypeWString:
 		name = "WSTRING"
+	case TypeS5Time:
+		name = "S5TIME"
+	case TypeDateAndTime:
+		name = "DATE_AND_TIME"
+	case TypeDTL:
+		name = "DTL"
 	default:
 		name = fmt.Sprintf("UNKNOWN(0x%04X)", baseType)
 	}
@@ -179,6 +190,12 @@ func TypeCodeFromName(name string) (uint16, bool) {
 		typeCode, ok = TypeString, true
 	case "WSTRING":
 		typeCode, ok = TypeWString, true
+	case "S5TIME":
+		typeCode, ok = TypeS5Time, true
+	case "DATE_AND_TIME", "DT":
+		typeCode, ok = TypeDateAndTime, true
+	case "DTL":
+		typeCode, ok = TypeDTL, true
 	default:
 		return 0, false
 	}
@@ -198,5 +215,6 @@ func SupportedTypeNames() []string {
 		"DWORD", "DINT", "UDINT", "REAL", "TIME",
 		"LWORD", "LINT", "ULINT", "LREAL",
 		"STRING", "WSTRING",
+		"S5TIME", "DATE", "TIME_OF_DAY", "DATE_AND_TIME", "DTL",
 	}
 }

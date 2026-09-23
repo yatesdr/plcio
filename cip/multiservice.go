@@ -92,10 +92,18 @@ func ParseMultipleServiceResponse(data []byte) ([]MultiServiceResponse, error) {
 		return nil, fmt.Errorf("MultipleService response too short for %d services", serviceCount)
 	}
 
-	// Read offsets
+	// Read offsets. Each must lie within [minSize, len(data)] and they must be
+	// non-decreasing, otherwise the reply is malformed.
 	offsets := make([]uint16, serviceCount)
 	for i := 0; i < int(serviceCount); i++ {
 		offsets[i] = binary.LittleEndian.Uint16(data[2+i*2 : 4+i*2])
+		off := int(offsets[i])
+		if off < minSize || off > len(data) {
+			return nil, fmt.Errorf("MultipleService response offset %d for service %d out of range [%d, %d]", off, i, minSize, len(data))
+		}
+		if i > 0 && offsets[i] < offsets[i-1] {
+			return nil, fmt.Errorf("MultipleService response offset %d for service %d precedes previous offset %d", off, i, offsets[i-1])
+		}
 	}
 
 	// Parse each service response

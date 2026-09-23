@@ -64,7 +64,7 @@ func (c *Client) catalogResult(project bool) ([]TagInfo, []adsbridge.Tag, error)
 		if !staleSymbolError(err) || attempt == 1 {
 			return nil, nil, err
 		}
-		c.invalidateCaches()
+		c.invalidateLive()
 	}
 	panic("unreachable")
 }
@@ -109,6 +109,15 @@ func staleSymbolError(err error) bool {
 	return errors.As(err, &device) && (device.Code == ErrDeviceSymbolVersionInvalid || device.Code == ErrDeviceNotifyHndInvalid || device.Code == ErrDeviceSymbolNotActive)
 }
 
+// staleHandleNotFound reports symbol-not-found from a value access through a
+// handle cached by an earlier operation. After a download that does not change
+// the symbol version, TwinCAT reports old handles this way. Callers apply it
+// only to cached-handle value access: a name lookup's not-found is final.
+func staleHandleNotFound(err error) bool {
+	var device *AdsError
+	return errors.As(err, &device) && device.Code == ErrDeviceSymbolNotFound
+}
+
 // Only a documented missing catalog permits primitive fallback. Version and
 // transport failures still fail the operation when that capability is cached.
 func (c *Client) loadSchemaForIO() error {
@@ -145,7 +154,7 @@ func (c *Client) checkVersion() (uint32, error) {
 	if err != nil {
 		if unsupportedService(err) {
 			if c.versionSet {
-				c.invalidateCaches()
+				c.invalidateLive()
 			}
 			c.versionCapability = 2
 			return 0, nil
@@ -162,7 +171,7 @@ func (c *Client) checkVersion() (uint32, error) {
 		return 0, c.conn.fail(fmt.Errorf("symbol-version payload size %d", len(data)))
 	}
 	if c.versionSet && c.symbolVersion != version {
-		c.invalidateCaches()
+		c.invalidateLive()
 	}
 	c.symbolVersion, c.versionSet, c.versionCapability = version, true, 1
 	return version, nil
@@ -212,7 +221,7 @@ func (c *Client) loadSchema() error {
 	}
 	var symbols, types []byte
 	if symbolBytes != 0 {
-		symbols, err = c.readData(IndexGroupSymbolUpload, 0, symbolBytes)
+		symbols, err = c.readUpload(IndexGroupSymbolUpload, symbolBytes)
 		if err != nil {
 			return err
 		}
@@ -226,7 +235,7 @@ func (c *Client) loadSchema() error {
 	}
 	entries := make(map[string]*typeEntry)
 	if !legacy && !c.typesUnavailable && typeBytes != 0 {
-		types, err = c.readData(IndexGroupDataTypeUpload, 0, typeBytes)
+		types, err = c.readUpload(IndexGroupDataTypeUpload, typeBytes)
 		if unsupportedService(err) {
 			c.typesUnavailable = true
 		} else if err != nil {
@@ -255,9 +264,18 @@ func (c *Client) loadSchema() error {
 	}
 	// Validate resolution budgets before publication. Unsupported valid layouts
 	// remain advertised and cannot poison unrelated supported symbols.
+	snapshot.folded = make(map[string]string, len(tags))
 	for _, tag := range tags {
 		if err := checkDeadline(c.deadline); err != nil {
 			return err
+		}
+		// TwinCAT names are case-insensitive. An ambiguous fold (never produced
+		// by TwinCAT) resolves nothing and leaves the decision to the PLC lookup.
+		key := foldSymbolName(tag.Name)
+		if prior, ok := snapshot.folded[key]; ok && prior != tag.Name {
+			snapshot.folded[key] = ""
+		} else {
+			snapshot.folded[key] = tag.Name
 		}
 		snapshot.resolver.symbol(tag)
 		if !tag.IsWritable() {

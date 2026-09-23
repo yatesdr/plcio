@@ -2,6 +2,7 @@ package s7
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -135,7 +136,7 @@ func tryS7Connect(ip net.IP, addr string, rack, slot int, timeout time.Duration)
 
 	// Read TPKT response
 	header := make([]byte, 4)
-	if _, err := conn.Read(header); err != nil {
+	if _, err := io.ReadFull(conn, header); err != nil {
 		return nil
 	}
 
@@ -149,7 +150,7 @@ func tryS7Connect(ip net.IP, addr string, rack, slot int, timeout time.Duration)
 	}
 
 	payload := make([]byte, length-4)
-	if _, err := conn.Read(payload); err != nil {
+	if _, err := io.ReadFull(conn, payload); err != nil {
 		return nil
 	}
 

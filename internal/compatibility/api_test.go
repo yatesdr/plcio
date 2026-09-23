@@ -105,6 +105,10 @@ func TestPublishedSurface(t *testing.T) {
 		"ads.WithMaxBatchItems": true, "ads.WithMetadataLimits": true, "ads.WithExpansionLimits": true,
 		"ads.WithStringEncoding": true, "driver.Describer": true, "driver.NewADSAdapterWithOptions": true,
 		"driver.*ADSAdapter.Describe": true,
+		// Additive hardening APIs: ReadState keepalive, UDP Get Info discovery
+		// report, connection-loss classification and discovery error report.
+		"ads.*Client.ReadState": true, "ads.DiscoverWithReport": true,
+		"driver.IsConnectionLost": true, "driver.DiscoverAllWithReport": true,
 	}
 	for key := range actual {
 		if _, exists := baseline[key]; !exists && !allowed[key] {

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"reflect"
 
 	"github.com/yatesdr/plcio/logix"
 	"github.com/yatesdr/plcio/omron"
@@ -12,6 +13,14 @@ import (
 )
 
 func canonicalNumeric(value any) bool {
+	if canonicalNumericType(value) {
+		return true
+	}
+	_, ok := widenNumeric(value)
+	return ok
+}
+
+func canonicalNumericType(value any) bool {
 	switch value.(type) {
 	case int64, uint64, float64, []int64, []uint64, []float64:
 		return true
@@ -19,9 +28,57 @@ func canonicalNumeric(value any) bool {
 	return false
 }
 
+// widenNumeric converts any other numeric kind (named types included) and
+// slices of them to int64/uint64/float64 so the canonical range checks apply.
+// Byte slices are opaque buffers and are left alone.
+func widenNumeric(value any) (any, bool) {
+	v := reflect.ValueOf(value)
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint(), true
+	case reflect.Float32, reflect.Float64:
+		return v.Float(), true
+	case reflect.Slice:
+		switch v.Type().Elem().Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			values := make([]int64, v.Len())
+			for i := range values {
+				values[i] = v.Index(i).Int()
+			}
+			return values, true
+		case reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			values := make([]uint64, v.Len())
+			for i := range values {
+				values[i] = v.Index(i).Uint()
+			}
+			return values, true
+		case reflect.Float32, reflect.Float64:
+			values := make([]float64, v.Len())
+			for i := range values {
+				values[i] = v.Index(i).Float()
+			}
+			return values, true
+		}
+	}
+	return nil, false
+}
+
 // Check the canonical numeric forms at the adapter boundary, preserving native
 // protocol encoders for existing input forms and vendor-specific text/time rules.
+//
+// Other numeric kinds are checked in their widened form; when in range they
+// report handled=false so the native encoder still receives the caller's value.
 func canonicalStorage(value any, width int, signed, floating bool, order binary.ByteOrder) ([]byte, int, bool, error) {
+	if !canonicalNumericType(value) {
+		if wide, ok := widenNumeric(value); ok {
+			if _, _, handled, err := canonicalStorage(wide, width, signed, floating, order); handled && err != nil {
+				return nil, 0, true, err
+			}
+		}
+		return nil, 0, false, nil
+	}
 	var values []any
 	switch v := value.(type) {
 	case int64:
@@ -203,9 +260,11 @@ func pcccCanonical(addr *pccc.FileAddress, value any) (any, error) {
 	if addr.BitNumber >= 0 {
 		return value, nil
 	}
-	width, floating := 0, false
+	width, floating, bitPattern := 0, false, false
 	switch addr.FileType {
-	case pccc.FileTypeInteger, pccc.FileTypeOutput, pccc.FileTypeInput, pccc.FileTypeStatus, pccc.FileTypeBinary, pccc.FileTypeASCII:
+	case pccc.FileTypeStatus, pccc.FileTypeBinary, pccc.FileTypeASCII:
+		width, bitPattern = 16, true
+	case pccc.FileTypeInteger, pccc.FileTypeOutput, pccc.FileTypeInput:
 		width = 16
 	case pccc.FileTypeLong:
 		width = 32
@@ -217,6 +276,12 @@ func pcccCanonical(addr *pccc.FileAddress, value any) (any, error) {
 		}
 	}
 	data, count, handled, err := canonicalStorage(value, width, true, floating, binary.LittleEndian)
+	if err != nil && bitPattern {
+		// B/S/A words are bit patterns: also accept the unsigned form 0..65535.
+		if d, c, h, uerr := canonicalStorage(value, width, false, floating, binary.LittleEndian); uerr == nil {
+			data, count, handled, err = d, c, h, nil
+		}
+	}
 	if !handled || err != nil {
 		return value, err
 	}

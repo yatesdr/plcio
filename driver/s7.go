@@ -3,6 +3,7 @@ package driver
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/yatesdr/plcio/s7"
 )
@@ -11,6 +12,8 @@ import (
 type S7Adapter struct {
 	client *s7.Client
 	config *PLCConfig
+	mu     sync.RWMutex
+	epoch  uint64 // bumped by Close so an in-flight Connect is discarded
 }
 
 // NewS7Adapter creates a new S7Adapter from configuration.
@@ -24,8 +27,20 @@ func NewS7Adapter(cfg *PLCConfig) (*S7Adapter, error) {
 	}, nil
 }
 
+func (a *S7Adapter) currentClient() *s7.Client {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.client
+}
+
 // Connect establishes connection to the S7 PLC.
 func (a *S7Adapter) Connect() error {
+	a.mu.RLock()
+	epoch := a.epoch
+	a.mu.RUnlock()
+	// Rack stays 0: PLCConfig has no Rack field (its layout is frozen by the
+	// v0.3.0 unkeyed-literal compatibility contract). s7.Connect validates
+	// the slot (0-31). Native s7.WithRackSlot supports racks 0-7.
 	opts := []s7.Option{s7.WithRackSlot(0, int(a.config.Slot))}
 	if a.config.Timeout > 0 {
 		opts = append(opts, s7.WithTimeout(a.config.Timeout))
@@ -36,22 +51,38 @@ func (a *S7Adapter) Connect() error {
 		return fmt.Errorf("s7 connect: %w", err)
 	}
 
+	a.mu.Lock()
+	if a.epoch != epoch {
+		a.mu.Unlock()
+		client.Close()
+		return fmt.Errorf("s7 connect superseded by Close")
+	}
+	previous := a.client
 	a.client = client
+	a.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 	return nil
 }
 
 // Close releases the connection.
 func (a *S7Adapter) Close() error {
-	if a.client != nil {
-		a.client.Close()
-		a.client = nil
+	a.mu.Lock()
+	client := a.client
+	a.client = nil
+	a.epoch++
+	a.mu.Unlock()
+	if client != nil {
+		client.Close()
 	}
 	return nil
 }
 
 // IsConnected returns true if connected to the PLC.
 func (a *S7Adapter) IsConnected() bool {
-	return a.client != nil && a.client.IsConnected()
+	client := a.currentClient()
+	return client != nil && client.IsConnected()
 }
 
 // Family returns the PLC family.
@@ -61,30 +92,40 @@ func (a *S7Adapter) Family() PLCFamily {
 
 // ConnectionMode returns a description of the connection mode.
 func (a *S7Adapter) ConnectionMode() string {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return "Not connected"
 	}
-	return a.client.ConnectionMode()
+	return client.ConnectionMode()
 }
 
 // GetDeviceInfo returns information about the connected PLC.
 func (a *S7Adapter) GetDeviceInfo() (*DeviceInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	info, err := a.client.GetCPUInfo()
+	info, err := client.GetCPUInfo()
 	if err != nil {
 		return nil, err
 	}
 
+	model := info.OrderCode
+	if model == "" {
+		model = info.ModuleTypeName
+	}
+	description := info.ModuleName
+	if description == "" && info.ModuleTypeName != "S7 PLC" {
+		description = info.ModuleTypeName
+	}
 	return &DeviceInfo{
 		Family:       FamilyS7,
 		Vendor:       "Siemens",
-		Model:        info.ModuleTypeName,
-		Version:      info.ASName,
+		Model:        model,
+		Version:      info.FirmwareVersion,
 		SerialNumber: info.SerialNumber,
-		Description:  info.ModuleName,
+		Description:  description,
 	}, nil
 }
 
@@ -105,20 +146,27 @@ func (a *S7Adapter) Programs() ([]string, error) {
 
 // Read reads tag values from the PLC.
 func (a *S7Adapter) Read(requests []TagRequest) ([]*TagValue, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	// Convert to s7.TagRequest
+	// Convert to s7.TagRequest. An explicit hint wins; otherwise use the
+	// tag's configured DataType, exactly as Write does, so a read and a write
+	// of the same configured tag agree on its width.
 	s7Requests := make([]s7.TagRequest, len(requests))
 	for i, req := range requests {
+		hint := req.TypeHint
+		if hint == "" {
+			hint = a.configuredType(req.Name)
+		}
 		s7Requests[i] = s7.TagRequest{
 			Address:  req.Name,
-			TypeHint: req.TypeHint,
+			TypeHint: hint,
 		}
 	}
 
-	values, err := a.client.ReadWithTypes(s7Requests)
+	values, err := client.ReadWithTypes(s7Requests)
 	if err != nil && len(values) == 0 {
 		return nil, err
 	}
@@ -160,39 +208,69 @@ func (a *S7Adapter) Read(requests []TagRequest) ([]*TagValue, error) {
 
 // Write writes a value to a tag.
 func (a *S7Adapter) Write(tag string, value interface{}) error {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return fmt.Errorf("not connected")
 	}
 
 	// Look up the tag's configured type
-	typeHint := ""
-	if a.config != nil {
-		for _, t := range a.config.Tags {
-			if strings.EqualFold(t.Name, tag) {
-				typeHint = t.DataType
-				break
-			}
-		}
-	}
+	typeHint := a.configuredType(tag)
 
 	addr, err := s7.ParseAddress(tag)
 	if err != nil {
 		return err
 	}
 	code := addr.DataType
-	if code == 0 && typeHint != "" {
-		code, _ = s7.TypeCodeFromName(typeHint)
+	if typeHint != "" {
+		// The configured type decides the encoding for offset-only and
+		// (same-width) sized addresses alike; s7 rejects width mismatches.
+		if hinted, ok := s7.TypeCodeFromName(typeHint); ok {
+			code = hinted
+		}
+	} else if code != 0 && addr.BitNum < 0 {
+		// Mirrors s7.Client.WriteWithType: a float written to a 4/8-byte
+		// sized address (DBD, MD, ...) is a REAL/LREAL of that width.
+		switch value.(type) {
+		case float32, float64, []float32, []float64:
+			switch addr.Size {
+			case 4:
+				code = s7.TypeReal
+			case 8:
+				code = s7.TypeLReal
+			}
+		}
 	}
 	value, err = s7Canonical(code, value)
 	if err != nil {
 		return err
 	}
-	return a.client.WriteWithType(tag, value, typeHint)
+	return client.WriteWithType(tag, value, typeHint)
 }
 
-// Keepalive is a no-op for S7 (TCP connection is kept alive by OS).
+// configuredType returns the DataType configured for tag in PLCConfig.Tags
+// (case-insensitive name match, first match wins), or "".
+func (a *S7Adapter) configuredType(tag string) string {
+	if a.config == nil {
+		return ""
+	}
+	for _, t := range a.config.Tags {
+		if strings.EqualFold(t.Name, tag) {
+			return t.DataType
+		}
+	}
+	return ""
+}
+
+// Keepalive performs a lightweight request (SZL 0x0424 CPU status read) so a
+// dead link is detected between polls. It returns an error when not
+// connected and a connection error (matching s7.ErrConnectionLost) when the
+// round trip fails.
 func (a *S7Adapter) Keepalive() error {
-	return nil
+	client := a.currentClient()
+	if client == nil {
+		return fmt.Errorf("s7 keepalive: not connected")
+	}
+	return client.Keepalive()
 }
 
 // IsConnectionError returns true if the error indicates a connection problem.
@@ -202,5 +280,5 @@ func (a *S7Adapter) IsConnectionError(err error) bool {
 
 // Client returns the underlying s7.Client for advanced operations.
 func (a *S7Adapter) Client() *s7.Client {
-	return a.client
+	return a.currentClient()
 }

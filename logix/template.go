@@ -209,6 +209,7 @@ func (p *PLC) getTemplateAttributes(templateID uint16) (*templateAttributes, err
 
 	attrs := &templateAttributes{}
 	offset := 2
+	var defSizeStatus uint16 // Controller's per-attribute status for attribute 4
 
 	for i := 0; i < int(attrCount) && offset+4 <= len(data); i++ {
 		attrID := binary.LittleEndian.Uint16(data[offset : offset+2])
@@ -217,6 +218,9 @@ func (p *PLC) getTemplateAttributes(templateID uint16) (*templateAttributes, err
 
 		if attrStatus != 0 {
 			debugLogVerbose("getTemplateAttributes: attribute %d has error status 0x%04X", attrID, attrStatus)
+			if attrID == 4 {
+				defSizeStatus = attrStatus
+			}
 			// Still need to skip the value bytes - but we don't know the size
 			// For safety, try to continue based on expected attribute sizes
 			switch attrID {
@@ -275,6 +279,10 @@ func (p *PLC) getTemplateAttributes(templateID uint16) (*templateAttributes, err
 	}
 
 	if attrs.ObjectDefinitionSize == 0 {
+		if defSizeStatus != 0 && defSizeStatus <= 0xFF {
+			// The controller explicitly rejected the attribute.
+			return nil, &cipStatusError{status: byte(defSizeStatus), msg: "failed to get object definition size"}
+		}
 		return nil, fmt.Errorf("failed to get object definition size")
 	}
 
@@ -322,19 +330,17 @@ func (p *PLC) readTemplateData(templateID uint16, totalBytes uint32) ([]byte, er
 		reqData = append(reqData, path...)
 		reqData = append(reqData, reqPayload...)
 
+		// Any failure before the final (status 0x00) chunk leaves the
+		// definition incomplete; never parse or cache a truncated template.
 		cipResp, err := p.sendCipRequest(reqData)
 		if err != nil {
 			if len(allData) > 0 {
 				debugLogVerbose("readTemplateData: error after %d bytes: %v", len(allData), err)
-				break
 			}
 			return nil, err
 		}
 
 		if len(cipResp) < 4 {
-			if len(allData) > 0 {
-				break
-			}
 			return nil, fmt.Errorf("response too short: %d bytes", len(cipResp))
 		}
 
@@ -351,13 +357,15 @@ func (p *PLC) readTemplateData(templateID uint16, totalBytes uint32) ([]byte, er
 		if status != StatusSuccess && status != StatusPartialTransfer {
 			if len(allData) > 0 {
 				debugLogVerbose("readTemplateData: error after %d bytes: %v", len(allData), parseCipError(status, addlStatusSize, cipResp[4:]))
-				break
 			}
 			return nil, parseCipError(status, addlStatusSize, cipResp[4:])
 		}
 
 		dataStart := 4 + int(addlStatusSize)*2
 		if dataStart >= len(cipResp) {
+			if status == StatusPartialTransfer {
+				return nil, fmt.Errorf("partial transfer without data after %d bytes", len(allData))
+			}
 			break
 		}
 

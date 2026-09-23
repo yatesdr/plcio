@@ -100,7 +100,7 @@ func (c *Client) listSymbols() ([]TagInfo, error) {
 		if err != nil {
 			if isEIPConnectionError(err) {
 				logging.DebugLog("EIP/Discovery", "Connection error at instance %d, stopping discovery: %v", instance, err)
-				break
+				return allTags, discoveryInterrupted(len(allTags), err)
 			}
 
 			consecutiveErrors++
@@ -180,6 +180,9 @@ func (c *Client) listSymbolsService55() ([]TagInfo, error) {
 
 		data, status, err := c.sendCIPRequestWithStatus(req)
 		if err != nil {
+			if isEIPConnectionError(err) {
+				return allTags, discoveryInterrupted(len(allTags), err)
+			}
 			return nil, fmt.Errorf("service 0x55 page %d: %w", page, err)
 		}
 
@@ -259,7 +262,7 @@ func parseService55ABFormat(data []byte) (tags []TagInfo, lastInstance uint32) {
 
 		entry := data[i : i+entrySize]
 		name := string(entry[6 : 6+nameLen])
-		typeCode := binary.LittleEndian.Uint16(entry[6+nameLen : 8+nameLen])
+		typeCode := discoveryTypeCode(binary.LittleEndian.Uint16(entry[6+nameLen : 8+nameLen]))
 
 		i += entrySize
 
@@ -310,7 +313,7 @@ func parseService55CIPFormat(data []byte) (tags []TagInfo, lastInstance uint32) 
 		}
 
 		name := string(data[i+4 : i+4+nameLen])
-		typeCode := binary.LittleEndian.Uint16(data[i+4+nameLen : i+4+nameLen+2])
+		typeCode := discoveryTypeCode(binary.LittleEndian.Uint16(data[i+4+nameLen : i+4+nameLen+2]))
 		i += 4 + nameLen + 2
 
 		if instance == 0 || !isValidTagName(name) {
@@ -370,6 +373,9 @@ func (c *Client) listSymbolsOmron5F() ([]TagInfo, error) {
 
 			data, _, err := c.sendCIPRequestWithStatus(req)
 			if err != nil {
+				if isEIPConnectionError(err) {
+					return nil, discoveryInterrupted(len(allNames), err)
+				}
 				if page == 0 {
 					logging.DebugLog("EIP/Discovery", "Service 0x5F tagType=%s failed: %v", tagTypeNames[ti], err)
 					break // Try next tag type
@@ -527,11 +533,11 @@ func (c *Client) getSymbolTypeByName(name string) uint16 {
 
 	// Handle array type (0xA3): element type follows
 	if typeCode == 0xA3 && len(data) >= 6 {
-		elemType := uint16(data[5])
+		elemType := discoveryTypeCode(uint16(data[5]))
 		return MakeArrayType(elemType)
 	}
 
-	return typeCode
+	return discoveryTypeCode(typeCode)
 }
 
 // getSymbolTypesBatched resolves type codes for multiple tags using MSP-batched GAA.
@@ -671,9 +677,9 @@ func (c *Client) getSymbolTypesMSP(names []string, result map[string]uint16) {
 		if len(resp.Data) < 5 {
 			continue
 		}
-		typeCode := uint16(resp.Data[4])
-		if typeCode == 0xA3 && len(resp.Data) >= 6 {
-			elemType := uint16(resp.Data[5])
+		typeCode := discoveryTypeCode(uint16(resp.Data[4]))
+		if resp.Data[4] == 0xA3 && len(resp.Data) >= 6 {
+			elemType := discoveryTypeCode(uint16(resp.Data[5]))
 			typeCode = MakeArrayType(elemType)
 		}
 		result[name] = typeCode
@@ -798,7 +804,7 @@ func (c *Client) getSymbolInstanceGAS(instance uint32) (TagInfo, error) {
 	}
 
 	if len(typeData) >= 2 {
-		tag.TypeCode = binary.LittleEndian.Uint16(typeData[0:2])
+		tag.TypeCode = discoveryTypeCode(binary.LittleEndian.Uint16(typeData[0:2]))
 	}
 
 	logging.DebugLog("EIP/Discovery", "Instance %d (GAS): name=%q type=0x%04X (%s)",
@@ -894,7 +900,7 @@ func (c *Client) parseOmronSymbolAttributes(data []byte, instance uint32) TagInf
 		logging.DebugLog("EIP/Discovery", "Instance %d (%s): no type code", instance, tag.Name)
 		return tag
 	}
-	tag.TypeCode = binary.LittleEndian.Uint16(data[i : i+2])
+	tag.TypeCode = discoveryTypeCode(binary.LittleEndian.Uint16(data[i : i+2]))
 	i += 2
 
 	// Parse dimensions if this is an array type
@@ -936,6 +942,9 @@ func (c *Client) allTagsEIP() ([]TagInfo, error) {
 		logging.DebugLog("EIP/Discovery", "Service 0x55 succeeded: %d tags", len(tags))
 		return tags, nil
 	}
+	if isEIPConnectionError(err) {
+		return tags, err
+	}
 	if err != nil {
 		logging.DebugLog("EIP/Discovery", "Service 0x55 failed: %v — trying service 0x5F", err)
 	} else {
@@ -948,6 +957,9 @@ func (c *Client) allTagsEIP() ([]TagInfo, error) {
 		logging.DebugLog("EIP/Discovery", "Service 0x5F succeeded: %d tags", len(tags))
 		return tags, nil
 	}
+	if isEIPConnectionError(err) {
+		return tags, err
+	}
 	if err != nil {
 		logging.DebugLog("EIP/Discovery", "Service 0x5F failed: %v — falling back to GAA/GAS", err)
 	} else {
@@ -956,6 +968,12 @@ func (c *Client) allTagsEIP() ([]TagInfo, error) {
 
 	// Fall back to Omron-specific GAA/GAS instance iteration
 	return c.listSymbols()
+}
+
+// discoveryInterrupted reports a connection drop part-way through a tag scan.
+// The wrapped error still matches isEIPConnectionError and ErrConnectionLost.
+func discoveryInterrupted(found int, err error) error {
+	return fmt.Errorf("tag discovery interrupted after %d tags: %w (%w)", found, err, ErrConnectionLost)
 }
 
 // allTagsEIPFallback is a fallback method if the primary discovery fails.
@@ -999,7 +1017,7 @@ func (c *Client) allTagsEIPFallback() ([]TagInfo, error) {
 		if err != nil {
 			if isEIPConnectionError(err) {
 				logging.DebugLog("EIP/Discovery", "Fallback: connection error at instance %d, stopping: %v", instance, err)
-				break
+				return tags, discoveryInterrupted(len(tags), err)
 			}
 			consecutiveErrors++
 			if instance <= 10 {

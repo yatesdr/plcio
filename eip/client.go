@@ -333,8 +333,12 @@ func (e *EipClient) recvEncap() (*EipEncap, error) {
 	sessionHandle := binary.LittleEndian.Uint32(header[4:8])
 
 	// Sanity checks before proceeding.
+	// On these framing errors the payload is left unread, so the stream is
+	// desynchronized: mark the connection dead exactly as for an I/O error.
 	if payload_length > 65511 {
 		logging.DebugLog("EIP", "RX excessive payload length: %d", payload_length)
+		e.conn.Close()
+		e.conn = nil
 		return nil, fmt.Errorf("SendRecv: Payload excessive.  Payload Length: %d", payload_length)
 	}
 	// Session handle validation:
@@ -342,6 +346,8 @@ func (e *EipClient) recvEncap() (*EipEncap, error) {
 	// - Otherwise, response session must match our session
 	if sessionHandle != 0 && e.session != 0 && sessionHandle != e.session {
 		logging.DebugLog("EIP", "RX session mismatch: expected 0x%08X, got 0x%08X", e.session, sessionHandle)
+		e.conn.Close()
+		e.conn = nil
 		return nil, fmt.Errorf("SendRecv: Session mismatch in response.  Need %d, Got %d", e.session, sessionHandle)
 	}
 

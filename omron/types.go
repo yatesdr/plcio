@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"reflect"
 )
 
 // Transport represents the communication protocol.
@@ -86,16 +87,40 @@ const (
 	TypeCIPLREAL  uint16 = 0xCB // CIP LREAL (8 bytes double)
 	TypeCIPSTRING uint16 = 0xD0 // CIP STRING (Omron: 16-bit LE length prefix)
 
-	// Omron-specific type codes
-	// Based on libplctag research and Wireshark captures
-	TypeOmronByte  uint16 = 0xD1 // Omron BYTE (sometimes used instead of USINT)
-	TypeOmronWord  uint16 = 0xD2 // Omron WORD (sometimes used instead of UINT)
-	TypeOmronDWord uint16 = 0xD3 // Omron DWORD (sometimes used instead of UDINT)
-	TypeOmronLWord uint16 = 0xD4 // Omron LWORD (sometimes used instead of ULINT)
-	TypeOmronTime  uint16 = 0xDB // Omron TIME (4 bytes, milliseconds)
-	TypeOmronDate  uint16 = 0xDC // Omron DATE
-	TypeOmronTOD   uint16 = 0xDD // Omron TIME_OF_DAY
-	TypeOmronDT    uint16 = 0xDE // Omron DATE_AND_TIME
+	// NJ/NX bit-string and TIME codes, W506 section 7-7-1 "Data Type Codes"
+	// ("CIP Common" group).
+	TypeOmronByte  uint16 = 0xD1 // BYTE (1-byte hexadecimal)
+	TypeOmronWord  uint16 = 0xD2 // WORD (1-word hexadecimal)
+	TypeOmronDWord uint16 = 0xD3 // DWORD (2-word hexadecimal)
+	TypeOmronLWord uint16 = 0xD4 // LWORD (4-word hexadecimal)
+	TypeOmronTime  uint16 = 0xDB // TIME (8-byte data): signed 64-bit nanoseconds
+
+	// NJ/NX "Vendor Specific" data type codes (W506 section 7-7-1). On the
+	// wire they are the single bytes 0x04..0x0C, which collide with this
+	// package's FINS pseudo-type codes (TypeWord..TypeString), so a CIP reply
+	// carrying one is mapped to 0x0100|code (see cipTypeFromWire) and mapped
+	// back when writing. Sizes are from W506 appendix A (8 bytes for the
+	// time types, 4 for enumerations); value ranges from W501 section 6-3:
+	//   TIME            signed ns (T#-106751d_23h47m16s854.775808ms ..)
+	//   DATE            ns since 1970-01-01 00:00 (D#1970-01-01..D#2106-02-06)
+	//   TIME_OF_DAY     ns since midnight (TOD#00:00:00..23:59:59.999999999)
+	//   DATE_AND_TIME   ns since 1970-01-01 00:00:00 (..DT#2106-02-06-23:59:59.999999999)
+	// The controller clock has no time zone: DATE/DATE_AND_TIME count the
+	// controller's local wall clock and are decoded as a time.Time in UTC
+	// carrying that wall clock. The nanosecond encoding matches aphyt
+	// (github.com/aphyt/aphytcomm, omron/omron_datatypes.py).
+	TypeOmronUINTBCD  uint16 = 0x0104 // UINT BCD (wire 0x04, 2 bytes, returned raw)
+	TypeOmronUDINTBCD uint16 = 0x0105 // UDINT BCD (wire 0x05, 4 bytes, returned raw)
+	TypeOmronULINTBCD uint16 = 0x0106 // ULINT BCD (wire 0x06, 8 bytes, returned raw)
+	TypeOmronEnum     uint16 = 0x0107 // enumeration (wire 0x07, DINT-range, 4 bytes)
+	TypeOmronDate     uint16 = 0x0108 // DATE (wire 0x08 DATE_NSEC)
+	TypeOmronTimeNSec uint16 = 0x0109 // TIME (wire 0x09 TIME_NSEC)
+	TypeOmronDT       uint16 = 0x010A // DATE_AND_TIME (wire 0x0A DATE_AND_TIME_NSEC)
+	TypeOmronTOD      uint16 = 0x010B // TIME_OF_DAY (wire 0x0B TIME_OF_DAY_NSEC)
+	TypeOmronUnion    uint16 = 0x010C // union (wire 0x0C, returned raw)
+
+	// omronVendorTypeBase is OR-ed onto an NJ/NX vendor-specific wire code.
+	omronVendorTypeBase uint16 = 0x0100
 
 	// Structure/UDT type indicator (high byte = 0x02 indicates struct)
 	TypeStructFlag uint16 = 0x0200
@@ -165,7 +190,7 @@ func TypeName(typeCode uint16) string {
 		name = "LREAL"
 	case TypeString, TypeCIPSTRING:
 		name = "STRING"
-	case TypeOmronTime:
+	case TypeOmronTime, TypeOmronTimeNSec:
 		name = "TIME"
 	case TypeOmronDate:
 		name = "DATE"
@@ -173,6 +198,16 @@ func TypeName(typeCode uint16) string {
 		name = "TIME_OF_DAY"
 	case TypeOmronDT:
 		name = "DATE_AND_TIME"
+	case TypeOmronUINTBCD:
+		name = "UINT_BCD"
+	case TypeOmronUDINTBCD:
+		name = "UDINT_BCD"
+	case TypeOmronULINTBCD:
+		name = "ULINT_BCD"
+	case TypeOmronEnum:
+		name = "ENUM"
+	case TypeOmronUnion:
+		name = "UNION"
 	default:
 		name = fmt.Sprintf("TYPE_%04X", baseType)
 	}
@@ -183,7 +218,8 @@ func TypeName(typeCode uint16) string {
 	return name
 }
 
-// TypeCodeFromName returns the type code for a type name.
+// TypeCodeFromName returns the type code for a FINS type name. INT16, INT32
+// and INT64 are accepted as documented aliases of INT, DINT and LINT.
 func TypeCodeFromName(name string) (uint16, bool) {
 	switch name {
 	case "VOID":
@@ -196,15 +232,15 @@ func TypeCodeFromName(name string) (uint16, bool) {
 		return TypeSByte, true
 	case "WORD", "UINT":
 		return TypeWord, true
-	case "INT":
+	case "INT", "INT16":
 		return TypeInt16, true
 	case "DWORD", "UDINT":
 		return TypeDWord, true
-	case "DINT":
+	case "DINT", "INT32":
 		return TypeInt32, true
 	case "LWORD", "ULINT":
 		return TypeLWord, true
-	case "LINT":
+	case "LINT", "INT64":
 		return TypeInt64, true
 	case "REAL":
 		return TypeReal, true
@@ -233,12 +269,18 @@ func TypeSize(typeCode uint16) int {
 		return 1
 	case TypeWord, TypeInt16, TypeCIPUINT, TypeCIPINT, TypeOmronWord:
 		return 2
-	case TypeDWord, TypeInt32, TypeReal, TypeCIPUDINT, TypeCIPDINT, TypeCIPREAL, TypeOmronDWord, TypeOmronTime:
+	case TypeDWord, TypeInt32, TypeReal, TypeCIPUDINT, TypeCIPDINT, TypeCIPREAL, TypeOmronDWord:
 		return 4
-	case TypeLWord, TypeInt64, TypeLReal, TypeCIPULINT, TypeCIPLINT, TypeCIPLREAL, TypeOmronLWord, TypeOmronDT:
+	case TypeLWord, TypeInt64, TypeLReal, TypeCIPULINT, TypeCIPLINT, TypeCIPLREAL, TypeOmronLWord:
 		return 8
-	case TypeOmronDate, TypeOmronTOD:
+	case TypeOmronTime, TypeOmronTimeNSec, TypeOmronDate, TypeOmronTOD, TypeOmronDT:
+		return 8 // W506 appendix A: TIME, DATE, TIME_OF_DAY, DATE_AND_TIME are 8 bytes
+	case TypeOmronUINTBCD:
+		return 2
+	case TypeOmronUDINTBCD, TypeOmronEnum:
 		return 4
+	case TypeOmronULINTBCD:
+		return 8
 	case TypeString, TypeCIPSTRING:
 		return 1 // Per-character size; count determines string length
 	default:
@@ -297,9 +339,13 @@ func AreaName(area byte) string {
 }
 
 // AreaFromName returns the memory area code for a name.
+//
+// The bare prefixes "C" and "T" are deliberately not accepted: in Omron
+// notation they denote counters and timers, not CIO or task flags. Use "CIO",
+// "TK", or the TIM/CNT prefixes understood by ParseAddress.
 func AreaFromName(name string) (byte, bool) {
 	switch name {
-	case "CIO", "C":
+	case "CIO":
 		return AreaCIOWord, true
 	case "WR", "W":
 		return AreaWRWord, true
@@ -309,7 +355,7 @@ func AreaFromName(name string) (byte, bool) {
 		return AreaARWord, true
 	case "DM", "D":
 		return AreaDMWord, true
-	case "TK", "T":
+	case "TK":
 		return AreaTaskBit, true
 	case "TC":
 		return AreaTimerCounterPV, true
@@ -385,12 +431,67 @@ func SupportedTypeNames() []string {
 	}
 }
 
+// finsWordOrder is the byte order of multi-word values in CS/CJ/CP memory as
+// returned by FINS memory reads: each 16-bit word is big-endian, and a 32/64-bit
+// value occupies consecutive words with the LEAST significant word at the
+// LOWEST address. REAL 1.0 (0x3F800000) in D100/D101 is D100=0x0000,
+// D101=0x3F80, i.e. wire bytes 00 00 3F 80.
+type finsWordOrder struct{}
+
+var finsOrder binary.ByteOrder = finsWordOrder{}
+
+func (finsWordOrder) Uint16(b []byte) uint16 { return binary.BigEndian.Uint16(b) }
+
+func (finsWordOrder) PutUint16(b []byte, v uint16) { binary.BigEndian.PutUint16(b, v) }
+
+func (finsWordOrder) Uint32(b []byte) uint32 {
+	_ = b[3]
+	return uint32(binary.BigEndian.Uint16(b[2:4]))<<16 | uint32(binary.BigEndian.Uint16(b[0:2]))
+}
+
+func (finsWordOrder) PutUint32(b []byte, v uint32) {
+	_ = b[3]
+	binary.BigEndian.PutUint16(b[0:2], uint16(v))
+	binary.BigEndian.PutUint16(b[2:4], uint16(v>>16))
+}
+
+func (finsWordOrder) Uint64(b []byte) uint64 {
+	_ = b[7]
+	return uint64(binary.BigEndian.Uint16(b[6:8]))<<48 | uint64(binary.BigEndian.Uint16(b[4:6]))<<32 |
+		uint64(binary.BigEndian.Uint16(b[2:4]))<<16 | uint64(binary.BigEndian.Uint16(b[0:2]))
+}
+
+func (finsWordOrder) PutUint64(b []byte, v uint64) {
+	_ = b[7]
+	binary.BigEndian.PutUint16(b[0:2], uint16(v))
+	binary.BigEndian.PutUint16(b[2:4], uint16(v>>16))
+	binary.BigEndian.PutUint16(b[4:6], uint16(v>>32))
+	binary.BigEndian.PutUint16(b[6:8], uint16(v>>48))
+}
+
+func (finsWordOrder) String() string { return "FINSWordOrder" }
+
+// decodeCIPString strips the Omron NJ/NX CIP STRING 16-bit little-endian
+// length prefix. A declared length longer than the payload is clipped.
+func decodeCIPString(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	n := int(binary.LittleEndian.Uint16(data[0:2]))
+	body := data[2:]
+	if n > len(body) {
+		n = len(body)
+	}
+	return decodeString(body[:n])
+}
+
 // DecodeValue decodes raw bytes into a Go value based on the type code.
-// FINS uses big-endian, CIP uses little-endian.
+// bigEndian selects the FINS layout (big-endian words, least significant word
+// first for 32/64-bit values); otherwise CIP little-endian is used.
 func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 	var order binary.ByteOrder
 	if bigEndian {
-		order = binary.BigEndian
+		order = finsOrder
 	} else {
 		order = binary.LittleEndian
 	}
@@ -405,7 +506,7 @@ func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 		}
 		return data[0] != 0
 
-	case TypeByte, TypeCIPUSINT:
+	case TypeByte, TypeCIPUSINT, TypeOmronByte:
 		if len(data) < 1 {
 			return uint8(0)
 		}
@@ -417,7 +518,7 @@ func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 		}
 		return int8(data[0])
 
-	case TypeWord, TypeCIPUINT:
+	case TypeWord, TypeCIPUINT, TypeOmronWord:
 		if len(data) < 2 {
 			return uint16(0)
 		}
@@ -429,7 +530,7 @@ func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 		}
 		return int16(order.Uint16(data))
 
-	case TypeDWord, TypeCIPUDINT:
+	case TypeDWord, TypeCIPUDINT, TypeOmronDWord:
 		if len(data) < 4 {
 			return uint32(0)
 		}
@@ -441,7 +542,7 @@ func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 		}
 		return int32(order.Uint32(data))
 
-	case TypeLWord, TypeCIPULINT:
+	case TypeLWord, TypeCIPULINT, TypeOmronLWord:
 		if len(data) < 8 {
 			return uint64(0)
 		}
@@ -466,6 +567,9 @@ func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 		return math.Float64frombits(order.Uint64(data))
 
 	case TypeString, TypeCIPSTRING:
+		if !bigEndian && BaseType(typeCode) == TypeCIPSTRING {
+			return decodeCIPString(data)
+		}
 		// Find null terminator
 		for i, b := range data {
 			if b == 0 {
@@ -474,59 +578,55 @@ func DecodeValue(typeCode uint16, data []byte, bigEndian bool) interface{} {
 		}
 		return string(data)
 
+	case TypeOmronTime, TypeOmronTimeNSec, TypeOmronTOD, TypeOmronDate, TypeOmronDT, TypeOmronEnum:
+		// NJ/NX CIP-only types; always little-endian.
+		if v, ok := decodeNJValue(BaseType(typeCode), data); ok {
+			return v
+		}
+		return data
+
 	default:
 		return data
 	}
 }
 
 // EncodeValue encodes a Go value into bytes for writing.
-// Supports both scalar values and slices (for array writes).
+// Supports both scalar values and slices (for array writes). Every integer
+// target is range-checked: a value that does not fit the PLC type (for
+// example 70000 for a WORD, -1 for a UDINT or 1.5 for a DINT) is rejected
+// instead of being truncated or wrapped.
 func EncodeValue(value interface{}, typeCode uint16, bigEndian bool) ([]byte, error) {
 	var order binary.ByteOrder
 	if bigEndian {
-		order = binary.BigEndian
+		order = finsOrder
 	} else {
 		order = binary.LittleEndian
 	}
 
-	// Handle slice types - encode each element and concatenate
-	switch v := value.(type) {
-	case []int64:
-		var result []byte
-		for _, elem := range v {
-			encoded, err := encodeScalar(elem, typeCode, order)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
+	base := BaseType(typeCode)
+	isString := base == TypeString || base == TypeCIPSTRING
+	rv := reflect.ValueOf(value)
+	if rv.IsValid() && rv.Kind() == reflect.Slice && !(isString && rv.Type().Elem().Kind() == reflect.Uint8) {
+		if rv.Len() == 0 {
+			return nil, fmt.Errorf("cannot write an empty array")
 		}
-		return result, nil
-	case []float64:
 		var result []byte
-		for _, elem := range v {
-			encoded, err := encodeScalar(elem, typeCode, order)
-			if err != nil {
-				return nil, err
+		for i := 0; i < rv.Len(); i++ {
+			elem := rv.Index(i).Interface()
+			var encoded []byte
+			var err error
+			if b, ok := elem.(bool); ok && !bigEndian && (base == TypeBool || base == TypeCIPBool) {
+				// W506 7-7-4: when Num of Element is given for a BOOL
+				// array, each element is a single status byte.
+				encoded = []byte{0}
+				if b {
+					encoded[0] = 1
+				}
+			} else {
+				encoded, err = encodeScalar(elem, typeCode, order)
 			}
-			result = append(result, encoded...)
-		}
-		return result, nil
-	case []int:
-		var result []byte
-		for _, elem := range v {
-			encoded, err := encodeScalar(int64(elem), typeCode, order)
 			if err != nil {
-				return nil, err
-			}
-			result = append(result, encoded...)
-		}
-		return result, nil
-	case []bool:
-		var result []byte
-		for _, elem := range v {
-			encoded, err := encodeScalar(elem, typeCode, order)
-			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("element %d: %w", i, err)
 			}
 			result = append(result, encoded...)
 		}
@@ -539,7 +639,8 @@ func EncodeValue(value interface{}, typeCode uint16, bigEndian bool) ([]byte, er
 
 // encodeScalar encodes a single scalar value into bytes.
 func encodeScalar(value interface{}, typeCode uint16, order binary.ByteOrder) ([]byte, error) {
-	switch BaseType(typeCode) {
+	base := BaseType(typeCode)
+	switch base {
 	case TypeBool, TypeCIPBool:
 		var v uint16
 		switch b := value.(type) {
@@ -547,152 +648,93 @@ func encodeScalar(value interface{}, typeCode uint16, order binary.ByteOrder) ([
 			if b {
 				v = 1
 			}
-		case int:
-			if b != 0 {
-				v = 1
+		case int, int32, int64, float64:
+			n, err := signedValue(b, 64)
+			if err != nil {
+				return nil, fmt.Errorf("BOOL: %w", err)
 			}
-		case int32:
-			if b != 0 {
-				v = 1
+			if n != 0 && n != 1 {
+				return nil, fmt.Errorf("BOOL: %d is not 0 or 1", n)
 			}
-		case int64:
-			if b != 0 {
-				v = 1
-			}
-		case float64:
-			if b != 0 {
-				v = 1
-			}
+			v = uint16(n)
 		default:
 			return nil, fmt.Errorf("cannot convert %T to BOOL", value)
 		}
 		if order == binary.LittleEndian {
-			return []byte{byte(v)}, nil
+			// W506 7-7-3 Boolean Data: status byte then the forced
+			// set/reset byte, which must be 0 when writing.
+			return []byte{byte(v), 0}, nil
 		}
 		buf := make([]byte, 2)
 		order.PutUint16(buf, v)
 		return buf, nil
 
-	case TypeByte, TypeCIPUSINT:
-		switch v := value.(type) {
-		case uint8:
-			return []byte{v}, nil
-		case int:
-			return []byte{byte(v)}, nil
-		case int64:
-			return []byte{byte(v)}, nil
-		case float64:
-			return []byte{byte(int64(v))}, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to BYTE", value)
+	case TypeByte, TypeCIPUSINT, TypeOmronByte:
+		n, err := unsignedValue(value, 8)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", TypeName(base), err)
 		}
+		return []byte{byte(n)}, nil
 
 	case TypeSByte, TypeCIPSINT:
-		switch v := value.(type) {
-		case int8:
-			return []byte{byte(v)}, nil
-		case int:
-			return []byte{byte(v)}, nil
-		case int64:
-			return []byte{byte(v)}, nil
-		case float64:
-			return []byte{byte(int8(v))}, nil
-		default:
-			return nil, fmt.Errorf("cannot convert %T to SINT", value)
+		n, err := signedValue(value, 8)
+		if err != nil {
+			return nil, fmt.Errorf("SINT: %w", err)
 		}
+		return []byte{byte(int8(n))}, nil
 
-	case TypeWord, TypeCIPUINT:
-		buf := make([]byte, 2)
-		switch v := value.(type) {
-		case uint16:
-			order.PutUint16(buf, v)
-		case int:
-			order.PutUint16(buf, uint16(v))
-		case int64:
-			order.PutUint16(buf, uint16(v))
-		case float64:
-			order.PutUint16(buf, uint16(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to WORD", value)
+	case TypeWord, TypeCIPUINT, TypeOmronWord:
+		n, err := unsignedValue(value, 16)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", TypeName(base), err)
 		}
+		buf := make([]byte, 2)
+		order.PutUint16(buf, uint16(n))
 		return buf, nil
 
 	case TypeInt16, TypeCIPINT:
+		n, err := signedValue(value, 16)
+		if err != nil {
+			return nil, fmt.Errorf("INT: %w", err)
+		}
 		buf := make([]byte, 2)
-		switch v := value.(type) {
-		case int16:
-			order.PutUint16(buf, uint16(v))
-		case int:
-			order.PutUint16(buf, uint16(v))
-		case int64:
-			order.PutUint16(buf, uint16(v))
-		case float64:
-			order.PutUint16(buf, uint16(int16(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to INT", value)
-		}
+		order.PutUint16(buf, uint16(int16(n)))
 		return buf, nil
 
-	case TypeDWord, TypeCIPUDINT:
+	case TypeDWord, TypeCIPUDINT, TypeOmronDWord:
+		n, err := unsignedValue(value, 32)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", TypeName(base), err)
+		}
 		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case uint32:
-			order.PutUint32(buf, v)
-		case int:
-			order.PutUint32(buf, uint32(v))
-		case int64:
-			order.PutUint32(buf, uint32(v))
-		case float64:
-			order.PutUint32(buf, uint32(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to DWORD", value)
-		}
+		order.PutUint32(buf, uint32(n))
 		return buf, nil
 
-	case TypeInt32, TypeCIPDINT:
+	case TypeInt32, TypeCIPDINT, TypeOmronEnum:
+		n, err := signedValue(value, 32)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", TypeName(base), err)
+		}
 		buf := make([]byte, 4)
-		switch v := value.(type) {
-		case int32:
-			order.PutUint32(buf, uint32(v))
-		case int:
-			order.PutUint32(buf, uint32(v))
-		case int64:
-			order.PutUint32(buf, uint32(v))
-		case float64:
-			order.PutUint32(buf, uint32(int32(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to DINT", value)
-		}
+		order.PutUint32(buf, uint32(int32(n)))
 		return buf, nil
 
-	case TypeLWord, TypeCIPULINT:
+	case TypeLWord, TypeCIPULINT, TypeOmronLWord:
+		n, err := unsignedValue(value, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", TypeName(base), err)
+		}
 		buf := make([]byte, 8)
-		switch v := value.(type) {
-		case uint64:
-			order.PutUint64(buf, v)
-		case int:
-			order.PutUint64(buf, uint64(v))
-		case int64:
-			order.PutUint64(buf, uint64(v))
-		case float64:
-			order.PutUint64(buf, uint64(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to LWORD", value)
-		}
+		order.PutUint64(buf, n)
 		return buf, nil
 
 	case TypeInt64, TypeCIPLINT:
-		buf := make([]byte, 8)
-		switch v := value.(type) {
-		case int64:
-			order.PutUint64(buf, uint64(v))
-		case int:
-			order.PutUint64(buf, uint64(v))
-		case float64:
-			order.PutUint64(buf, uint64(int64(v)))
-		default:
-			return nil, fmt.Errorf("cannot convert %T to LINT", value)
+		n, err := signedValue(value, 64)
+		if err != nil {
+			return nil, fmt.Errorf("LINT: %w", err)
 		}
+		buf := make([]byte, 8)
+		order.PutUint64(buf, uint64(n))
 		return buf, nil
 
 	case TypeReal, TypeCIPREAL:
@@ -701,8 +743,13 @@ func encodeScalar(value interface{}, typeCode uint16, order binary.ByteOrder) ([
 		case float32:
 			order.PutUint32(buf, math.Float32bits(v))
 		case float64:
+			if !math.IsInf(v, 0) && !math.IsNaN(v) && math.Abs(v) > math.MaxFloat32 {
+				return nil, fmt.Errorf("REAL: %v is outside the float32 range", v)
+			}
 			order.PutUint32(buf, math.Float32bits(float32(v)))
 		case int:
+			order.PutUint32(buf, math.Float32bits(float32(v)))
+		case int64:
 			order.PutUint32(buf, math.Float32bits(float32(v)))
 		default:
 			return nil, fmt.Errorf("cannot convert %T to REAL", value)
@@ -718,20 +765,47 @@ func encodeScalar(value interface{}, typeCode uint16, order binary.ByteOrder) ([
 			order.PutUint64(buf, math.Float64bits(float64(v)))
 		case int:
 			order.PutUint64(buf, math.Float64bits(float64(v)))
+		case int64:
+			order.PutUint64(buf, math.Float64bits(float64(v)))
 		default:
 			return nil, fmt.Errorf("cannot convert %T to LREAL", value)
 		}
 		return buf, nil
 
 	case TypeString, TypeCIPSTRING:
+		if order == binary.LittleEndian && base == TypeCIPSTRING {
+			// Omron NJ/NX CIP STRING: 16-bit little-endian byte count, then
+			// the characters (no terminator).
+			var body []byte
+			switch v := value.(type) {
+			case string:
+				body = []byte(v)
+			case []byte:
+				body = v
+			default:
+				return nil, fmt.Errorf("cannot convert %T to STRING", value)
+			}
+			if len(body) > math.MaxUint16 {
+				return nil, fmt.Errorf("STRING too long: %d bytes", len(body))
+			}
+			return append(binary.LittleEndian.AppendUint16(nil, uint16(len(body))), body...), nil
+		}
+		// Always build a fresh buffer: appending the terminator to a
+		// caller's []byte could write into its backing array.
 		switch v := value.(type) {
 		case string:
 			return append([]byte(v), 0), nil
 		case []byte:
-			return append(v, 0), nil
+			return append(append(make([]byte, 0, len(v)+1), v...), 0), nil
 		default:
 			return nil, fmt.Errorf("cannot convert %T to STRING", value)
 		}
+
+	case TypeOmronTime, TypeOmronTimeNSec, TypeOmronTOD, TypeOmronDate, TypeOmronDT:
+		if order != binary.LittleEndian {
+			return nil, fmt.Errorf("%s is an NJ/NX (EtherNet/IP) type", TypeName(base))
+		}
+		return encodeNJTime(value, base)
 
 	default:
 		return nil, fmt.Errorf("unsupported type code: %s", TypeName(typeCode))

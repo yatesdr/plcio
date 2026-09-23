@@ -43,7 +43,8 @@ type schemaSnapshot struct {
 	entries       map[string]*typeEntry
 	resolver      *typeResolver
 	symbols       map[string]*symbolRecord
-	readOnlyNames []string // sorted access index derived from this catalog only
+	readOnlyNames []string          // sorted access index derived from this catalog only
+	folded        map[string]string // ASCII-folded name -> canonical catalog name; "" if ambiguous
 }
 
 type typeResolver struct {

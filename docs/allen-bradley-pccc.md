@@ -7,7 +7,7 @@ plcio supports Allen-Bradley SLC 500, PLC-5, and MicroLogix processors using the
 | Series | Models | Protocol | Connection Mode | Tested |
 |---|---|---|---|---|
 | SLC 500 | SLC 5/03, 5/04, 5/05 | PCCC over EtherNet/IP | Unconnected | SLC 5/05 |
-| PLC-5 | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Unconnected | No |
+| PLC-5 | PLC-5/20E, 5/40E, 5/80E | PCCC over EtherNet/IP | Unconnected | No (experimental) |
 | MicroLogix | 1100, 1200, 1400, 1500 | PCCC over EtherNet/IP | Unconnected | MicroLogix 1400 |
 
 **Default port:** TCP 44818
@@ -38,6 +38,16 @@ defer drv.Close()
 ```
 
 ### PLC-5
+
+**PLC-5 support is experimental: it has not been tested against hardware.** PLC-5 uses its own command set, as given in the DF1 Protocol and Command Set Reference Manual (1770-6.5.16):
+
+- **Reads** use Typed Read (CMD 0x0F, FNC 0x68). **Writes** use Typed Write (FNC 0x67). Addresses are sent in PLC-5 logical binary form (for example, `B3:300` is sent as `06 03 FF 2C 01`). Data is preceded by the DF1 type/data parameter.
+- A logical binary address does not carry a file type. plcio checks each reply's type/data parameter against the address letter instead. Reading `F7:0` when file 7 is an integer file is an error. So is reading `N4:0` from a timer file. The value is never mis-decoded.
+- Each write is preceded by a Typed Read of the same address. That read supplies the exact type/data parameter the processor reported, and plcio sends it back unchanged, as libplctag does. As a result, a PLC-5 write takes two round trips. A write whose size does not match the file (for example, a float into an integer file) is refused before anything is sent.
+- **Bit writes** use Read-Modify-Write (FNC 0x26). The processor applies the AND/OR masks to the word itself (see [Bit Writes](#bit-writes)).
+- **I/O addresses are octal**, as in RSLogix 5: `I:010/17` is input word 8, bit 15. Digits 8 and 9 are rejected in `I:` and `O:` word and bit numbers. All other numbers stay decimal (`N7:10` is element 10). SLC 500 and MicroLogix addresses are always decimal.
+- **Floats:** the PLC-5 sends the high 16-bit word of a float first. libplctag verified this against hardware. plcio swaps the two words so values decode as normal IEEE 754.
+- `L` (long) files do not exist on PLC-5 and are rejected. `MG` and `PD` elements are a different size on PLC-5 and are not supported. File directory discovery is not available.
 
 ```go
 cfg := &driver.PLCConfig{
@@ -249,7 +259,7 @@ When the `Driver.Read()` method receives multiple addresses from the same data f
 - Bit access (e.g., `B3:0/5`, `N7:0/3`)
 - Addresses from different data files
 
-Each batch is capped at 236 bytes (the PCCC response payload limit). For 16-bit integer files, this means up to 118 elements per batch. If a batch read fails, the affected elements automatically fall back to individual reads.
+Each batch is capped at 236 data bytes on SLC 500 and MicroLogix. This is the DF1 manual's limit for SLC 5/03 and 5/04 protected typed logical reads, and no reference gives a smaller limit for the 5/03. For 16-bit integer files, that means up to 118 elements per batch. On PLC-5 the cap is 234 bytes (117 words). A Typed Read carries at most 240 bytes, and the type/data parameter counts toward that limit. If a batch read fails, the affected elements automatically fall back to individual reads.
 
 Batching is transparent &mdash; you use the same `Read()` API and the driver handles grouping internally. The order of results always matches the order of requests.
 
@@ -271,9 +281,22 @@ err = drv.Write("L10:0", int32(100000))
 
 ### Bit Writes
 
-Writing to a single bit (e.g., `B3:0/5`) performs a **read-modify-write** operation: plcio reads the containing 16-bit word, sets or clears the specified bit, and writes the word back. This is atomic at the protocol level but not at the PLC scan level &mdash; if the PLC modifies other bits in the same word between the read and write, those changes could be lost.
+On **SLC 500 and MicroLogix**, writing a single bit (e.g., `B3:0/5`, `T4:0.EN`) sends one Protected Typed Logical Write with Mask (FNC 0xAB) with only that bit set in the mask. The processor changes only that bit, so bits it updates itself (counter CU/CD, one-shot storage bits) are never overwritten. Nothing is read first.
 
-**Recommendation:** If you need to write individual bits frequently, use dedicated integer words as status/command registers instead of individual bit addresses.
+Bit writes are accepted for 16-bit word files (O, I, S, B, N, A) and Timer/Counter/Control status bits. Bit writes to L (long) files return an error because the masked write is only 16 bits wide; write the whole long instead. Bit writes to F (float) and ST (string) files return an error.
+
+On **PLC-5** (which does not support FNC 0xAB), a bit write sends one Read-Modify-Write (CMD 0x0F, FNC 0x26). To set a bit, the AND mask is `0xFFFF` and the OR mask is the bit. To clear a bit, the AND mask is the inverted bit and the OR mask is `0`. The processor applies the masks to the current word, so plcio never writes back a stale copy of the other bits. Timer, counter and control bits (for example `T4:0.DN` or `T4:0/13`) address sub-element 0, the control word.
+
+### Write Value Ranges
+
+Out-of-range values return an error and are never truncated:
+
+- **16-bit words** (N, B, S, A, O, I): -32768..65535. Values 32768..65535 are stored as their 16-bit two's-complement pattern, so `0xFFFF` can be written to a B or S word (it reads back from N files as -1).
+- **Timer `.PRE` / `.ACC`**: 0..32767. A negative timer preset or accumulator faults SLC processors.
+- **Counter `.PRE` / `.ACC`, Control `.LEN` / `.POS`**: -32768..32767.
+- **L (long)**: -2147483648..2147483647 (a `uint32` argument is written as its bit pattern).
+- Floating-point input for integer files must be a whole number.
+- **ST (string)**: at most 82 characters. The full 84-byte element is written: length, characters stored byte-swapped within each 16-bit word the way SLC processors hold them, and zero fill.
 
 ### Write Limitations
 
@@ -313,16 +336,18 @@ if drv.SupportsDiscovery() {
 
 | Family | Discovery | Method |
 |---|---|---|
-| SLC 500 (5/03, 5/04, 5/05) | Supported | File directory read |
-| MicroLogix (1000, 1100, 1200, 1400, 1500) | Supported | File directory read |
+| SLC 500 (5/03, 5/04, 5/05: 1747-L53x/L54x/L55x) | Supported | File directory read |
+| MicroLogix 1100 (1763), 1400 (1766) | Supported | File directory read |
+| MicroLogix 1000, 1200, 1500; SLC 5/01, 5/02 | Not supported | Directory layout not verified; returns `pccc.ErrDiscoveryNotSupported` |
 | PLC-5 | Not supported | PLC-5 does not expose a file directory |
 
 ### How It Works
 
-Discovery sends two PCCC commands:
+Discovery follows the procedure pycomm3's `SLCDriver.get_file_directory` uses:
 
-1. **Diagnostic Status** (CMD 0x06) &mdash; retrieves the processor catalog string (e.g., "1747-L552") to identify the processor family and determine the file directory binary layout.
-2. **Read Section** (CMD 0x0F, FNC 0xA1) &mdash; reads system file 0 (the file directory) in 80-byte chunks, then parses each row to extract the file type code and element count.
+1. **Diagnostic Status** (CMD 0x06, FNC 0x03) &mdash; retrieves the processor catalog string (e.g., "1747-L552") to select the file directory layout. If that fails, the catalog is taken from the ListIdentity product name.
+2. **Directory size** (CMD 0x0F, FNC 0xA1, Protected Typed Logical Read with 2 address fields) &mdash; reads the size in bytes of system file 0.
+3. **Directory contents** (FNC 0xA1) &mdash; reads all of system file 0 in 80-byte chunks, then parses each row: the file type code, and the file size in bytes, divided by the element size to give the element count.
 
 The discovered tag names use the format `PrefixFileNumber` (e.g., `N7`, `F8`, `T4`). These names correspond directly to the data table addresses used for reading and writing.
 
@@ -414,8 +439,12 @@ client := adapter.Client() // *pccc.Client
 | Connection refused | PLC not reachable, wrong IP, or no Ethernet port | Verify IP with ping, confirm PLC has Ethernet capability |
 | Timeout on connect | Wrong IP or port, firewall blocking TCP 44818 | Check network path, open port 44818 |
 | PCCC status error (0x10, "Illegal command or format") | Address doesn't exist in PLC or wrong file type | Verify address exists in RSLogix, check file type and number |
-| PCCC status error (0x0F, "Address out of range") | Element number exceeds file size | Check maximum element number for the file in RSLogix |
+| PCCC status error (STS=0xF0 with an EXT_STS code) | Processor-specific failure, such as an element beyond the end of the file | Read the extended status text. Check the address against RSLogix |
 | Wrong values returned | Reading wrong file number or element | Double-check address against RSLogix data table configuration |
-| Bit writes lost | Read-modify-write race with PLC scan | Use dedicated words for bit-level command/status instead of shared bit files |
+| "typed reply ... check the file type letter" (PLC-5) | The address letter does not match the file's actual type. PLC-5 addresses carry no file type, so the processor answers with whatever the file holds | Use the letter RSLogix 5 shows for that file number |
+| "reply has N data bytes, expected M" error | The processor returned a different number of data bytes than requested | Check the address and element size. No value is decoded from a reply of the wrong length |
+| "reply TNS ... does not match" error | A reply belonged to a different (e.g. timed-out) request | Retry. Frequent occurrences point to a network or gateway problem |
+
+PCCC status failures can be classified in code with `errors.As(err, &se)` where `se` is a `*pccc.StatusError` (fields `STS` and `EXTSTS`).
 | Routing errors | Bad connection path or gateway unreachable | Test direct connection first, verify path in RSLinx |
 | "nil response" error | PLC didn't respond to the request | Check PLC mode (should be Run or Remote Run), verify connectivity |

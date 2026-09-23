@@ -2,8 +2,10 @@ package omron
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,7 +72,7 @@ func (t *udpTransport) connect(address string, port int, network, node, unit, sr
 
 	// Auto-detect source node from local IP if not specified
 	if srcNode == 0 {
-		srcNode = t.detectLocalNode(address)
+		srcNode = t.detectLocalNode(address, port)
 		logging.DebugLog("FINS/UDP", "Auto-detected source node: %d", srcNode)
 	}
 
@@ -82,13 +84,48 @@ func (t *udpTransport) connect(address string, port int, network, node, unit, sr
 	t.localNode = srcNode
 	t.connected = true
 
+	// UDP is connectionless: prove a FINS node actually answers before
+	// reporting success, using the read-only Controller Data Read (0x0501).
+	if err := t.verifyReachable(); err != nil {
+		t.close()
+		logging.DebugConnectError("FINS/UDP", addr, err)
+		return fmt.Errorf("no FINS response from %s: %w", addr, err)
+	}
+
 	logging.DebugConnectSuccess("FINS/UDP", addr, fmt.Sprintf("localNode=%d, plcNode=%d", srcNode, node))
 	return nil
 }
 
-// detectLocalNode attempts to determine the local node number.
-func (t *udpTransport) detectLocalNode(plcAddress string) byte {
-	conn, err := net.Dial("udp", plcAddress+":9600")
+// verifyReachable sends Controller Data Read (0x0501) and requires a valid,
+// matching FINS response. A command-level refusal (e.g. not supported by the
+// model) still proves the node is there; local/destination node, controller,
+// routing and relay errors mean the target was not reached.
+func (t *udpTransport) verifyReachable() error {
+	_, err := t.sendCommand(FINSCmdCPURead, nil)
+	if err == nil {
+		return nil
+	}
+	var endErr *FINSEndError
+	if errors.As(err, &endErr) {
+		switch endErr.Code >> 8 {
+		case 0x01, 0x02, 0x03, 0x05:
+			return err
+		}
+		if endErr.RelayError {
+			return err
+		}
+		return nil
+	}
+	return err
+}
+
+// detectLocalNode derives the source node from the last octet of the local
+// IPv4 address used to reach the PLC, the convention of the Ethernet Unit's
+// default "Automatic generation (dynamic)" FINS-node-to-IP conversion (W420
+// section 3-1, FINS/UDP only). Returns 0 when it cannot be determined or is
+// not a valid node (1..254).
+func (t *udpTransport) detectLocalNode(plcAddress string, port int) byte {
+	conn, err := net.Dial("udp", net.JoinHostPort(plcAddress, strconv.Itoa(port)))
 	if err != nil {
 		return 0
 	}
@@ -96,7 +133,7 @@ func (t *udpTransport) detectLocalNode(plcAddress string) byte {
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	ip := localAddr.IP.To4()
-	if ip == nil {
+	if ip == nil || ip[3] == 0 || ip[3] == 255 {
 		return 0
 	}
 	return ip[3]
@@ -161,14 +198,14 @@ func (t *udpTransport) sendCommand(command uint16, data []byte) ([]byte, error) 
 		DNA: t.network,
 		DA1: t.plcNode,
 		DA2: t.unit,
-		SNA: t.network,
+		SNA: 0x00, // Source network: local network (this host)
 		SA1: t.localNode,
 		SA2: 0x00,
 		SID: sid,
 	}
 
 	logging.DebugLog("FINS/UDP", "Command 0x%04X: SID=%d DNA=%d DA1=%d DA2=%d SNA=%d SA1=%d dataLen=%d",
-		command, sid, t.network, t.plcNode, t.unit, t.network, t.localNode, len(data))
+		command, sid, t.network, t.plcNode, t.unit, header.SNA, t.localNode, len(data))
 
 	frame := FINSFrame{
 		Header:  header,
@@ -191,31 +228,69 @@ func (t *udpTransport) sendCommand(command uint16, data []byte) ([]byte, error) 
 		return nil, fmt.Errorf("failed to send: %w", err)
 	}
 
-	// Receive response
+	// Receive response. Datagrams that are not the response to this request
+	// (stale replies to an earlier timed-out request, other senders, garbage)
+	// are discarded and we keep waiting until the deadline.
 	buf := make([]byte, 2048)
-	n, _, err := t.conn.ReadFromUDP(buf)
-	if err != nil {
-		t.connected = false
-		logging.DebugDisconnect("FINS/UDP", t.plcAddr.String(), fmt.Sprintf("recv failed: %v", err))
-		return nil, fmt.Errorf("failed to receive: %w", err)
+	var resp *FINSResponse
+	for {
+		n, from, err := t.conn.ReadFromUDP(buf)
+		if err != nil {
+			t.connected = false
+			logging.DebugDisconnect("FINS/UDP", t.plcAddr.String(), fmt.Sprintf("recv failed: %v", err))
+			return nil, fmt.Errorf("failed to receive: %w", err)
+		}
+
+		logging.DebugRX("FINS/UDP", buf[:n])
+
+		if from != nil && !from.IP.Equal(t.plcAddr.IP) {
+			logging.DebugLog("FINS/UDP", "Discarding datagram from unexpected sender %s", from)
+			continue
+		}
+		if reason := t.mismatch(buf[:n], sid, command); reason != "" {
+			logging.DebugLog("FINS/UDP", "Discarding datagram: %s", reason)
+			continue
+		}
+		r, err := ParseFINSResponse(buf[:n])
+		if err != nil {
+			logging.DebugError("FINS/UDP", "parse response", err)
+			continue
+		}
+		resp = r
+		resp.Data = append([]byte(nil), resp.Data...)
+		break
 	}
 
-	logging.DebugRX("FINS/UDP", buf[:n])
-
-	// Parse response
-	resp, err := ParseFINSResponse(buf[:n])
-	if err != nil {
-		logging.DebugError("FINS/UDP", "parse response", err)
+	// Check end code (status flags masked; see FINSEndCodeError)
+	if err := finsResponseError(resp.EndCode, resp.Data); err != nil {
+		logging.DebugLog("FINS/UDP", "FINS end code error: 0x%04X", resp.EndCode)
 		return nil, err
 	}
 
-	// Check end code
-	if resp.EndCode != FINSEndOK {
-		logging.DebugLog("FINS/UDP", "FINS end code error: 0x%04X", resp.EndCode)
-		return nil, FINSEndCodeError(resp.EndCode)
-	}
-
 	return resp.Data, nil
+}
+
+// mismatch returns a non-empty reason when a datagram is not a valid response
+// to the request identified by sid/command addressed to this node.
+func (t *udpTransport) mismatch(b []byte, sid byte, command uint16) string {
+	if len(b) < 14 {
+		return fmt.Sprintf("too short (%d bytes)", len(b))
+	}
+	if b[0]&0x40 == 0 {
+		return fmt.Sprintf("ICF 0x%02X is not a response", b[0])
+	}
+	if b[9] != sid {
+		return fmt.Sprintf("SID %d does not match request SID %d", b[9], sid)
+	}
+	if cmd := binary.BigEndian.Uint16(b[10:12]); cmd != command {
+		return fmt.Sprintf("command 0x%04X does not match request 0x%04X", cmd, command)
+	}
+	// The responder swaps source and destination: the reply must be
+	// addressed to our node/unit.
+	if b[4] != t.localNode || b[5] != 0x00 {
+		return fmt.Sprintf("addressed to node %d unit %d, not local node %d", b[4], b[5], t.localNode)
+	}
+	return ""
 }
 
 // readWords reads words from a memory area.

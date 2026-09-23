@@ -25,9 +25,12 @@ func buildReadRequest(addr *FileAddress, tns uint16, vendorID uint16, serialNum 
 // This is used for bulk reads where multiple contiguous elements are requested
 // in a single PCCC command by specifying byteCount = count * ElementSize.
 func buildReadRequestN(addr *FileAddress, byteCount int, tns uint16, vendorID uint16, serialNum uint32) ([]byte, error) {
+	if err := checkByteSize(byteCount); err != nil {
+		return nil, fmt.Errorf("read %s: %w", addr.RawAddress, err)
+	}
 	// Build the PCCC command payload
 	pcccCmd := buildPCCCHeader(CmdTypedCommand, tns, FncProtectedTypedLogicalRead)
-	pcccCmd = appendCompactValue(pcccCmd, uint16(byteCount))
+	pcccCmd = append(pcccCmd, byte(byteCount))
 	pcccCmd = appendCompactValue(pcccCmd, addr.FileNumber)
 	pcccCmd = append(pcccCmd, addr.FileType)
 	pcccCmd = appendCompactValue(pcccCmd, addr.Element)
@@ -44,9 +47,12 @@ func buildReadRequestN(addr *FileAddress, byteCount int, tns uint16, vendorID ui
 //
 //	[CMD:1] [STS:1] [TNS:2 LE] [FNC:1] [ByteSize] [FileNumber] [FileType] [Element] [SubElement] [Data...]
 func buildWriteRequest(addr *FileAddress, data []byte, tns uint16, vendorID uint16, serialNum uint32) ([]byte, error) {
+	if err := checkByteSize(len(data)); err != nil {
+		return nil, fmt.Errorf("write %s: %w", addr.RawAddress, err)
+	}
 	// Build the PCCC command payload
 	pcccCmd := buildPCCCHeader(CmdTypedCommand, tns, FncProtectedTypedLogicalWrite)
-	pcccCmd = appendCompactValue(pcccCmd, uint16(len(data)))
+	pcccCmd = append(pcccCmd, byte(len(data)))
 	pcccCmd = appendCompactValue(pcccCmd, addr.FileNumber)
 	pcccCmd = append(pcccCmd, addr.FileType)
 	pcccCmd = appendCompactValue(pcccCmd, addr.Element)
@@ -55,6 +61,49 @@ func buildWriteRequest(addr *FileAddress, data []byte, tns uint16, vendorID uint
 
 	// Wrap in CIP Execute PCCC
 	return wrapInCipExecutePCCC(pcccCmd, vendorID, serialNum)
+}
+
+// buildMaskedWriteRequest builds a PCCC "Protected Typed Logical Write with
+// Mask, 3 Address Fields" command (CMD=0x0F, FNC=0xAB) wrapped in CIP Execute
+// PCCC. Only bits set in mask are changed; the processor applies them
+// atomically, so no read-modify-write is needed.
+//
+//	[CMD:1] [STS:1] [TNS:2 LE] [FNC:1=0xAB] [ByteSize] [FileNumber] [FileType] [Element] [SubElement] [Mask...] [Data...]
+//
+// ByteSize counts the data bytes only; the mask has the same length as the
+// data. This matches pycomm3 (SLC_FNC_WRITE = 0xAB; writeable_value returns
+// mask + value with a 2-byte size for a bit) and libplctag's
+// slc_tag_write_bit_start (AB_EIP_SLC_RANGE_WRITE_MASK_FUNC, transfer size 2,
+// 2-byte mask then 2-byte value; "the mask is only 16 bits").
+func buildMaskedWriteRequest(addr *FileAddress, mask, data []byte, tns uint16, vendorID uint16, serialNum uint32) ([]byte, error) {
+	if len(mask) != len(data) {
+		return nil, fmt.Errorf("masked write: mask length %d does not match data length %d", len(mask), len(data))
+	}
+	if err := checkByteSize(len(data)); err != nil {
+		return nil, fmt.Errorf("masked write %s: %w", addr.RawAddress, err)
+	}
+	pcccCmd := buildPCCCHeader(CmdTypedCommand, tns, FncProtectedTypedLogicalMaskedWrite)
+	pcccCmd = append(pcccCmd, byte(len(data)))
+	pcccCmd = appendCompactValue(pcccCmd, addr.FileNumber)
+	pcccCmd = append(pcccCmd, addr.FileType)
+	pcccCmd = appendCompactValue(pcccCmd, addr.Element)
+	pcccCmd = appendCompactValue(pcccCmd, addr.SubElement)
+	pcccCmd = append(pcccCmd, mask...)
+	pcccCmd = append(pcccCmd, data...)
+	return wrapInCipExecutePCCC(pcccCmd, vendorID, serialNum)
+}
+
+// checkByteSize validates the Byte Size field of FNC 0xA2/0xAA/0xAB. Unlike
+// the file, element and sub-element fields it has no FF escape (1770-6.5.16
+// p. 7-17/7-18; pycomm3 packs it as USINT, libplctag as uint8_t
+// pccc_transfer_size). It used to go through appendCompactValue, so a size of
+// 255 or more was sent as FF lo hi and the processor would have read "lo" as
+// the file number and "hi" as the file type: a request for a different file.
+func checkByteSize(n int) error {
+	if n <= 0 || n > 0xFF {
+		return fmt.Errorf("byte size %d out of range (1..255)", n)
+	}
+	return nil
 }
 
 // buildPCCCHeader creates the common PCCC command header.
@@ -205,9 +254,13 @@ func parseCipExecutePCCCResponse(data []byte) ([]byte, error) {
 	if len(payload) < 7 {
 		return nil, fmt.Errorf("CIP response missing requester ID")
 	}
+	// The requester ID is echoed as sent: 7 bytes including its length byte
+	// (libplctag's cip_pccc_resp has the same fixed layout). Any other length
+	// byte means the reply is malformed; a 0 used to return the payload with
+	// the length byte still in front, shifting every PCCC field by one.
 	idLen := int(payload[0])
-	if len(payload) < idLen {
-		return nil, fmt.Errorf("CIP response requester ID truncated")
+	if idLen != int(RequesterIDLength) {
+		return nil, fmt.Errorf("CIP response requester ID length %d, expected %d", idLen, RequesterIDLength)
 	}
 	pcccData := payload[idLen:]
 
@@ -223,18 +276,20 @@ func parseCipExecutePCCCResponse(data []byte) ([]byte, error) {
 // PCCC response format (error with extended status):
 //
 //	[CMD:1 = 0x4F] [STS:1 with 0xF0] [TNS:2 LE] [EXT_STS:1]
-func parsePCCCReadResponse(data []byte) ([]byte, error) {
+func parsePCCCReadResponse(data []byte, tns uint16) ([]byte, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("PCCC response too short: %d bytes", len(data))
 	}
 
 	cmd := data[0]
 	sts := data[1]
-	// tns := binary.LittleEndian.Uint16(data[2:4])
 
 	// Verify it's a reply to our typed command
 	if cmd != CmdTypedReply {
 		return nil, fmt.Errorf("unexpected PCCC reply command: 0x%02X (expected 0x%02X)", cmd, CmdTypedReply)
+	}
+	if err := checkReplyTNS(data, tns); err != nil {
+		return nil, err
 	}
 
 	// Check status
@@ -252,7 +307,7 @@ func parsePCCCReadResponse(data []byte) ([]byte, error) {
 
 // parsePCCCWriteResponse parses the PCCC response to a typed write command.
 // The response has no data payload on success, just the 4-byte header.
-func parsePCCCWriteResponse(data []byte) error {
+func parsePCCCWriteResponse(data []byte, tns uint16) error {
 	if len(data) < 4 {
 		return fmt.Errorf("PCCC response too short: %d bytes", len(data))
 	}
@@ -263,6 +318,9 @@ func parsePCCCWriteResponse(data []byte) error {
 	if cmd != CmdTypedReply {
 		return fmt.Errorf("unexpected PCCC reply command: 0x%02X (expected 0x%02X)", cmd, CmdTypedReply)
 	}
+	if err := checkReplyTNS(data, tns); err != nil {
+		return err
+	}
 
 	if sts != StsSuccess {
 		var extSts byte
@@ -272,5 +330,20 @@ func parsePCCCWriteResponse(data []byte) error {
 		return PCCCStatusError(sts, extSts)
 	}
 
+	return nil
+}
+
+// checkReplyTNS verifies that a PCCC reply ([CMD] [STS] [TNS:2 LE] ...)
+// echoes the transaction number of the request it answers. A mismatch means
+// the reply belongs to another (e.g. earlier, timed-out) request and its data
+// must not be used. libplctag's pccc_check_response_header applies the same
+// check.
+func checkReplyTNS(data []byte, tns uint16) error {
+	if len(data) < 4 {
+		return fmt.Errorf("PCCC response too short: %d bytes", len(data))
+	}
+	if got := binary.LittleEndian.Uint16(data[2:4]); got != tns {
+		return fmt.Errorf("PCCC reply TNS 0x%04X does not match request TNS 0x%04X", got, tns)
+	}
 	return nil
 }

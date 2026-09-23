@@ -19,7 +19,10 @@ type PLC struct {
 	// - non-empty: route via Connection Manager (e.g., through 1756-DHRIO gateway)
 	RoutePath []byte
 
-	// PLCType selects command format details (SLC500, PLC5, MicroLogix).
+	// PLCType selects the command set: SLC 500 and MicroLogix use the SLC
+	// protected typed logical commands (FNC 0xA2/0xAA/0xAB); PLC-5 uses
+	// Typed Read/Write (FNC 0x68/0x67) and Read-Modify-Write (FNC 0x26) with
+	// logical binary addressing (see plc5.go).
 	PLCType PLCType
 
 	// PCCC requester ID fields (embedded in CIP Execute PCCC requests)
@@ -54,6 +57,14 @@ func (p *PLC) ReadAddress(addr *FileAddress) (*Tag, error) {
 	debugLog("ReadAddress %s: file=%d type=0x%02X elem=%d sub=%d readSize=%d",
 		addr.RawAddress, addr.FileNumber, addr.FileType, addr.Element, addr.SubElement, addr.ReadSize())
 
+	if p.PLCType == TypePLC5 {
+		td, err := p.plc5TypedRead(addr, 1)
+		if err != nil {
+			return nil, fmt.Errorf("ReadAddress %s: %w", addr.RawAddress, err)
+		}
+		return &Tag{Address: addr.RawAddress, FileType: addr.FileType, Bytes: td.data}, nil
+	}
+
 	// Build the PCCC read request wrapped in CIP
 	tns := p.nextTNS()
 	cipReq, err := buildReadRequest(addr, tns, p.vendorID, p.serialNum)
@@ -74,12 +85,20 @@ func (p *PLC) ReadAddress(addr *FileAddress) (*Tag, error) {
 	}
 
 	// Parse the PCCC response
-	data, err := parsePCCCReadResponse(pcccResp)
+	data, err := parsePCCCReadResponse(pcccResp, tns)
 	if err != nil {
 		return nil, fmt.Errorf("ReadAddress %s: %w", addr.RawAddress, err)
 	}
 
 	debugLog("ReadAddress %s: got %d bytes", addr.RawAddress, len(data))
+
+	// The reply must carry exactly the requested byte count: fewer is a
+	// partial element, more means the reply is not the answer to this
+	// request. libplctag's pccc_check_read_status rejects both ("Too little"
+	// / "Too much data received").
+	if want := addr.ReadSize(); len(data) != want {
+		return nil, fmt.Errorf("ReadAddress %s: reply has %d data bytes, expected %d", addr.RawAddress, len(data), want)
+	}
 
 	return &Tag{
 		Address:  addr.RawAddress,
@@ -89,7 +108,8 @@ func (p *PLC) ReadAddress(addr *FileAddress) (*Tag, error) {
 }
 
 // ReadAddressN reads count contiguous elements starting at addr.Element.
-// The returned Tag.Bytes contains up to count * ElementSize(addr.FileType) bytes.
+// The returned Tag.Bytes contains exactly count * ElementSize(addr.FileType)
+// bytes (a reply of any other length is an error).
 // This is used for batch reads: a single PCCC round-trip retrieves multiple
 // consecutive data table elements.
 func (p *PLC) ReadAddressN(addr *FileAddress, count int) (*Tag, error) {
@@ -101,6 +121,14 @@ func (p *PLC) ReadAddressN(addr *FileAddress, count int) (*Tag, error) {
 	}
 	if count <= 0 {
 		return nil, fmt.Errorf("ReadAddressN: count must be > 0")
+	}
+
+	if p.PLCType == TypePLC5 {
+		td, err := p.plc5TypedRead(addr, count)
+		if err != nil {
+			return nil, fmt.Errorf("ReadAddressN %s: %w", addr.RawAddress, err)
+		}
+		return &Tag{Address: addr.RawAddress, FileType: addr.FileType, Bytes: td.data}, nil
 	}
 
 	elemSize := ElementSize(addr.FileType)
@@ -125,12 +153,16 @@ func (p *PLC) ReadAddressN(addr *FileAddress, count int) (*Tag, error) {
 		return nil, fmt.Errorf("ReadAddressN %s: %w", addr.RawAddress, err)
 	}
 
-	data, err := parsePCCCReadResponse(pcccResp)
+	data, err := parsePCCCReadResponse(pcccResp, tns)
 	if err != nil {
 		return nil, fmt.Errorf("ReadAddressN %s: %w", addr.RawAddress, err)
 	}
 
 	debugLog("ReadAddressN %s: got %d bytes (expected %d)", addr.RawAddress, len(data), byteCount)
+
+	if len(data) != byteCount {
+		return nil, fmt.Errorf("ReadAddressN %s: reply has %d data bytes, expected %d", addr.RawAddress, len(data), byteCount)
+	}
 
 	return &Tag{
 		Address:  addr.RawAddress,
@@ -150,6 +182,17 @@ func (p *PLC) WriteAddress(addr *FileAddress, data []byte) error {
 
 	debugLog("WriteAddress %s: file=%d type=0x%02X elem=%d sub=%d data=%X",
 		addr.RawAddress, addr.FileNumber, addr.FileType, addr.Element, addr.SubElement, data)
+
+	if p.PLCType == TypePLC5 {
+		elem := plc5ExpectedElementSize(addr)
+		if len(data) == 0 || len(data)%elem != 0 {
+			return fmt.Errorf("WriteAddress %s: %d bytes is not a whole number of %d-byte elements", addr.RawAddress, len(data), elem)
+		}
+		if err := p.plc5TypedWrite(addr, len(data)/elem, data); err != nil {
+			return fmt.Errorf("WriteAddress %s: %w", addr.RawAddress, err)
+		}
+		return nil
+	}
 
 	// Build the PCCC write request wrapped in CIP
 	tns := p.nextTNS()
@@ -171,11 +214,47 @@ func (p *PLC) WriteAddress(addr *FileAddress, data []byte) error {
 	}
 
 	// Parse the PCCC write response
-	if err := parsePCCCWriteResponse(pcccResp); err != nil {
+	if err := parsePCCCWriteResponse(pcccResp, tns); err != nil {
 		return fmt.Errorf("WriteAddress %s: %w", addr.RawAddress, err)
 	}
 
 	debugLog("WriteAddress %s: success", addr.RawAddress)
+	return nil
+}
+
+// writeMasked changes only the bits set in mask to the corresponding bits of
+// data, using Protected Typed Logical Write with Mask (FNC 0xAB). SLC 500 and
+// MicroLogix only; PLC-5 uses readModifyWrite.
+func (p *PLC) writeMasked(addr *FileAddress, mask, data []byte) error {
+	if p == nil || p.Connection == nil {
+		return fmt.Errorf("writeMasked: nil PLC or connection")
+	}
+	if p.PLCType == TypePLC5 {
+		return fmt.Errorf("writeMasked: FNC 0xAB is not a PLC-5 command")
+	}
+
+	debugLog("writeMasked %s: file=%d type=0x%02X elem=%d sub=%d mask=%X data=%X",
+		addr.RawAddress, addr.FileNumber, addr.FileType, addr.Element, addr.SubElement, mask, data)
+
+	tns := p.nextTNS()
+	cipReq, err := buildMaskedWriteRequest(addr, mask, data, tns, p.vendorID, p.serialNum)
+	if err != nil {
+		return fmt.Errorf("WriteAddress %s: %w", addr.RawAddress, err)
+	}
+
+	cipResp, err := p.sendCipRequest(cipReq)
+	if err != nil {
+		return fmt.Errorf("WriteAddress %s: %w", addr.RawAddress, err)
+	}
+
+	pcccResp, err := parseCipExecutePCCCResponse(cipResp)
+	if err != nil {
+		return fmt.Errorf("WriteAddress %s: %w", addr.RawAddress, err)
+	}
+
+	if err := parsePCCCWriteResponse(pcccResp, tns); err != nil {
+		return fmt.Errorf("WriteAddress %s: %w", addr.RawAddress, err)
+	}
 	return nil
 }
 
@@ -213,6 +292,11 @@ func (p *PLC) sendCipRequest(reqData []byte) ([]byte, error) {
 	debugLog("sendCipRequest: %d bytes, svc=0x%02X", len(reqData), reqData[0])
 
 	var cpf *eip.EipCommonPacket
+	if len(p.RoutePath)%2 != 0 {
+		// The route path size is sent in 16-bit words; an odd length would
+		// silently drop the last byte of the route.
+		return nil, fmt.Errorf("sendCipRequest: route path has odd length %d", len(p.RoutePath))
+	}
 	if len(p.RoutePath) > 0 {
 		cpf = buildRoutedCpf(reqData, p.RoutePath)
 	} else {

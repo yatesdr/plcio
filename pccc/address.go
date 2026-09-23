@@ -30,6 +30,13 @@ type FileAddress struct {
 	BitNumber   int    // Bit position within element/sub-element (-1 if not a bit address)
 	TypeLetter  string // Original type prefix (e.g., "N", "T", "ST")
 	RawAddress  string // Original address string
+
+	// HasSubElement is true when the address names a sub-element (".PRE",
+	// ".ACC", ".DN", ".1", ...). SLC/MicroLogix requests always carry a
+	// sub-element field (0 when absent), so it does not change their bytes;
+	// PLC-5 logical binary addresses only include the sub-element level when
+	// it is present (libplctag plc5_encode_address: sub_element >= 0).
+	HasSubElement bool
 }
 
 // ReadSize returns the number of bytes to request from the PLC for this address.
@@ -52,8 +59,24 @@ func (a *FileAddress) ReadSize() int {
 	return ElementSize(a.FileType)
 }
 
-// ParseAddress parses an SLC500/PLC5 data table address string into a FileAddress.
+// ParseAddress parses an SLC 500 / MicroLogix data table address string into
+// a FileAddress. All numbers are decimal. Use ParseAddressFor for PLC-5
+// addresses, whose I/O word and bit numbers are octal.
 func ParseAddress(addr string) (*FileAddress, error) {
+	return ParseAddressFor(addr, TypeSLC500)
+}
+
+// ParseAddressFor parses a data table address for the given processor family.
+//
+// PLC-5 differences:
+//   - I: and O: word and bit numbers are octal, as RSLogix 5 displays them:
+//     I:010/17 is input image word 8, bit 15 (I:rrg/bb = rack, group, bit).
+//     Digits 8 and 9 are rejected. Every other number (file numbers, other
+//     files' elements and bits) stays decimal.
+//   - L (long integer) files do not exist on PLC-5 and are rejected.
+//
+// SLC 500 and MicroLogix addresses are all-decimal (I:010/15 is word 10).
+func ParseAddressFor(addr string, plcType PLCType) (*FileAddress, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("empty address")
 	}
@@ -85,6 +108,9 @@ func ParseAddress(addr string) (*FileAddress, error) {
 		return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 	}
 	result.FileType = fileType
+	if plcType == TypePLC5 && fileType == FileTypeLong {
+		return nil, fmt.Errorf("invalid address %q: PLC-5 has no L (long integer) files", addr)
+	}
 
 	if fileNum >= 0 {
 		result.FileNumber = uint16(fileNum)
@@ -100,7 +126,14 @@ func ParseAddress(addr string) (*FileAddress, error) {
 		return nil, fmt.Errorf("invalid address %q: missing element number", addr)
 	}
 
-	if err := parseElementAndModifiers(remainder, result); err != nil {
+	// PLC-5 I/O image word and bit numbers are octal (DF1 manual 1770-6.5.16
+	// ch. 13: I:rrg/bb; RSLogix 5 shows I:000..I:277 and bits 00..17).
+	base := 10
+	if plcType == TypePLC5 && (fileType == FileTypeInput || fileType == FileTypeOutput) {
+		base = 8
+	}
+
+	if err := parseElementAndModifiers(remainder, base, result); err != nil {
 		return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 	}
 
@@ -122,7 +155,7 @@ func parseFileSpec(spec string) (typeLetter string, fileNum int, err error) {
 			if numStr == "" {
 				return prefix, -1, nil
 			}
-			n, err := strconv.Atoi(numStr)
+			n, err := parseFileNumber(numStr)
 			if err != nil {
 				return "", -1, fmt.Errorf("invalid file number in %q", spec)
 			}
@@ -140,11 +173,33 @@ func parseFileSpec(spec string) (typeLetter string, fileNum int, err error) {
 	if numStr == "" {
 		return prefix, -1, nil
 	}
-	n, err := strconv.Atoi(numStr)
+	n, err := parseFileNumber(numStr)
 	if err != nil {
 		return "", -1, fmt.Errorf("invalid file number in %q", spec)
 	}
 	return prefix, n, nil
+}
+
+// parseFileNumber parses a decimal file number 0..65535. strconv.Atoi was
+// used before, which accepted signs ("O-1" silently became the default file)
+// and values above 65535 that were then truncated to 16 bits (N70000 became
+// N4464).
+func parseFileNumber(s string) (int, error) {
+	n, err := parseUnsigned(s, 10, 16)
+	return int(n), err
+}
+
+// parseUnsigned parses digits only (no sign, no prefix) in the given base.
+func parseUnsigned(s string, base, bits int) (uint64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty number")
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, fmt.Errorf("invalid digit %q in %q", s[i], s)
+		}
+	}
+	return strconv.ParseUint(s, base, bits)
 }
 
 // isValidTypePrefix returns true if the single letter is a valid PCCC file type.
@@ -194,27 +249,31 @@ func lookupFileType(typeLetter string) (byte, int, error) {
 	}
 }
 
-// parseElementAndModifiers parses "Element[/Bit][.SubElement]" from the remainder after the colon.
-func parseElementAndModifiers(remainder string, result *FileAddress) error {
+// parseElementAndModifiers parses "Element[/Bit][.SubElement]" from the
+// remainder after the colon. base is 8 for PLC-5 I/O words and bits, else 10.
+func parseElementAndModifiers(remainder string, base int, result *FileAddress) error {
 	// Check for bit access: element/bit
 	if slashIdx := strings.Index(remainder, "/"); slashIdx >= 0 {
 		elemStr := remainder[:slashIdx]
 		bitStr := remainder[slashIdx+1:]
 
-		elem, err := strconv.ParseUint(elemStr, 10, 16)
+		elem, err := parseUnsigned(elemStr, base, 16)
 		if err != nil {
-			return fmt.Errorf("invalid element number %q", elemStr)
+			return fmt.Errorf("invalid element number %q%s", elemStr, octalHint(base))
 		}
 		result.Element = uint16(elem)
 
-		bit, err := strconv.Atoi(bitStr)
+		bit, err := parseUnsigned(bitStr, base, 8)
 		if err != nil {
-			return fmt.Errorf("invalid bit number %q", bitStr)
+			return fmt.Errorf("invalid bit number %q%s", bitStr, octalHint(base))
 		}
-		if bit < 0 || bit > 15 {
+		if bit > 15 {
+			if base == 8 {
+				return fmt.Errorf("bit number %s out of range (octal 0-17)", bitStr)
+			}
 			return fmt.Errorf("bit number %d out of range (0-15)", bit)
 		}
-		result.BitNumber = bit
+		result.BitNumber = int(bit)
 		return nil
 	}
 
@@ -223,22 +282,30 @@ func parseElementAndModifiers(remainder string, result *FileAddress) error {
 		elemStr := remainder[:dotIdx]
 		subStr := remainder[dotIdx+1:]
 
-		elem, err := strconv.ParseUint(elemStr, 10, 16)
+		elem, err := parseUnsigned(elemStr, base, 16)
 		if err != nil {
-			return fmt.Errorf("invalid element number %q", elemStr)
+			return fmt.Errorf("invalid element number %q%s", elemStr, octalHint(base))
 		}
 		result.Element = uint16(elem)
+		result.HasSubElement = true
 
 		return parseSubElement(subStr, result)
 	}
 
 	// Simple element access
-	elem, err := strconv.ParseUint(remainder, 10, 16)
+	elem, err := parseUnsigned(remainder, base, 16)
 	if err != nil {
-		return fmt.Errorf("invalid element number %q", remainder)
+		return fmt.Errorf("invalid element number %q%s", remainder, octalHint(base))
 	}
 	result.Element = uint16(elem)
 	return nil
+}
+
+func octalHint(base int) string {
+	if base == 8 {
+		return " (PLC-5 I/O addresses are octal: digits 0-7)"
+	}
+	return ""
 }
 
 // parseSubElement resolves a named sub-element (like PRE, ACC, DN) to a numeric

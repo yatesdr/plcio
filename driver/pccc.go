@@ -3,6 +3,7 @@ package driver
 import (
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/yatesdr/plcio/cip"
 	"github.com/yatesdr/plcio/pccc"
@@ -13,6 +14,8 @@ import (
 type PCCCAdapter struct {
 	client *pccc.Client
 	config *PLCConfig
+	mu     sync.RWMutex
+	epoch  uint64
 }
 
 // NewPCCCAdapter creates a new PCCCAdapter from configuration.
@@ -24,8 +27,22 @@ func NewPCCCAdapter(cfg *PLCConfig) (*PCCCAdapter, error) {
 	return &PCCCAdapter{config: cfg}, nil
 }
 
+// currentClient returns the client in use. Operations capture it once, so a
+// concurrent Close or Connect cannot swap it out mid-operation (a closed
+// client fails its I/O with an error instead of a nil dereference).
+func (a *PCCCAdapter) currentClient() *pccc.Client {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.client
+}
+
 // Connect establishes connection to the SLC500/PLC-5/MicroLogix PLC.
+// Reconnecting closes the previous session: SLC 5/05 and MicroLogix
+// processors allow very few concurrent EtherNet/IP sessions.
 func (a *PCCCAdapter) Connect() error {
+	a.mu.RLock()
+	epoch := a.epoch
+	a.mu.RUnlock()
 	opts := []pccc.Option{}
 
 	if a.config.Timeout > 0 {
@@ -52,22 +69,38 @@ func (a *PCCCAdapter) Connect() error {
 		return fmt.Errorf("pccc connect: %w", err)
 	}
 
+	a.mu.Lock()
+	if a.epoch != epoch {
+		a.mu.Unlock()
+		client.Close()
+		return fmt.Errorf("PCCC connect superseded by Close")
+	}
+	previous := a.client
 	a.client = client
+	a.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 	return nil
 }
 
 // Close releases the connection.
 func (a *PCCCAdapter) Close() error {
-	if a.client != nil {
-		a.client.Close()
-		a.client = nil
+	a.mu.Lock()
+	client := a.client
+	a.client = nil
+	a.epoch++
+	a.mu.Unlock()
+	if client != nil {
+		client.Close()
 	}
 	return nil
 }
 
 // IsConnected returns true if connected to the PLC.
 func (a *PCCCAdapter) IsConnected() bool {
-	return a.client != nil && a.client.IsConnected()
+	client := a.currentClient()
+	return client != nil && client.IsConnected()
 }
 
 // Family returns the PLC family.
@@ -77,19 +110,21 @@ func (a *PCCCAdapter) Family() PLCFamily {
 
 // ConnectionMode returns a description of the connection mode.
 func (a *PCCCAdapter) ConnectionMode() string {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return "Not connected"
 	}
-	return a.client.ConnectionMode()
+	return client.ConnectionMode()
 }
 
 // GetDeviceInfo returns information about the connected PLC.
 func (a *PCCCAdapter) GetDeviceInfo() (*DeviceInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	identity, err := a.client.GetIdentity()
+	identity, err := client.GetIdentity()
 	if err != nil {
 		return nil, err
 	}
@@ -113,14 +148,15 @@ func (a *PCCCAdapter) SupportsDiscovery() bool {
 // AllTags discovers data files from the file directory and returns them as TagInfo entries.
 // Supported for SLC500 and MicroLogix only.
 func (a *PCCCAdapter) AllTags() ([]TagInfo, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 	if a.config.GetFamily() == FamilyPLC5 {
 		return nil, fmt.Errorf("tag discovery not supported for PLC-5")
 	}
 
-	entries, err := a.client.DiscoverDataFiles()
+	entries, err := client.DiscoverDataFiles()
 	if err != nil {
 		return nil, err
 	}
@@ -151,10 +187,32 @@ func (a *PCCCAdapter) Programs() ([]string, error) {
 	return nil, fmt.Errorf("program listing not supported for %s", a.config.GetFamily())
 }
 
-// maxPCCCReadBytes is the maximum data payload for a single PCCC typed read.
-// SLC 5/03 supports ~164 bytes; SLC 5/04 and 5/05 support ~236 bytes.
-// We use 236 as the cap, which works on 5/04+ and MicroLogix.
+// maxPCCCReadBytes is the data cap for one SLC/MicroLogix batch read
+// (Protected Typed Logical Read, FNC 0xA2). The DF1 manual (1770-6.5.16
+// p. 7-17) gives 236 data bytes for SLC 5/03 and 5/04 ("225 bytes with IP",
+// which does not apply to DF1 drivers). No reference gives a smaller SLC 5/03
+// limit, so the cap is unchanged; a batch the processor rejects falls back to
+// per-element reads.
 const maxPCCCReadBytes = 236
+
+// maxPLC5ReadBytes is the data cap for one PLC-5 Typed Read (FNC 0x68):
+// "up to 240 bytes minus the number of bytes used in the type/data
+// parameter" (1770-6.5.16 p. 7-28). An array parameter is at most 6 bytes
+// here (flag, type ID, 1-byte size, element descriptor of up to 3 bytes).
+const maxPLC5ReadBytes = 234
+
+// pcccPLCType maps the configured family to the pccc command set and address
+// syntax (PLC-5 I/O addresses are octal).
+func (a *PCCCAdapter) pcccPLCType() pccc.PLCType {
+	switch a.config.GetFamily() {
+	case FamilyPLC5:
+		return pccc.TypePLC5
+	case FamilyMicroLogix:
+		return pccc.TypeMicroLogix
+	default:
+		return pccc.TypeSLC500
+	}
+}
 
 // Read reads data table addresses from the PLC, batching contiguous full-element
 // reads in the same data file into single PCCC round-trips for efficiency.
@@ -163,7 +221,8 @@ const maxPCCCReadBytes = 236
 // always read individually. If a batch read fails, the affected elements fall
 // back to individual reads automatically.
 func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 	if len(requests) == 0 {
@@ -180,12 +239,17 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 		bulkable bool
 	}
 	parsed := make([]parsedReq, len(requests))
+	plcType := a.pcccPLCType()
 	for i, req := range requests {
-		addr, err := pccc.ParseAddress(req.Name)
+		addr, err := pccc.ParseAddressFor(req.Name, plcType)
 		parsed[i] = parsedReq{addr: addr, err: err}
-		if err == nil && addr.SubElement == 0 && addr.BitNumber < 0 {
+		if err == nil && addr.SubElement == 0 && addr.BitNumber < 0 && !addr.HasSubElement {
 			parsed[i].bulkable = true
 		}
+	}
+	maxBytes := maxPCCCReadBytes
+	if plcType == pccc.TypePLC5 {
+		maxBytes = maxPLC5ReadBytes
 	}
 
 	// Fill in parse errors immediately.
@@ -244,7 +308,7 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 
 			startAddr := parsed[run[0]].addr
 			elemSize := pccc.ElementSize(startAddr.FileType)
-			maxCount := maxPCCCReadBytes / elemSize
+			maxCount := maxBytes / elemSize
 
 			// Process run in chunks that fit within the PCCC payload limit.
 			for chunkStart := 0; chunkStart < len(run); chunkStart += maxCount {
@@ -260,7 +324,7 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 				chunkAddr := parsed[chunk[0]].addr
 				count := len(chunk)
 
-				tag, err := a.client.PLC().ReadAddressN(chunkAddr, count)
+				tag, err := client.PLC().ReadAddressN(chunkAddr, count)
 				if err != nil {
 					// Fall back to individual reads for this chunk.
 					continue
@@ -304,7 +368,7 @@ func (a *PCCCAdapter) Read(requests []TagRequest) ([]*TagValue, error) {
 
 	var readErr error
 	if len(remaining) > 0 {
-		values, err := a.client.Read(remaining...)
+		values, err := client.Read(remaining...)
 		readErr = err
 		for j, v := range values {
 			if j >= len(remainingIdx) {
@@ -371,10 +435,11 @@ func pcccContiguousRuns(sortedIndices []int, elemOf func(int) uint16) [][]int {
 
 // Write writes a value to a data table address.
 func (a *PCCCAdapter) Write(tag string, value interface{}) error {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return fmt.Errorf("not connected")
 	}
-	addr, err := pccc.ParseAddress(tag)
+	addr, err := pccc.ParseAddressFor(tag, a.pcccPLCType())
 	if err != nil {
 		return err
 	}
@@ -382,15 +447,16 @@ func (a *PCCCAdapter) Write(tag string, value interface{}) error {
 	if err != nil {
 		return err
 	}
-	return a.client.Write(tag, value)
+	return client.Write(tag, value)
 }
 
 // Keepalive sends a NOP to maintain the connection.
 func (a *PCCCAdapter) Keepalive() error {
-	if a.client == nil {
+	client := a.currentClient()
+	if client == nil {
 		return nil
 	}
-	return a.client.Keepalive()
+	return client.Keepalive()
 }
 
 // IsConnectionError returns true if the error indicates a connection problem.
@@ -400,5 +466,5 @@ func (a *PCCCAdapter) IsConnectionError(err error) bool {
 
 // Client returns the underlying pccc.Client for advanced operations.
 func (a *PCCCAdapter) Client() *pccc.Client {
-	return a.client
+	return a.currentClient()
 }

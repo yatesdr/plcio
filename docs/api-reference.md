@@ -64,6 +64,12 @@ Factory function that creates the appropriate `Driver` implementation based on t
 | `FamilyBeckhoff` | `ADSAdapter` |
 | `FamilyOmron` | `OmronAdapter` |
 
+Family names are matched case-insensitively and ignoring surrounding whitespace
+(`"S7"`, `" Logix "`); an empty or blank family selects Logix, and any other name
+returns an `unknown PLC family` error. When the configured spelling is not
+canonical, the adapter receives a copy of the config with the canonical family; the
+caller's config is not modified.
+
 The connection is **not** established until `Connect()` is called on the returned driver.
 
 ---
@@ -287,6 +293,10 @@ type DiscoveredDevice struct {
 // Discover PLCs using all protocols in parallel
 func DiscoverAll(broadcastIP string, scanCIDR string, timeout time.Duration, concurrency int) []DiscoveredDevice
 
+// Same, also returning per-protocol failures (socket, broadcast permission,
+// invalid CIDR, scan errors). DiscoverAll calls it and drops the errors.
+func DiscoverAllWithReport(broadcastIP string, scanCIDR string, timeout time.Duration, concurrency int) ([]DiscoveredDevice, []error)
+
 // Discover EIP devices only (Allen-Bradley, Omron NJ/NX)
 func DiscoverEIPOnly(broadcastIP string, timeout time.Duration) []DiscoveredDevice
 ```
@@ -306,11 +316,26 @@ func GetBroadcastAddresses() []string
 ### Error Detection
 
 ```go
+// Driver-level sentinel; errors created by the driver package for a lost or
+// absent link (e.g. ADSAdapter.Keepalive) wrap it.
+var ErrConnectionLost error
+
+// True if err wraps driver.ErrConnectionLost or any package sentinel:
+// logix, s7, omron, pccc or ads ErrConnectionLost.
+func IsConnectionLost(err error) bool
+
 // Check if an error indicates a connection problem
 func IsLikelyConnectionError(err error) bool
 ```
 
-Returns `true` for: EOF, network errors, connection reset/refused/aborted, broken pipe, timeouts, and other connection-related error patterns.
+Package sentinels do not match `errors.Is(err, driver.ErrConnectionLost)`; use
+`IsConnectionLost` to test for all of them. `IsLikelyConnectionError` returns
+`true` for `IsConnectionLost` errors, `io.EOF`, `io.ErrUnexpectedEOF`,
+`net.ErrClosed`, socket errnos (ECONNRESET, ECONNREFUSED, EPIPE, ECONNABORTED,
+ENETUNREACH, EHOSTUNREACH, ETIMEDOUT) and `net.Error` values including timeouts.
+Message keywords are only a last resort for errors flattened to text, and match
+whole words only (a tag named `Geofence` or `EOF_Count` is not an EOF). Every
+adapter's `IsConnectionError` delegates to it.
 
 ---
 
@@ -378,6 +403,13 @@ type DecodedTagValue struct {
 func (c *Client) ReadDecoded(names ...string) ([]*DecodedTagValue, error)
 func (c *Client) Describe(name string) (*metadata.Symbol, error)
 func NewADSAdapterWithOptions(cfg *PLCConfig, opts ...ads.Option) (*ADSAdapter, error)
+
+// ADS ReadState (command 4); used by ADSAdapter.Keepalive.
+func (c *Client) ReadState() (adsState, deviceState uint16, err error)
+
+// UDP Get Info (48899) unicast to ips plus broadcastAddrs in one pass, TCP 48898
+// fallback for non-responders, and a report of send/socket failures.
+func DiscoverWithReport(ips []net.IP, broadcastAddrs []string, timeout time.Duration, concurrency int) ([]DiscoveredDevice, []error)
 ```
 
 No fields were added to existing exported result or shared configuration structs.

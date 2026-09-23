@@ -12,10 +12,10 @@ func TestLookupSys0Info(t *testing.T) {
 		rowSize int
 	}{
 		{"1747", false, 10},
-		{"1761", false, 8},
-		{"1762", false, 10},
+		{"1761", true, 0}, // pycomm3: "Not sure if these are correct, never tested"
+		{"1762", true, 0}, // pycomm3: "not tested on 1200/1500"
 		{"1763", false, 10},
-		{"1764", false, 10},
+		{"1764", true, 0},
 		{"1766", false, 10},
 		{"9999", true, 0},
 		{"", true, 0},
@@ -87,43 +87,30 @@ func TestExtractCatalogFromIdentityProductName(t *testing.T) {
 }
 
 func TestParseFileDirectory(t *testing.T) {
-	// Build a test directory using SLC layout (RowSize=10, FileType offset=0x01, SizeElement offset=0x23 is too large for 10-byte row)
-	// For SLC (1747): FileType=0x01, SizeElement=0x23, FilePosition=79, RowSize=10
-	// But SizeElement=0x23=35 which is > RowSize=10, so we need to understand the actual layout.
-	// Let's use a simpler scenario: SizeElement is at byte offset within the row.
-	// Actually, looking at the code, for RowSize=10 and SizeElement=0x23, the offset is too large
-	// so elemCount will be 0. Let's test with MicroLogix 1000 layout which has RowSize=8.
-
-	// Use a custom Sys0Info for testing to verify the parsing logic
+	// Rows follow pycomm3's _parse_file0: [file type][size in bytes, LE].
+	// A small custom layout (rows at offset 0, 4 bytes apart) exercises the
+	// parser; TestParseFileDirectorySLCLayout covers the real SLC layout.
 	sys0 := &Sys0Info{
-		FileType:    0, // file type at byte 0 of each row
-		SizeElement: 2, // element count at bytes 2-3 (16-bit LE)
-		RowSize:     4, // 4 bytes per row for simplicity
-		SizeConst:   0,
+		RowSize: 4,
 	}
 
 	// Build 4 rows: file 0 = integer (50 elements), file 1 = placeholder, file 2 = float (10 elements), file 3 = timer (5 elements)
 	data := make([]byte, 4*4)
 
-	// Row 0: Integer file, 50 elements
+	// Row 0: Integer file, 50 elements = 100 bytes
 	data[0] = FileTypeInteger
-	data[1] = 0x00
-	binary.LittleEndian.PutUint16(data[2:4], 50)
+	binary.LittleEndian.PutUint16(data[1:3], 100)
 
 	// Row 1: Placeholder (deleted)
 	data[4] = FileTypePlaceholder
-	data[5] = 0x00
-	binary.LittleEndian.PutUint16(data[6:8], 0)
 
-	// Row 2: Float file, 10 elements
+	// Row 2: Float file, 10 elements = 40 bytes
 	data[8] = FileTypeFloat
-	data[9] = 0x00
-	binary.LittleEndian.PutUint16(data[10:12], 10)
+	binary.LittleEndian.PutUint16(data[9:11], 40)
 
-	// Row 3: Timer file, 5 elements
+	// Row 3: Timer file, 5 elements = 30 bytes
 	data[12] = FileTypeTimer
-	data[13] = 0x00
-	binary.LittleEndian.PutUint16(data[14:16], 5)
+	binary.LittleEndian.PutUint16(data[13:15], 30)
 
 	entries, err := parseFileDirectory(data, sys0)
 	if err != nil {

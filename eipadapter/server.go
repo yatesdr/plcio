@@ -28,6 +28,11 @@ func (a *Adapter) serveTCP(ctx context.Context) {
 			logging.DebugError("eipadapter", "accept", err)
 			continue
 		}
+		if !a.trackConn(conn) {
+			logging.DebugLog("eipadapter", "TCP reject %s: shutting down or MaxTCPConnections (%d) reached", conn.RemoteAddr(), a.cfg.MaxTCPConnections)
+			_ = conn.Close()
+			continue
+		}
 		logging.DebugLog("eipadapter", "TCP accept %s", conn.RemoteAddr())
 		a.wg.Add(1)
 		go a.handleConn(ctx, conn)
@@ -37,13 +42,25 @@ func (a *Adapter) serveTCP(ctx context.Context) {
 // handleConn services a single TCP session until close or error.
 func (a *Adapter) handleConn(ctx context.Context, conn net.Conn) {
 	defer a.wg.Done()
-	defer conn.Close()
+	defer a.untrackConn(conn)
 
 	var localSession uint32
+	// Sessions are bound to their TCP connection: drop it however we exit.
+	defer func() {
+		if localSession != 0 {
+			a.sessions.remove(localSession)
+		}
+	}()
+	defer recoverPanic("TCP session " + conn.RemoteAddr().String())
 
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+		select {
+		case <-a.stopCh:
+			return
+		default:
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		frame, err := eip.ReadFrame(conn)
@@ -68,6 +85,14 @@ func (a *Adapter) handleConn(ctx context.Context, conn net.Conn) {
 		case uint16(0x00): // NOP — no response per spec
 			continue
 		case eip.RegisterSession:
+			if localSession != 0 {
+				// Only one session per TCP connection. A second
+				// RegisterSession gets "invalid or unsupported
+				// encapsulation command" (0x0001), as OpENer does
+				// (CIP Vol 2, 2-4.4).
+				a.sendFrame(conn, frame.Reply(eip.EncapStatusInvalidCommand, nil))
+				continue
+			}
 			localSession = a.handleRegisterSession(conn, frame)
 		case eip.UnRegisterSession:
 			a.handleUnregisterSession(localSession, frame)
@@ -87,10 +112,6 @@ func (a *Adapter) handleConn(ctx context.Context, conn net.Conn) {
 		default:
 			a.sendFrame(conn, frame.Reply(eip.EncapStatusInvalidCommand, nil))
 		}
-	}
-
-	if localSession != 0 {
-		a.sessions.remove(localSession)
 	}
 }
 

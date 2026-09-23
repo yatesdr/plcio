@@ -1,6 +1,9 @@
 package omron
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // TagValue holds the result of a tag read operation.
 type TagValue struct {
@@ -23,6 +26,10 @@ func (tv *TagValue) GoValue() interface{} {
 	// STRING is special - the "array dimension" is the string length, not multiple strings
 	// Decode entire buffer as a single null-terminated string
 	if baseType == TypeString || baseType == TypeCIPSTRING {
+		if baseType == TypeCIPSTRING && !tv.bigEndian {
+			// CIP STRING payload carries a 16-bit LE length prefix.
+			return decodeCIPString(tv.Bytes)
+		}
 		return decodeString(tv.Bytes)
 	}
 
@@ -65,7 +72,7 @@ func (tv *TagValue) decodeArray(baseType uint16, elemSize int) interface{} {
 		}
 		return result
 
-	case TypeByte, TypeCIPUSINT:
+	case TypeByte, TypeCIPUSINT, TypeOmronByte:
 		result := make([]uint8, count)
 		for i := 0; i < count; i++ {
 			result[i] = tv.Bytes[i]
@@ -79,7 +86,7 @@ func (tv *TagValue) decodeArray(baseType uint16, elemSize int) interface{} {
 		}
 		return result
 
-	case TypeWord, TypeCIPUINT:
+	case TypeWord, TypeCIPUINT, TypeOmronWord:
 		result := make([]uint16, count)
 		for i := 0; i < count; i++ {
 			result[i] = DecodeValue(baseType, tv.Bytes[i*2:], tv.bigEndian).(uint16)
@@ -93,7 +100,7 @@ func (tv *TagValue) decodeArray(baseType uint16, elemSize int) interface{} {
 		}
 		return result
 
-	case TypeDWord, TypeCIPUDINT:
+	case TypeDWord, TypeCIPUDINT, TypeOmronDWord:
 		result := make([]uint32, count)
 		for i := 0; i < count; i++ {
 			result[i] = DecodeValue(baseType, tv.Bytes[i*4:], tv.bigEndian).(uint32)
@@ -114,7 +121,7 @@ func (tv *TagValue) decodeArray(baseType uint16, elemSize int) interface{} {
 		}
 		return result
 
-	case TypeLWord, TypeCIPULINT:
+	case TypeLWord, TypeCIPULINT, TypeOmronLWord:
 		result := make([]uint64, count)
 		for i := 0; i < count; i++ {
 			result[i] = DecodeValue(baseType, tv.Bytes[i*8:], tv.bigEndian).(uint64)
@@ -176,13 +183,24 @@ func (tv *TagValue) Bool() (bool, error) {
 	}
 }
 
-// Int returns the value as an int64.
+// Int returns the value as an int64. A value that does not fit (a ULINT above
+// math.MaxInt64, a NaN, infinite or out-of-range float) is an error rather
+// than a wrapped number; a finite float is truncated toward zero.
 func (tv *TagValue) Int() (int64, error) {
 	if tv == nil || tv.Error != nil {
 		return 0, tv.Error
 	}
 	v := tv.GoValue()
 	switch n := v.(type) {
+	case uint64:
+		if n > math.MaxInt64 {
+			return 0, fmt.Errorf("value %d overflows int64", n)
+		}
+		return int64(n), nil
+	case float32:
+		return floatToInt64(float64(n))
+	case float64:
+		return floatToInt64(n)
 	case bool:
 		if n {
 			return 1, nil
@@ -202,18 +220,14 @@ func (tv *TagValue) Int() (int64, error) {
 		return int64(n), nil
 	case uint32:
 		return int64(n), nil
-	case uint64:
-		return int64(n), nil
-	case float32:
-		return int64(n), nil
-	case float64:
-		return int64(n), nil
 	default:
 		return 0, fmt.Errorf("cannot convert %T to int64", v)
 	}
 }
 
-// Uint returns the value as a uint64.
+// Uint returns the value as a uint64. Negative values and NaN, infinite or
+// out-of-range floats are errors rather than wrapped numbers; a finite float
+// is truncated toward zero.
 func (tv *TagValue) Uint() (uint64, error) {
 	if tv == nil || tv.Error != nil {
 		return 0, tv.Error
@@ -226,13 +240,13 @@ func (tv *TagValue) Uint() (uint64, error) {
 		}
 		return 0, nil
 	case int8:
-		return uint64(n), nil
+		return intToUint64(int64(n))
 	case int16:
-		return uint64(n), nil
+		return intToUint64(int64(n))
 	case int32:
-		return uint64(n), nil
+		return intToUint64(int64(n))
 	case int64:
-		return uint64(n), nil
+		return intToUint64(n)
 	case uint8:
 		return uint64(n), nil
 	case uint16:
@@ -242,12 +256,33 @@ func (tv *TagValue) Uint() (uint64, error) {
 	case uint64:
 		return n, nil
 	case float32:
-		return uint64(n), nil
+		return floatToUint64(float64(n))
 	case float64:
-		return uint64(n), nil
+		return floatToUint64(n)
 	default:
 		return 0, fmt.Errorf("cannot convert %T to uint64", v)
 	}
+}
+
+func intToUint64(n int64) (uint64, error) {
+	if n < 0 {
+		return 0, fmt.Errorf("negative value %d cannot be converted to uint64", n)
+	}
+	return uint64(n), nil
+}
+
+func floatToInt64(f float64) (int64, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < math.MinInt64 || f >= math.MaxInt64 {
+		return 0, fmt.Errorf("value %v does not fit in int64", f)
+	}
+	return int64(f), nil
+}
+
+func floatToUint64(f float64) (uint64, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f <= -1 || f >= math.MaxUint64 {
+		return 0, fmt.Errorf("value %v does not fit in uint64", f)
+	}
+	return uint64(f), nil
 }
 
 // Float returns the value as a float64.

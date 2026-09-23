@@ -21,6 +21,17 @@ const (
 	cmdNodeAddressResponse = 0x00000001
 	cmdFINSFrameSend       = 0x00000002
 	cmdFINSFrameSendError  = 0x00000003
+	cmdConnectionConfirm   = 0x00000006 // CONNECTION CONFIRMATION (server to client; discarded)
+
+	// maxFINSTCPLength caps the FINS/TCP length field (bytes after the length
+	// field): W421 section 7-4-2 gives 00000014..000007E4 (20..2020) for FINS
+	// FRAME SEND, i.e. 8 bytes of command/error code plus a FINS frame of at
+	// most 2,012 bytes. Anything larger is a corrupt or hostile header.
+	maxFINSTCPLength = 2020
+
+	// maxFINSTCPDiscards bounds how many CONNECTION CONFIRMATION frames are
+	// skipped while waiting for one response.
+	maxFINSTCPDiscards = 16
 )
 
 // tcpTransport implements FINS over TCP.
@@ -87,9 +98,14 @@ func (t *tcpTransport) connect(address string, port int, network, node, unit, sr
 }
 
 // negotiateNodeAddress performs FINS/TCP node address exchange.
-// Per Omron W421 FINS/TCP specification:
-// - Request: FINS(4) + Length(4) + Command(4) + ErrorCode(4) + ClientNode(4) = 20 bytes
-// - Response: FINS(4) + Length(4) + Command(4) + ErrorCode(4) + ClientNode(4) + ServerNode(4) = 24 bytes
+// Per Omron W421 section 7-4-2 "FINS/TCP Headers":
+//   - FINS NODE ADDRESS DATA SEND (CLIENT TO SERVER): 'FINS', length 0x0C,
+//     command 0x00000000, error code 0, client node 0 (0 = allocate
+//     automatically; the server picks from its automatic range, default
+//     239..254) = 20 bytes.
+//   - FINS NODE ADDRESS DATA SEND (SERVER TO CLIENT): 'FINS', length 0x10,
+//     command 0x00000001, error code, client node 1..254, server node 1..254
+//     = 24 bytes. A non-zero error code means the client must close.
 func (t *tcpTransport) negotiateNodeAddress() error {
 	// Build Node Address Data Send request
 	req := make([]byte, tcpHeaderSize+4)
@@ -107,11 +123,10 @@ func (t *tcpTransport) negotiateNodeAddress() error {
 	// Error code: 0
 	binary.BigEndian.PutUint32(req[12:16], 0)
 
-	// Client node: Always request 0 (auto-assign) for FINS/TCP
-	// The PLC will assign a valid node within its supported range.
-	// Unlike UDP where we use IP-based node detection, TCP negotiation
-	// should let the PLC assign the node to avoid "node out of range" errors
-	// (error 0x00000002) on PLCs with limited node ranges like CP1L-E.
+	// Client node: always request 0 (automatic allocation) so the PLC
+	// assigns a node from its configured range, avoiding error 0x00000023
+	// (client FINS node address out of range) and 0x00000024 (same node as
+	// the server).
 	requestedNode := uint32(0)
 	binary.BigEndian.PutUint32(req[16:20], requestedNode)
 
@@ -129,8 +144,9 @@ func (t *tcpTransport) negotiateNodeAddress() error {
 		return fmt.Errorf("failed to send node address request: %w", err)
 	}
 
-	// Read response
-	resp := make([]byte, tcpHeaderSize+8)
+	// Read the 16-byte header first: on failure the PLC answers with a short
+	// frame (length 8, no node fields) carrying its error code.
+	resp := make([]byte, tcpHeaderSize)
 	if _, err := io.ReadFull(t.conn, resp); err != nil {
 		logging.DebugError("FINS/TCP", "read node address response", err)
 		return fmt.Errorf("failed to read node address response: %w", err)
@@ -146,26 +162,42 @@ func (t *tcpTransport) negotiateNodeAddress() error {
 
 	// Check length field
 	respLen := binary.BigEndian.Uint32(resp[4:8])
-	logging.DebugLog("FINS/TCP", "Response length field: %d (expected 12 for node address response)", respLen)
+	logging.DebugLog("FINS/TCP", "Response length field: %d (expected 16 for node address response)", respLen)
 
-	// Check command
 	cmd := binary.BigEndian.Uint32(resp[8:12])
-	logging.DebugLog("FINS/TCP", "Response command: 0x%08X (expected 0x%08X for node address response)", cmd, cmdNodeAddressResponse)
-	if cmd != cmdNodeAddressResponse {
-		return fmt.Errorf("unexpected command: 0x%08X (expected 0x%08X)", cmd, cmdNodeAddressResponse)
-	}
-
-	// Check error code
 	errCode := binary.BigEndian.Uint32(resp[12:16])
+	logging.DebugLog("FINS/TCP", "Response command: 0x%08X (expected 0x%08X for node address response)", cmd, cmdNodeAddressResponse)
+
+	// Check error code before insisting on the node fields
 	if errCode != 0 {
 		logging.DebugLog("FINS/TCP", "Node address error code: 0x%08X", errCode)
 		errMsg := finsNodeAddressErrorMsg(errCode)
 		return fmt.Errorf("node address error: 0x%08X (%s)", errCode, errMsg)
 	}
 
-	// Extract assigned addresses
-	t.localNode = byte(binary.BigEndian.Uint32(resp[16:20]))
-	t.serverNode = byte(binary.BigEndian.Uint32(resp[20:24]))
+	// Check command
+	if cmd != cmdNodeAddressResponse {
+		return fmt.Errorf("unexpected command: 0x%08X (expected 0x%08X)", cmd, cmdNodeAddressResponse)
+	}
+	if respLen < 16 || respLen > maxFINSTCPLength {
+		return fmt.Errorf("invalid node address response length: %d", respLen)
+	}
+
+	body := make([]byte, respLen-8)
+	if _, err := io.ReadFull(t.conn, body); err != nil {
+		logging.DebugError("FINS/TCP", "read node address response", err)
+		return fmt.Errorf("failed to read node address response: %w", err)
+	}
+	resp = append(resp, body...)
+
+	// Extract assigned addresses; W421 defines both as 1..254.
+	client := binary.BigEndian.Uint32(resp[16:20])
+	server := binary.BigEndian.Uint32(resp[20:24])
+	if client < 1 || client > 254 || server < 1 || server > 254 {
+		return fmt.Errorf("invalid node addresses in node address response: client=%d server=%d (want 1..254)", client, server)
+	}
+	t.localNode = byte(client)
+	t.serverNode = byte(server)
 
 	logging.DebugLog("FINS/TCP", "Node address negotiation success: localNode=%d (assigned), serverNode=%d", t.localNode, t.serverNode)
 
@@ -178,17 +210,32 @@ func (t *tcpTransport) negotiateNodeAddress() error {
 	return nil
 }
 
-// finsNodeAddressErrorMsg returns a human-readable message for FINS/TCP node address error codes.
+// finsNodeAddressErrorMsg returns a human-readable message for a FINS/TCP
+// header error code. The table is verbatim from W421-E1 section 7-4-2 (FINS
+// NODE ADDRESS DATA SEND and FINS FRAME SEND ERROR NOTIFICATION) and matches
+// libfins (github.com/lammertb/libfins, src/fins_io.c).
 func finsNodeAddressErrorMsg(errCode uint32) string {
 	switch errCode {
 	case 0x00000000:
 		return "normal"
 	case 0x00000001:
-		return "client node address already used"
+		return "header is not 'FINS'"
 	case 0x00000002:
-		return "client node address out of range"
+		return "data length too long"
 	case 0x00000003:
-		return "server node address already used"
+		return "command not supported"
+	case 0x00000020:
+		return "all connections are in use"
+	case 0x00000021:
+		return "specified node is already connected"
+	case 0x00000022:
+		return "attempt to access a protected node from an unspecified IP address"
+	case 0x00000023:
+		return "client FINS node address out of range"
+	case 0x00000024:
+		return "same FINS node address used by client and server"
+	case 0x00000025:
+		return "all node addresses available for allocation are in use"
 	default:
 		return "unknown error"
 	}
@@ -255,14 +302,14 @@ func (t *tcpTransport) sendCommand(command uint16, data []byte) ([]byte, error) 
 		DNA: t.network,
 		DA1: t.plcNode,
 		DA2: t.unit,
-		SNA: t.network,
+		SNA: 0x00, // Source network: local network (this host)
 		SA1: t.localNode,
 		SA2: 0x00,
 		SID: sid,
 	}
 
 	logging.DebugLog("FINS/TCP", "Command 0x%04X: SID=%d DNA=%d DA1=%d DA2=%d SNA=%d SA1=%d dataLen=%d",
-		command, sid, t.network, t.plcNode, t.unit, t.network, t.localNode, len(data))
+		command, sid, t.network, t.plcNode, t.unit, header.SNA, t.localNode, len(data))
 
 	finsFrame := FINSFrame{
 		Header:  header,
@@ -293,44 +340,66 @@ func (t *tcpTransport) sendCommand(command uint16, data []byte) ([]byte, error) 
 		return nil, fmt.Errorf("failed to send: %w", err)
 	}
 
-	// Read response header
+	// Read response header. Any framing error below leaves the byte stream
+	// in an unknown position, so the connection is treated as broken exactly
+	// like an I/O error.
 	respHeader := make([]byte, tcpHeaderSize)
-	if _, err := io.ReadFull(t.conn, respHeader); err != nil {
-		t.connected = false
-		logging.DebugDisconnect("FINS/TCP", t.address, fmt.Sprintf("recv header failed: %v", err))
-		return nil, fmt.Errorf("failed to read response header: %w", err)
-	}
+	var respLen, cmd uint32
+	for discards := 0; ; discards++ {
+		if _, err := io.ReadFull(t.conn, respHeader); err != nil {
+			t.connected = false
+			logging.DebugDisconnect("FINS/TCP", t.address, fmt.Sprintf("recv header failed: %v", err))
+			return nil, fmt.Errorf("failed to read response header: %w", err)
+		}
 
-	// Verify magic
-	if string(respHeader[0:4]) != finsTCPMagic {
-		logging.DebugLog("FINS/TCP", "Invalid FINS response magic: %s", string(respHeader[0:4]))
-		return nil, fmt.Errorf("invalid FINS response magic")
-	}
+		// Verify magic
+		if string(respHeader[0:4]) != finsTCPMagic {
+			logging.DebugLog("FINS/TCP", "Invalid FINS response magic: %s", string(respHeader[0:4]))
+			return nil, t.framingError(fmt.Errorf("invalid FINS response magic"))
+		}
 
-	// Get length
-	respLen := binary.BigEndian.Uint32(respHeader[4:8])
-	if respLen < 8 {
-		logging.DebugLog("FINS/TCP", "Invalid response length: %d", respLen)
-		return nil, fmt.Errorf("invalid response length: %d", respLen)
+		// Get length
+		respLen = binary.BigEndian.Uint32(respHeader[4:8])
+		if respLen < 8 || respLen > maxFINSTCPLength {
+			logging.DebugLog("FINS/TCP", "Invalid response length: %d", respLen)
+			return nil, t.framingError(fmt.Errorf("invalid response length: %d", respLen))
+		}
+
+		cmd = binary.BigEndian.Uint32(respHeader[8:12])
+		if cmd != cmdConnectionConfirm {
+			break
+		}
+		// W421 7-4-2: the server sends CONNECTION CONFIRMATION when another
+		// client presents our IP address and node; "the client that
+		// receives this command will simply destroy the frames".
+		if discards >= maxFINSTCPDiscards {
+			return nil, t.framingError(fmt.Errorf("too many CONNECTION CONFIRMATION frames"))
+		}
+		if extra := int64(respLen) - 8; extra > 0 {
+			if _, err := io.CopyN(io.Discard, t.conn, extra); err != nil {
+				t.connected = false
+				return nil, fmt.Errorf("failed to read response: %w", err)
+			}
+		}
+		logging.DebugLog("FINS/TCP", "Discarded CONNECTION CONFIRMATION frame")
 	}
 
 	// Check command
-	cmd := binary.BigEndian.Uint32(respHeader[8:12])
 	if cmd == cmdFINSFrameSendError {
 		errCode := binary.BigEndian.Uint32(respHeader[12:16])
 		logging.DebugLog("FINS/TCP", "FINS frame error: 0x%08X", errCode)
-		return nil, fmt.Errorf("FINS frame error: 0x%08X", errCode)
+		return nil, t.framingError(fmt.Errorf("FINS frame error: 0x%08X (%s)", errCode, finsNodeAddressErrorMsg(errCode)))
 	}
 	if cmd != cmdFINSFrameSend {
 		logging.DebugLog("FINS/TCP", "Unexpected response command: 0x%08X", cmd)
-		return nil, fmt.Errorf("unexpected response command: 0x%08X", cmd)
+		return nil, t.framingError(fmt.Errorf("unexpected response command: 0x%08X", cmd))
 	}
 
 	// Read FINS frame
 	finsLen := int(respLen) - 8
 	if finsLen <= 0 {
 		logging.DebugLog("FINS/TCP", "Empty FINS response")
-		return nil, fmt.Errorf("empty FINS response")
+		return nil, t.framingError(fmt.Errorf("empty FINS response"))
 	}
 
 	respFrame := make([]byte, finsLen)
@@ -348,16 +417,28 @@ func (t *tcpTransport) sendCommand(command uint16, data []byte) ([]byte, error) 
 	resp, err := ParseFINSResponse(respFrame)
 	if err != nil {
 		logging.DebugError("FINS/TCP", "parse response", err)
+		return nil, t.framingError(err)
+	}
+	if resp.Header.ICF&0x40 == 0 || resp.Header.SID != sid || resp.Command != command {
+		return nil, t.framingError(fmt.Errorf("mismatched FINS response: ICF=0x%02X SID=%d cmd=0x%04X (want SID=%d cmd=0x%04X)",
+			resp.Header.ICF, resp.Header.SID, resp.Command, sid, command))
+	}
+
+	// Check end code (status flags masked; see FINSEndCodeError)
+	if err := finsResponseError(resp.EndCode, resp.Data); err != nil {
+		logging.DebugLog("FINS/TCP", "FINS end code error: 0x%04X", resp.EndCode)
 		return nil, err
 	}
 
-	// Check end code
-	if resp.EndCode != FINSEndOK {
-		logging.DebugLog("FINS/TCP", "FINS end code error: 0x%04X", resp.EndCode)
-		return nil, FINSEndCodeError(resp.EndCode)
-	}
-
 	return resp.Data, nil
+}
+
+// framingError marks the connection broken after a framing/protocol error and
+// returns err. Must be called with t.mu held.
+func (t *tcpTransport) framingError(err error) error {
+	t.connected = false
+	logging.DebugDisconnect("FINS/TCP", t.address, fmt.Sprintf("framing error: %v", err))
+	return err
 }
 
 // readWords reads words from a memory area.

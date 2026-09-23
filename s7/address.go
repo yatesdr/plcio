@@ -58,6 +58,9 @@ var (
 	// Simple DB addresses: DB1.0 or DB1.0[6] (offset only, type from config, optional array count)
 	reDBSimple = regexp.MustCompile(`^DB(\d+)\.(\d+)(?:\[(\d+)\])?$`)
 
+	// Simple DB bit addresses: DB1.12.0 (same as DB1.DBX12.0)
+	reDBSimpleBit = regexp.MustCompile(`^DB(\d+)\.(\d+)\.(\d)$`)
+
 	// I/Q/M addresses: M0.0 (bit), MB0 (byte), MW0 (word), MD0 (dword)
 	reIQM = regexp.MustCompile(`^([IQM])([XBWDL])?(\d+)(?:\.(\d))?$`)
 
@@ -65,14 +68,41 @@ var (
 	reTC = regexp.MustCompile(`^([TC])(\d+)$`)
 )
 
+const (
+	// maxDBNumber is the largest DB number the 16-bit S7ANY field can carry.
+	maxDBNumber = 0xFFFF
+	// maxByteOffset is the largest byte offset the 24-bit S7ANY bit address
+	// (byte offset << 3 | bit) can carry.
+	maxByteOffset = 0xFFFFFF >> 3
+)
+
+// parseDBNumber parses a DB number and rejects values the protocol cannot encode.
+func parseDBNumber(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n > maxDBNumber {
+		return 0, fmt.Errorf("DB number %s out of range (max %d)", s, maxDBNumber)
+	}
+	return n, nil
+}
+
+// parseByteOffset parses a byte offset and rejects values the protocol cannot encode.
+func parseByteOffset(s string) (int, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil || n > maxByteOffset {
+		return 0, fmt.Errorf("byte offset %s out of range (max %d)", s, maxByteOffset)
+	}
+	return n, nil
+}
+
 // ParseAddress parses an S7 address string and returns an Address.
 // Supported formats:
 //   - DB1.0      - Data Block with offset (requires type hint for size)
+//   - DB1.0.0    - Data Block bit (same as DB1.DBX0.0)
 //   - DB1.DBX0.0 - Data Block bit
 //   - DB1.DBB0   - Data Block byte
 //   - DB1.DBW0   - Data Block word
 //   - DB1.DBD0   - Data Block dword
-//   - M0.0       - Merker bit
+//   - M0.0       - Merker bit (M0 without a bit number is also M0.0)
 //   - MB0        - Merker byte
 //   - MW0        - Merker word
 //   - MD0        - Merker dword
@@ -89,6 +119,11 @@ func ParseAddress(addr string) (*Address, error) {
 	// Try simple DB address first (DB1.0 format)
 	if m := reDBSimple.FindStringSubmatch(addr); m != nil {
 		return parseDBSimpleAddress(m)
+	}
+
+	// Try simple DB bit address (DB1.12.0 format)
+	if m := reDBSimpleBit.FindStringSubmatch(addr); m != nil {
+		return parseDBAddress([]string{m[0], m[1], "X", m[2], m[3]})
 	}
 
 	// Try full DB address (DB1.DBD0 format)
@@ -112,12 +147,21 @@ func ParseAddress(addr string) (*Address, error) {
 // parseDBSimpleAddress parses simple DB addresses like "DB1.0" or "DB1.0[6]" for arrays.
 // Returns an address with no type/size - caller must set these based on configuration.
 func parseDBSimpleAddress(m []string) (*Address, error) {
-	dbNum, _ := strconv.Atoi(m[1])
-	offset, _ := strconv.Atoi(m[2])
+	dbNum, err := parseDBNumber(m[1])
+	if err != nil {
+		return nil, err
+	}
+	offset, err := parseByteOffset(m[2])
+	if err != nil {
+		return nil, err
+	}
 
 	count := 1
 	if m[3] != "" {
-		count, _ = strconv.Atoi(m[3])
+		count, err = strconv.Atoi(m[3])
+		if err != nil || count > maxByteOffset+1 {
+			return nil, fmt.Errorf("array count %s out of range", m[3])
+		}
 		if count < 1 {
 			count = 1
 		}
@@ -135,9 +179,15 @@ func parseDBSimpleAddress(m []string) (*Address, error) {
 }
 
 func parseDBAddress(m []string) (*Address, error) {
-	dbNum, _ := strconv.Atoi(m[1])
+	dbNum, err := parseDBNumber(m[1])
+	if err != nil {
+		return nil, err
+	}
 	typeLetter := m[2]
-	offset, _ := strconv.Atoi(m[3])
+	offset, err := parseByteOffset(m[3])
+	if err != nil {
+		return nil, err
+	}
 
 	addr := &Address{
 		Area:     AreaDB,
@@ -194,7 +244,10 @@ func parseIQMAddress(m []string) (*Address, error) {
 	if typeLetter == "" {
 		typeLetter = "X" // Default to bit if no type specified
 	}
-	offset, _ := strconv.Atoi(m[3])
+	offset, err := parseByteOffset(m[3])
+	if err != nil {
+		return nil, err
+	}
 
 	addr := &Address{
 		Area:   area,
@@ -246,7 +299,10 @@ func parseTCAddress(m []string) (*Address, error) {
 		area = AreaC
 	}
 
-	num, _ := strconv.Atoi(m[2])
+	num, err := strconv.Atoi(m[2])
+	if err != nil || num > 0xFFFF {
+		return nil, fmt.Errorf("%s number %s out of range (max 65535)", m[1], m[2])
+	}
 
 	return &Address{
 		Area:     area,

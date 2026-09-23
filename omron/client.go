@@ -150,6 +150,10 @@ func Connect(address string, opts ...Option) (*Client, error) {
 	logging.DebugLog("Omron", "Connect to %s transport=%s port=%d network=%d node=%d unit=%d srcNode=%d timeout=%v",
 		address, c.transport, c.port, c.network, c.node, c.unit, c.srcNode, c.timeout)
 
+	if c.port < 0 || c.port > 65535 {
+		return nil, fmt.Errorf("invalid port %d (want 1..65535, or 0 for the default)", c.port)
+	}
+
 	switch c.transport {
 	case TransportFINS:
 		// Try TCP first (more reliable), fall back to UDP if TCP fails
@@ -261,7 +265,7 @@ func (c *Client) connectFINSTCP() (*Client, error) {
 // connectEIP establishes an EIP/CIP connection.
 func (c *Client) connectEIP() (*Client, error) {
 	port := c.port
-	if port == defaultFINSPort {
+	if port == defaultFINSPort || port <= 0 {
 		port = 44818 // Standard EIP port
 	}
 
@@ -631,6 +635,17 @@ func (c *Client) Keepalive() error {
 		return fmt.Errorf("Keepalive: expected 2 CPF items")
 	}
 
+	_, cipResp, err := c.cipConn.UnwrapConnected(resp.Items[1].Data)
+	if err != nil {
+		return fmt.Errorf("Keepalive: %w", err)
+	}
+	if len(cipResp) < 4 {
+		return fmt.Errorf("Keepalive: CIP response too short: %d bytes", len(cipResp))
+	}
+	if status := cipResp[2]; status != 0x00 {
+		return fmt.Errorf("Keepalive: CIP error 0x%02X (%s)", status, cipStatusMessage(status))
+	}
+
 	return nil
 }
 
@@ -720,7 +735,7 @@ func (c *Client) Reconnect() error {
 
 	case TransportEIP:
 		port := c.port
-		if port == defaultFINSPort {
+		if port == defaultFINSPort || port <= 0 {
 			port = 44818
 		}
 		c.cipConn = nil
@@ -751,6 +766,9 @@ func (c *Client) ConnectionMode() string {
 		return "Not connected"
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	switch c.transport {
 	case TransportFINSUDP, TransportFINSTCP:
 		if c.fins != nil {
@@ -758,7 +776,7 @@ func (c *Client) ConnectionMode() string {
 		}
 	case TransportEIP:
 		port := c.port
-		if port == defaultFINSPort {
+		if port == defaultFINSPort || port <= 0 {
 			port = 44818
 		}
 		if c.cipConn != nil {
@@ -782,6 +800,8 @@ func (c *Client) SetDebug(enabled bool) {
 
 // GetSourceNode returns the source node number.
 func (c *Client) GetSourceNode() byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.fins != nil {
 		return c.fins.getSourceNode()
 	}
@@ -823,7 +843,11 @@ func (c *Client) getEIPDeviceInfo() (*DeviceInfo, error) {
 		return nil, err
 	}
 
-	if len(respData) < 20 {
+	// Identity object (class 1) Get Attributes All, CIP Vol. 1 5-2: vendor
+	// ID (UINT), device type (UINT), product code (UINT), revision (major,
+	// minor USINT), status (WORD), serial number (UDINT), product name
+	// (SHORT_STRING).
+	if len(respData) < 14 {
 		return &DeviceInfo{
 			Model: "Omron NJ/NX PLC",
 		}, nil
@@ -832,20 +856,15 @@ func (c *Client) getEIPDeviceInfo() (*DeviceInfo, error) {
 	info := &DeviceInfo{
 		VendorID:     binary.LittleEndian.Uint16(respData[0:2]),
 		ProductCode:  binary.LittleEndian.Uint16(respData[4:6]),
-		SerialNumber: binary.LittleEndian.Uint32(respData[8:12]),
+		Version:      fmt.Sprintf("%d.%d", respData[6], respData[7]),
+		SerialNumber: binary.LittleEndian.Uint32(respData[10:14]),
 	}
 
-	if len(respData) >= 8 {
-		info.Version = fmt.Sprintf("%d.%d", respData[6], respData[7])
-	}
-
-	if len(respData) > 12 {
-		nameOffset := 12
-		if nameOffset < len(respData) {
-			nameLen := int(respData[nameOffset])
-			if nameOffset+1+nameLen <= len(respData) {
-				info.Model = string(respData[nameOffset+1 : nameOffset+1+nameLen])
-			}
+	const nameOffset = 14
+	if nameOffset < len(respData) {
+		nameLen := int(respData[nameOffset])
+		if nameOffset+1+nameLen <= len(respData) {
+			info.Model = string(respData[nameOffset+1 : nameOffset+1+nameLen])
 		}
 	}
 
@@ -956,8 +975,9 @@ func (c *Client) sendCIPRequest(req cip.Request) ([]byte, error) {
 	logging.DebugLog("Omron", "sendCIPRequest response: service=0x%02X status=0x%02X extStatus=%d dataLen=%d",
 		respData[0], status, extStatusSize, len(respData))
 
-	// Status 0x00 = success, 0x06 = partial transfer (OK for reads)
-	if status != 0x00 && status != 0x06 {
+	// Status 0x00 = success, 0x06 = partial transfer (OK for reads only: a
+	// partial transfer on a write/set service means the data was not applied)
+	if status != 0x00 && (status != 0x06 || isCIPWriteService(req.Service)) {
 		return nil, fmt.Errorf("CIP error 0x%02X", status)
 	}
 
@@ -966,6 +986,16 @@ func (c *Client) sendCIPRequest(req cip.Request) ([]byte, error) {
 	}
 
 	return respData[dataStart:], nil
+}
+
+// isCIPWriteService reports whether a CIP service modifies data.
+func isCIPWriteService(service byte) bool {
+	switch service {
+	case svcWriteTag, 0x4E, 0x53, // Write Tag, Read-Modify-Write Tag, Write Tag Fragmented
+		0x02, 0x10: // Set Attributes All, Set Attribute Single
+		return true
+	}
+	return false
 }
 
 // sendCIPRequestWithStatus sends a CIP request and returns data + CIP general status.
@@ -1087,6 +1117,9 @@ func (c *Client) writeFINS(address string, value interface{}, typeHint string) e
 			if len(bits) == 0 || len(bits) > FINSMaxBitsPerRead {
 				return fmt.Errorf("BOOL array write requires 1..%d bits", FINSMaxBitsPerRead)
 			}
+			if len(bits) > parsed.Count {
+				return fmt.Errorf("write of %d bits to %q exceeds its declared count of %d", len(bits), address, parsed.Count)
+			}
 			return c.fins.writeBits(BitAreaFromWordArea(parsed.MemoryArea), parsed.Address, parsed.BitOffset, bits)
 		}
 		var bitVal bool
@@ -1113,6 +1146,26 @@ func (c *Client) writeFINS(address string, value interface{}, typeHint string) e
 			logging.DebugLog("Omron", "Write bit error for %q: %v", address, err)
 		}
 		return err
+	}
+
+	// Never write past the declared extent (element size x count, rounded
+	// up to whole words, as for reads) into adjacent memory.
+	capacityWords := (TypeSize(parsed.TypeCode)*parsed.Count + 1) / 2
+	if capacityWords < 1 {
+		capacityWords = 1
+	}
+	if base := BaseType(parsed.TypeCode); (base == TypeString || base == TypeCIPSTRING) &&
+		(len(data)+1)/2 > capacityWords && len(data)-1 <= capacityWords*2 {
+		// The string exactly fills the declared buffer: omit the terminator
+		// (reads stop at the end of the buffer).
+		data = data[:len(data)-1]
+	}
+	if needed := (len(data) + 1) / 2; needed > capacityWords {
+		return fmt.Errorf("write to %q needs %d words but the address declares %d (%s x %d); use a [count] suffix large enough for the value",
+			address, needed, capacityWords, TypeName(parsed.TypeCode), parsed.Count)
+	}
+	if (len(data)+1)/2 > finsMaxWordsPerWrite {
+		return fmt.Errorf("write to %q of %d words exceeds the FINS limit of %d words per write", address, (len(data)+1)/2, finsMaxWordsPerWrite)
 	}
 
 	words := make([]uint16, (len(data)+1)/2)
@@ -1153,11 +1206,10 @@ func (c *Client) writeEIP(tagName string, value interface{}) error {
 		return fmt.Errorf("failed to read tag type: %w", err)
 	}
 
-	if len(respData) < 2 {
-		return fmt.Errorf("response too short")
+	dataType, _, err := parseCIPReadReply(respData)
+	if err != nil {
+		return fmt.Errorf("failed to read tag type: %w", err)
 	}
-
-	dataType := binary.LittleEndian.Uint16(respData[0:2])
 
 	// Encode value
 	encodedData, err := EncodeValue(value, dataType, false)
@@ -1174,10 +1226,11 @@ func (c *Client) writeEIP(tagName string, value interface{}) error {
 	if count == 0 || count > 65535 {
 		return fmt.Errorf("array write requires 1..65535 elements")
 	}
-	writeData := make([]byte, 4+len(encodedData))
-	binary.LittleEndian.PutUint16(writeData[0:2], dataType)
-	binary.LittleEndian.PutUint16(writeData[2:4], uint16(count))
-	copy(writeData[4:], encodedData)
+	// W506 7-7-2: data type, AddInfo length, Num of Element, data.
+	writeData := make([]byte, 0, 4+len(encodedData))
+	writeData = append(writeData, cipWireType(dataType)...)
+	writeData = binary.LittleEndian.AppendUint16(writeData, uint16(count))
+	writeData = append(writeData, encodedData...)
 
 	writeReq := cip.Request{
 		Service: svcWriteTag,
@@ -1238,6 +1291,11 @@ func (c *Client) AllTags() ([]TagInfo, error) {
 	tags, err := c.allTagsEIP()
 	if err == nil && len(tags) > 0 {
 		return tags, nil
+	}
+	if err != nil && isEIPConnectionError(err) {
+		// The link dropped: report it (with any partial list) instead of
+		// retrying against a dead connection and returning an empty success.
+		return tags, err
 	}
 
 	// Fall back to legacy instance-by-instance discovery

@@ -2,6 +2,103 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.3] - 2026-09-22
+
+Production-hardening maintenance release. Hardware-verified on a ControlLogix L7, a
+Micro820, an S7-1200 and a Beckhoff CX (TwinCAT 3); see
+[docs/hardware-verification.md](docs/hardware-verification.md) for the
+evidence and the remaining lab checklist (Omron, SLC/MicroLogix/PLC-5,
+EtherNet/IP adapter, S7-300/400).
+
+### Fixed: wrong data (hardware-confirmed)
+- S7: one failed item in a batch read shifted later values onto the wrong tags.
+- S7: single-bit reads other than `.0` always returned false.
+- S7: REAL reads returned one byte, and REAL writes were rejected by the CPU.
+- Logix: structures larger than the connection size returned only the 2-byte
+  handle, without an error.
+- Logix and Micro800: STRING writes were rejected (0x2107). Scalar and array
+  strings now use the controller's native layout, with no truncation.
+- Logix: array indexes such as `Arr[1,2]`, `Arr[-1]` and `Arr[x]` silently
+  addressed the wrong element. Multi-dimensional indexes are now encoded
+  correctly, and invalid ones are errors.
+
+### Fixed: crashes, protocol and resource handling
+- Panics on malformed packets: an EtherNet/IP CPF length overflow, Multiple
+  Service reply offsets, and Logix additional-status slicing.
+- The eipadapter crashed on a Forward_Close sent over the same connection.
+- Logix Forward Close didn't match the Forward Open, leaving controller
+  connections open. The originator serial is now random per connection.
+- Connected replies are checked for connection ID and sequence number. S7
+  responses are checked for PDU reference, function code and item count.
+- EtherNet/IP and FINS/TCP framing errors now drop the connection instead of
+  leaving the stream out of step.
+- Truncated reads and partial transfers are errors, never short data returned
+  as success.
+- All driver adapters are safe for concurrent use. `Connect` closes the
+  previous client.
+
+### Fixed: silent truncation and unsafe writes
+- Numeric writes of every Go numeric kind are range-checked. Previously only
+  int64/uint64/float64 were checked, so e.g. a Go `int` of 300 to a SINT
+  stored 44.
+- S7:
+  - An untyped write to an offset-only address is an error (it used to write
+    8 bytes).
+  - Oversized writes, over-length strings and out-of-range addresses are
+    rejected.
+- PCCC:
+  - SLC/MicroLogix bit writes use the masked write (0xAB). PLC-5 uses
+    Read-Modify-Write (0x26).
+  - ST strings are byte-swapped correctly.
+  - File-directory discovery uses the documented layout.
+- Omron:
+  - FINS 32/64-bit values use Omron's low-word-first order.
+  - Non-fatal CPU status bits no longer fail every command.
+  - The 0x0104 multi-read request and reply formats are corrected.
+  - Bare `C`/`T` address prefixes are rejected as ambiguous (use `CIO`/`CNT`,
+    `TK`/`TIM`).
+  - Write bounds are enforced.
+  - NJ/NX STRING, TIME and DATE types are handled.
+
+### Added
+- Logix: bit access on integer tags (`Tag.5`), with atomic writes (CIP 0x4E).
+- S7:
+  - TIME writes, and signed TIME reads.
+  - S5TIME, DATE, TIME_OF_DAY, DATE_AND_TIME and DTL.
+  - UTF-16 WSTRING.
+  - Snap7-compatible timer/counter access.
+  - Real CPU info (order number and firmware).
+  - A real Keepalive.
+- PLC-5: typed read/write (0x68/0x67) and octal I/O addressing.
+- ADS:
+  - Case-insensitive symbol names.
+  - ReadState Keepalive.
+  - UDP 48899 discovery that reports the device's real AMS Net ID.
+  - Handle release on cache invalidation, and cache eviction instead of
+    permanent limit errors.
+- Discovery:
+  - Unicast EtherNet/IP ListIdentity across the scan CIDR, which reaches
+    routed subnets.
+  - `DiscoverAllWithReport`, which also returns per-protocol errors.
+- Driver:
+  - `driver.ErrConnectionLost` and `driver.IsConnectionLost`.
+  - Family names are case-insensitive.
+- eipadapter:
+  - Connection events and Run/Idle state.
+  - Connection and session limits, and a watchdog from Forward_Open.
+  - Forward_Open validation.
+  - Prompt shutdown and panic recovery.
+
+### Behaviour changes to review
+- Invalid inputs that used to be silently truncated or redirected now return
+  errors. This covers range, size, address and type checks, unknown PLC
+  families, and ambiguous Omron `C`/`T` prefixes.
+- S7 `Read` uses the data types configured in `PLCConfig.Tags` when the
+  request has no hint.
+- Logix `Driver.Read` always returns one result per request, in request order.
+- FINS DINT/REAL/LREAL values change word order. Any application-side word
+  swap must be removed.
+
 ## [0.3.2] - 2026-09-22
 
 ### Fixed

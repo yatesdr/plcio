@@ -2,6 +2,7 @@ package s7
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,6 +30,7 @@ const (
 	cotpParamTPDUSize = 0xC0
 
 	// Default PDU sizes
+	minPDUSize       = 240
 	defaultPDUSize   = 480
 	maxPDUSize       = 960
 	cotpTPDUSize1024 = 0x0A // 2^10 = 1024 bytes
@@ -66,6 +68,10 @@ func (t *transport) connect(address string, rack, slot int) error {
 		address = fmt.Sprintf("%s:%d", address, defaultS7Port)
 	} else if port == "" {
 		address = fmt.Sprintf("%s:%d", host, defaultS7Port)
+	}
+
+	if err := validateRackSlot(rack, slot); err != nil {
+		return err
 	}
 
 	t.address = address
@@ -196,7 +202,94 @@ func (t *transport) sendReceive(s7Request []byte) ([]byte, error) {
 		return nil, fmt.Errorf("expected COTP DT, got 0x%02X", response[1])
 	}
 
+	// A response that does not answer this request (stale, reordered or
+	// foreign PDU) means the request/response stream is out of step; every
+	// later exchange would be misattributed, so treat it like an I/O error.
+	if err := checkResponse(s7Request, response[3:]); err != nil {
+		t.connected = false
+		logging.DebugDisconnect("S7", t.address, err.Error())
+		return nil, err
+	}
+
 	return response[3:], nil
+}
+
+// ErrProtocol marks an S7 response that does not answer the request that was
+// sent (wrong PDU reference, message type, function code or item count). The
+// connection is marked lost when it occurs; such errors also match
+// ErrConnectionLost.
+var ErrProtocol = errors.New("s7: protocol error")
+
+func protocolError(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s; connection marked lost: %w", ErrProtocol, fmt.Sprintf(format, args...), ErrConnectionLost)
+}
+
+// checkResponse verifies that resp (an S7 PDU) answers req: same PDU
+// reference, a matching message type, and for Job requests the same function
+// code and, for read/write, the same item count.
+func checkResponse(req, resp []byte) error {
+	if len(req) < 10 {
+		return nil // not an S7 PDU we built; nothing to match against
+	}
+	if len(resp) < 10 {
+		return protocolError("response too short (%d bytes)", len(resp))
+	}
+	if resp[0] != s7ProtocolID {
+		return protocolError("invalid protocol ID 0x%02X", resp[0])
+	}
+	reqRef := binary.BigEndian.Uint16(req[4:6])
+	respRef := binary.BigEndian.Uint16(resp[4:6])
+	switch req[1] {
+	case s7MsgJob:
+		if resp[1] != s7MsgAck && resp[1] != s7MsgAckData {
+			return protocolError("unexpected message type 0x%02X for a job request", resp[1])
+		}
+		if len(resp) < 12 {
+			return protocolError("response too short (%d bytes)", len(resp))
+		}
+	case s7MsgUserData:
+		if resp[1] != s7MsgUserData {
+			return protocolError("unexpected message type 0x%02X for a userdata request", resp[1])
+		}
+	}
+	if respRef != reqRef {
+		return protocolError("response PDU reference 0x%04X does not match request 0x%04X", respRef, reqRef)
+	}
+	if req[1] != s7MsgJob || len(req) < 12 {
+		return nil
+	}
+	paramLen := int(binary.BigEndian.Uint16(resp[6:8]))
+	if 12+paramLen > len(resp) {
+		return protocolError("parameter length %d exceeds response (%d bytes)", paramLen, len(resp))
+	}
+	fn := req[10]
+	if paramLen == 0 {
+		// Error acknowledgements may carry no parameters; a successful
+		// read/write answer always echoes function and item count.
+		if resp[10] == 0 && resp[11] == 0 && resp[1] == s7MsgAckData && (fn == s7FuncRead || fn == s7FuncWrite) {
+			return protocolError("function 0x%02X answered without parameters", fn)
+		}
+		return nil
+	}
+	if resp[12] != fn {
+		return protocolError("response function 0x%02X does not match request 0x%02X", resp[12], fn)
+	}
+	if (fn == s7FuncRead || fn == s7FuncWrite) && paramLen >= 2 && resp[13] != req[11] {
+		return protocolError("response carries %d items for a %d-item request", resp[13], req[11])
+	}
+	return nil
+}
+
+// validateRackSlot rejects rack/slot values that do not fit the remote TSAP
+// byte (rack in bits 7-5, slot in bits 4-0).
+func validateRackSlot(rack, slot int) error {
+	if rack < 0 || rack > 7 {
+		return fmt.Errorf("rack %d out of range (0-7)", rack)
+	}
+	if slot < 0 || slot > 31 {
+		return fmt.Errorf("slot %d out of range (0-31)", slot)
+	}
+	return nil
 }
 
 // sendTPKT sends data with TPKT framing.
