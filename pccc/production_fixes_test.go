@@ -339,6 +339,9 @@ func slcFile0(rows [][3]byte) []byte {
 	file0 := make([]byte, 79+10*len(rows))
 	for i, r := range rows {
 		copy(file0[79+10*i:], r[:])
+		if FileTypePrefix(r[0]) != "" || r[0] == FileTypePlaceholder || r[0] == fileTypePLS {
+			binary.LittleEndian.PutUint16(file0[52:54], binary.LittleEndian.Uint16(file0[52:54])+1)
+		}
 	}
 	return file0
 }
@@ -443,7 +446,7 @@ func TestGetFileDirectorySLCRequests(t *testing.T) {
 	checkDirectory(t, entries)
 	mu.Lock()
 	defer mu.Unlock()
-	want := [][]byte{{0x04, 0x00, 0x01, 0x23}, {0x50, 0x00, 0x01, 0x00}, {0x50, 0x00, 0x01, 0x28}, {byte(len(file0) - 160), 0x00, 0x01, 0x50}}
+	want := [][]byte{{0x04, 0x00, 0x01, 0x23}, {0x50, 0x00, 0x01, 0x00}, {0x50, 0x00, 0x01, 0x28}, {byte(len(file0) - 160), 0x00, 0x01, 0x50}, {0x04, 0x00, 0x01, 0x23}}
 	if len(reads) != len(want) {
 		t.Fatalf("reads % X, want % X", reads, want)
 	}

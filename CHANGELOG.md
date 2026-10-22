@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.4] - 2026-10-21
+
+- PCCC discovery accepts diagnostic names 5/03, 5/04 and 5/05 and falls back
+  to ListIdentity only for direct connections. The 5/03 and 5/04 names use
+  the extrapolated 1747 layout.
+- Validate SLC directory size, chunk lengths, file count, element sizes and
+  the final size word; reject inconsistent directories with ErrDirectoryInvalid.
+- Bound discovery to 60 seconds and include processor and directory details
+  in errors and the success debug log.
+
 ## [0.3.3] - 2026-09-22
 
 Production-hardening maintenance release. Hardware-verified on a ControlLogix L7, a

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Sys0Info describes how to read and parse the file directory held in system
@@ -25,6 +26,9 @@ type Sys0Info struct {
 // whose file directory layout is not established by a reference, rather than
 // guessing and returning wrong data.
 var ErrDiscoveryNotSupported = errors.New("pccc: file directory discovery not supported for this processor")
+
+// ErrDirectoryInvalid indicates an inconsistent or malformed SLC directory.
+var ErrDirectoryInvalid = errors.New("pccc: invalid file directory")
 
 // FileDirectoryEntry describes a single data file discovered from the file directory.
 type FileDirectoryEntry struct {
@@ -56,8 +60,13 @@ func (p *PLC) GetProcessorType() (string, error) {
 }
 
 func (p *PLC) getProcessorTypeFromDiagnosticStatus() (string, error) {
+	catalog, _, err := p.getDiagnosticStatus()
+	return catalog, err
+}
+
+func (p *PLC) getDiagnosticStatus() (string, []byte, error) {
 	if p == nil || p.Connection == nil {
-		return "", fmt.Errorf("nil PLC or connection")
+		return "", nil, fmt.Errorf("nil PLC or connection")
 	}
 
 	tns := p.nextTNS()
@@ -68,39 +77,39 @@ func (p *PLC) getProcessorTypeFromDiagnosticStatus() (string, error) {
 
 	cipReq, err := wrapInCipExecutePCCC(pcccCmd, p.vendorID, p.serialNum)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	cipResp, err := p.sendCipRequest(cipReq)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	pcccResp, err := parseCipExecutePCCCResponse(cipResp)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Response: [CMD 0x46] [STS] [TNS lo] [TNS hi] [data...]
 	if len(pcccResp) < 4 {
-		return "", fmt.Errorf("response too short: %d bytes", len(pcccResp))
+		return "", nil, fmt.Errorf("response too short: %d bytes", len(pcccResp))
 	}
 
 	cmd := pcccResp[0]
 	sts := pcccResp[1]
 
 	if cmd != CmdDiagnosticReply {
-		return "", fmt.Errorf("unexpected reply command 0x%02X", cmd)
+		return "", nil, fmt.Errorf("unexpected reply command 0x%02X", cmd)
 	}
 	if err := checkReplyTNS(pcccResp, tns); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if sts != StsSuccess {
 		var extSts byte
 		if sts&0xF0 == 0xF0 && len(pcccResp) >= 5 {
 			extSts = pcccResp[4]
 		}
-		return "", PCCCStatusError(sts, extSts)
+		return "", nil, PCCCStatusError(sts, extSts)
 	}
 
 	// The catalog number is 11 ASCII bytes at offset 5 of the reply data
@@ -108,16 +117,23 @@ func (p *PLC) getProcessorTypeFromDiagnosticStatus() (string, error) {
 	// interface type, extended processor type, series/revision, then the
 	// catalog number. pycomm3 get_processor_type reads the same [5:16].
 	data := pcccResp[4:]
-	if len(data) < 16 {
-		return "", fmt.Errorf("diagnostic data too short: %d bytes", len(data))
-	}
+	return parseDiagnosticStatusData(data)
+}
 
+func parseDiagnosticStatusData(data []byte) (string, []byte, error) {
+	var processor []byte
+	if len(data) >= 5 {
+		processor = data[1:5]
+	}
+	if len(data) < 16 {
+		return "", processor, fmt.Errorf("diagnostic data too short: %d bytes", len(data))
+	}
 	catalog := extractCatalog(data[5:16])
 	if catalog == "" {
-		return "", fmt.Errorf("diagnostic status reply has no catalog number")
+		return "", processor, fmt.Errorf("diagnostic status reply has no catalog number")
 	}
 	debugLog("GetProcessorType: catalog=%q", catalog)
-	return catalog, nil
+	return catalog, processor, nil
 }
 
 func (p *PLC) getProcessorTypeFromIdentity() (string, error) {
@@ -236,77 +252,147 @@ const fileDirectoryChunk = 0x50
 // FileType), read all of file 0 from element 0 in 0x50-byte chunks (element =
 // words already read), then parse the rows starting at FilePosition.
 func (p *PLC) GetFileDirectory() ([]FileDirectoryEntry, error) {
-	// Step 1: Get processor type
-	catalog, err := p.GetProcessorType()
+	return p.getFileDirectory(p.getDiagnosticStatus, p.getProcessorTypeFromIdentity, p.readSection, time.Now)
+}
+
+// Callbacks keep the discovery sequence testable without a transport or real-time waits.
+func (p *PLC) getFileDirectory(diag func() (string, []byte, error), identity func() (string, error), read func(uint16, byte, uint16, uint16) ([]byte, error), now func() time.Time) (entries []FileDirectoryEntry, err error) {
+	deadline := now().Add(60 * time.Second)
+	var diagCatalog, identityCatalog string
+	var processorBytes, header []byte
+	totalSize, parsedCount := 0, 0
+	defer func() {
+		detail := fmt.Sprintf("diag=%q identity=%q processor=% X totalSize=%d header52=% X parsedCount=%d", diagCatalog, identityCatalog, processorBytes, totalSize, header, parsedCount)
+		if err != nil {
+			entries = nil
+			err = fmt.Errorf("GetFileDirectory: %s: %w", detail, err)
+		} else {
+			debugLog("GetFileDirectory: %s found %d data files", detail, len(entries))
+		}
+	}()
+	if p == nil {
+		return nil, fmt.Errorf("nil PLC")
+	}
+	budget := func() error {
+		if !now().Before(deadline) {
+			return fmt.Errorf("discovery time budget exceeded")
+		}
+		return nil
+	}
+	if err = budget(); err != nil {
+		return nil, err
+	}
+	diagCatalog, processorBytes, err = diag()
+	diagErr := err
+	var sys0 *Sys0Info
+	if diagErr == nil {
+		sys0, diagErr = sys0InfoForCatalog(diagCatalog)
+	}
+	if diagErr != nil {
+		if len(p.RoutePath) != 0 {
+			return nil, fmt.Errorf("diagnostic: %w; identity fallback disabled for routed connection", diagErr)
+		}
+		if err = budget(); err != nil {
+			return nil, err
+		}
+		var identityErr error
+		identityCatalog, identityErr = identity()
+		if identityErr == nil {
+			sys0, identityErr = sys0InfoForCatalog(identityCatalog)
+		}
+		if identityErr != nil {
+			return nil, fmt.Errorf("diagnostic: %w; identity: %w", diagErr, identityErr)
+		}
+	}
+	slc := sys0.FileType == 0x01
+	invalid := func(format string, args ...interface{}) error {
+		problem := fmt.Errorf(format, args...)
+		if slc {
+			return fmt.Errorf("%w: %v", ErrDirectoryInvalid, problem)
+		}
+		return problem
+	}
+	readSize := func() (int, error) {
+		if err := budget(); err != nil {
+			return 0, err
+		}
+		data, err := read(0, sys0.FileType, uint16(sys0.SizeElement), uint16(sys0.SizeLen))
+		if err != nil {
+			return 0, fmt.Errorf("read directory size: %w", err)
+		}
+		if len(data) < 2 {
+			return 0, invalid("directory size response too short")
+		}
+		return int(binary.LittleEndian.Uint16(data[:2])) - sys0.SizeConst, nil
+	}
+	totalSize, err = readSize()
 	if err != nil {
-		return nil, fmt.Errorf("GetFileDirectory: %w", err)
+		return nil, err
 	}
-
-	// Step 2: Lookup sys0 layout for this processor
-	sys0, err := sys0InfoForCatalog(catalog)
-	if err != nil {
-		return nil, fmt.Errorf("GetFileDirectory: %w", err)
+	if totalSize <= sys0.FilePosition || (slc && totalSize > 16384) {
+		return nil, invalid("directory size %d out of range", totalSize)
 	}
-
-	debugLog("GetFileDirectory: catalog=%q sys0=%+v", catalog, *sys0)
-
-	// Step 3: Read the size in bytes of file 0.
-	sizeData, err := p.readSection(0, sys0.FileType, uint16(sys0.SizeElement), uint16(sys0.SizeLen))
-	if err != nil {
-		return nil, fmt.Errorf("GetFileDirectory: read directory size: %w", err)
-	}
-	if len(sizeData) < 2 {
-		return nil, fmt.Errorf("GetFileDirectory: directory size response too short")
-	}
-	totalSize := int(binary.LittleEndian.Uint16(sizeData[:2])) - sys0.SizeConst
-	if totalSize <= sys0.FilePosition {
-		return nil, fmt.Errorf("GetFileDirectory: directory size %d too small", totalSize)
-	}
-
-	debugLog("GetFileDirectory: totalSize=%d filePosition=%d", totalSize, sys0.FilePosition)
-
-	// Step 4: Read all of file 0. The element field is a word offset.
 	dirData := make([]byte, 0, totalSize)
 	for len(dirData) < totalSize {
 		if len(dirData)%2 != 0 {
-			return nil, fmt.Errorf("GetFileDirectory: odd-length reply at offset %d", len(dirData)-1)
+			return nil, invalid("odd-length reply at offset %d", len(dirData)-1)
 		}
 		chunk := totalSize - len(dirData)
 		if chunk > fileDirectoryChunk {
 			chunk = fileDirectoryChunk
 		}
-		data, err := p.readSection(0, sys0.FileType, uint16(len(dirData)/2), uint16(chunk))
-		if err != nil {
-			return nil, fmt.Errorf("GetFileDirectory: read offset %d: %w", len(dirData), err)
+		if err = budget(); err != nil {
+			return nil, err
+		}
+		data, readErr := read(0, sys0.FileType, uint16(len(dirData)/2), uint16(chunk))
+		if readErr != nil {
+			return nil, fmt.Errorf("read offset %d: %w", len(dirData), readErr)
+		}
+		if slc && len(data) != chunk {
+			return nil, invalid("reply length %d at offset %d, want %d", len(data), len(dirData), chunk)
 		}
 		if len(data) == 0 {
-			return nil, fmt.Errorf("GetFileDirectory: empty reply at offset %d", len(dirData))
+			return nil, invalid("empty reply at offset %d", len(dirData))
 		}
 		if len(data) > chunk {
 			data = data[:chunk]
 		}
 		dirData = append(dirData, data...)
+		if len(dirData) >= 54 {
+			header = dirData[52:54]
+		}
 	}
-
-	// Step 5: Parse the directory entries
-	entries, err := parseFileDirectory(dirData, sys0)
+	entries, parsedCount, err = parseFileDirectoryCount(dirData, sys0)
 	if err != nil {
-		return nil, fmt.Errorf("GetFileDirectory: %w", err)
+		return nil, err
 	}
-
-	debugLog("GetFileDirectory: found %d data files", len(entries))
+	if slc {
+		finalSize, readErr := readSize()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if finalSize != totalSize {
+			return nil, invalid("directory size changed from %d to %d", totalSize, finalSize)
+		}
+	}
+	if err = budget(); err != nil {
+		return nil, err
+	}
 	return entries, nil
 }
 
 // sys0InfoForCatalog returns the file directory layout for a full catalog
-// number. SLC 500 (1747) support is limited to the Ethernet-capable modular
+// number. SLC 500 (1747) support is limited to the modular
 // processors (5/03 L53x, 5/04 L54x, 5/05 L55x); fixed and 5/01, 5/02
 // processors share the 1747 prefix but not the layout.
 func sys0InfoForCatalog(catalog string) (*Sys0Info, error) {
+	catalog = strings.ToUpper(strings.TrimSpace(catalog))
+	if catalog == "5/03" || catalog == "5/04" || catalog == "5/05" {
+		return lookupSys0Info("1747")
+	}
 	prefix := extractCatalogPrefix(catalog)
 	if prefix == "1747" {
-		model := strings.ToUpper(catalog)
-		if !strings.HasPrefix(model, "1747-L53") && !strings.HasPrefix(model, "1747-L54") && !strings.HasPrefix(model, "1747-L55") {
+		if !strings.HasPrefix(catalog, "1747-L53") && !strings.HasPrefix(catalog, "1747-L54") && !strings.HasPrefix(catalog, "1747-L55") {
 			return nil, fmt.Errorf("%w: %q", ErrDiscoveryNotSupported, catalog)
 		}
 	}
@@ -368,8 +454,13 @@ const fileTypePLS byte = 0x94
 // start at 0 and advance for each recognised data file type and for 0x81
 // placeholder rows (skipped file numbers); other rows do not use a number.
 func parseFileDirectory(data []byte, sys0 *Sys0Info) ([]FileDirectoryEntry, error) {
+	entries, _, err := parseFileDirectoryCount(data, sys0)
+	return entries, err
+}
+
+func parseFileDirectoryCount(data []byte, sys0 *Sys0Info) ([]FileDirectoryEntry, int, error) {
 	if sys0 == nil || sys0.RowSize <= 0 || sys0.FilePosition < 0 {
-		return nil, fmt.Errorf("invalid file directory layout")
+		return nil, 0, fmt.Errorf("invalid file directory layout")
 	}
 
 	var entries []FileDirectoryEntry
@@ -381,6 +472,9 @@ func parseFileDirectory(data []byte, sys0 *Sys0Info) ([]FileDirectoryEntry, erro
 
 		if prefix != "" {
 			size := int(binary.LittleEndian.Uint16(data[pos+1 : pos+3]))
+			if sys0.FileType == 0x01 && size%ElementSize(ft) != 0 {
+				return nil, fileNumber, fmt.Errorf("%w: file %d size %d not divisible by element size %d", ErrDirectoryInvalid, fileNumber, size, ElementSize(ft))
+			}
 			entries = append(entries, FileDirectoryEntry{
 				FileNumber:   fileNumber,
 				FileType:     ft,
@@ -395,7 +489,10 @@ func parseFileDirectory(data []byte, sys0 *Sys0Info) ([]FileDirectoryEntry, erro
 		}
 	}
 
-	return entries, nil
+	if sys0.FileType == 0x01 && (len(data) < 54 || int(binary.LittleEndian.Uint16(data[52:54])) != fileNumber) {
+		return nil, fileNumber, fmt.Errorf("%w: header file count differs from parsed count %d", ErrDirectoryInvalid, fileNumber)
+	}
+	return entries, fileNumber, nil
 }
 
 // DiscoverDataFiles reads the file directory from the PLC and returns
